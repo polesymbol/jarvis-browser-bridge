@@ -43,7 +43,9 @@ var state = {
   sites: {},
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer }
-  consentNotifs: {}            // notificationId -> proposalId (universal prompt)
+  consentNotifs: {},           // notificationId -> proposalId (universal prompt)
+  consentBanners: {},          // proposalId -> tabId (in-page banner)
+  panelOpen: false             // side panel visibility (banner only when closed)
 };
 
 var proposalSeq = 0;
@@ -136,13 +138,14 @@ function trackPending(proposal, remainingMs) {
     proposal: proposal,
     timer: timer,
     resolve: function (answer) {
-      // Idempotent: the card and the notification are two paths to one
-      // decision — the first one wins, the second is a no-op.
+      // Idempotent: card, notification and banner are three paths to one
+      // decision — the first one wins, the rest are no-ops.
       if (!state.pending.has(proposal.proposalId)) return;
       clearTimeout(timer);
       state.pending.delete(proposal.proposalId);
       unpersistPending(proposal.proposalId);
       clearConsentPrompt(proposal.proposalId);
+      dismissBannerConsent(proposal.proposalId);
       resolveConsent(proposal, answer);
     }
   };
@@ -261,6 +264,116 @@ chrome.notifications.onClosed.addListener(function (notifId, byUser) {
   // Dismissed without a decision: fail closed.
   decideFromNotification(proposalId, "deny", "notification dismissed");
 });
+
+// ---------------------------------------------------------------- in-page consent banner
+//
+// OS notifications are at the mercy of OS settings (Windows Focus Assist,
+// Chrome notification permissions) and the toolbar badge needs the user to
+// watch the icon — neither is a reliable consent gate. The banner injects a
+// top-center prompt directly into the active tab: impossible to miss while
+// looking at the page, needs no OS cooperation. Shown only when the side
+// panel is closed (the card covers the open case). Notification + badge +
+// card remain as additional channels; first decision wins everywhere.
+
+function jbbConsentBanner(summary) {
+  // NOTE: serialized into the tab via chrome.scripting.executeScript —
+  // must stay fully self-contained (no outer-scope references).
+  var BANNER_ID = "jbb-consent-banner";
+  function remove() {
+    var b = document.getElementById(BANNER_ID);
+    if (b) b.remove();
+    window.__jbbBannerProposal = null;
+  }
+  if (!window.__jbbBannerInstalled) {
+    window.__jbbBannerInstalled = true;
+    chrome.runtime.onMessage.addListener(function (msg) {
+      if (msg && msg.kind === "jbb.banner.dismiss") {
+        if (!msg.proposalId || msg.proposalId === window.__jbbBannerProposal) remove();
+      }
+    });
+  }
+  remove();
+  window.__jbbBannerProposal = summary.proposalId;
+
+  var bar = document.createElement("div");
+  bar.id = BANNER_ID;
+  bar.setAttribute("style", [
+    "position:fixed", "top:12px", "left:50%", "transform:translateX(-50%)",
+    "z-index:2147483647", "display:flex", "align-items:center", "gap:10px",
+    "background:#17171c", "color:#f5f5f7", "border:1px solid #3a3a44",
+    "border-left:4px solid #e8710a", "border-radius:12px",
+    "padding:10px 14px", "font:14px/1.4 -apple-system,'Segoe UI',Roboto,sans-serif",
+    "box-shadow:0 8px 30px rgba(0,0,0,.45)", "max-width:min(660px,92vw)"
+  ].join(";"));
+
+  function btn(label, primary, choice) {
+    var b = document.createElement("button");
+    b.textContent = label;
+    b.setAttribute("style", [
+      "cursor:pointer", "border:1px solid " + (primary ? "#e8710a" : "#4a4a55"),
+      "background:" + (primary ? "#e8710a" : "transparent"),
+      "color:#fff", "border-radius:8px", "padding:6px 12px", "font-size:13px",
+      "font-weight:" + (primary ? "600" : "400"), "white-space:nowrap"
+    ].join(";"));
+    b.addEventListener("click", function () {
+      chrome.runtime.sendMessage({ kind: "jbb.banner.decision",
+        proposalId: summary.proposalId, choice: choice });
+      remove();
+    });
+    return b;
+  }
+
+  var dot = document.createElement("span");
+  dot.setAttribute("style", "width:10px;height:10px;border-radius:50%;background:#e8710a;flex:none");
+  var txt = document.createElement("span");
+  var strong = document.createElement("strong");
+  strong.textContent = "Jarvis wants your approval";
+  txt.appendChild(strong);
+  txt.appendChild(document.createElement("br"));
+  var sub = document.createElement("span");
+  sub.setAttribute("style", "color:#b9b9c4;font-size:12px");
+  sub.textContent = (summary.description || "action") + " — " + (summary.site || "this site") +
+    (summary.tier ? " · " + summary.tier : "");
+  txt.appendChild(sub);
+
+  bar.appendChild(dot);
+  bar.appendChild(txt);
+  bar.appendChild(btn("Allow once", true, "once"));
+  bar.appendChild(btn("This site", false, "site"));
+  bar.appendChild(btn("Deny", false, "deny"));
+  (document.documentElement || document.body).appendChild(bar);
+}
+
+function showBannerConsent(proposal) {
+  if (state.panelOpen) return; // the card covers the open-panel case
+  chrome.tabs.query({ active: true, lastFocusedWindow: true }, function (tabs) {
+    var tab = tabs && tabs[0];
+    var url = (tab && tab.url) || "";
+    if (!tab || !tab.id || !/^https?:\/\//i.test(url)) return; // can't inject here
+    var summary = {
+      proposalId: proposal.proposalId,
+      description: proposal.description || proposal.type || "action",
+      site: hostOf(proposal.site || ""),
+      tier: proposal.actionTier || ""
+    };
+    state.consentBanners[proposal.proposalId] = tab.id;
+    try {
+      chrome.scripting.executeScript(
+        { target: { tabId: tab.id }, func: jbbConsentBanner, args: [summary] }
+      ).catch(function () { delete state.consentBanners[proposal.proposalId]; });
+    } catch (e) { delete state.consentBanners[proposal.proposalId]; }
+  });
+}
+
+function dismissBannerConsent(proposalId) {
+  var tabId = state.consentBanners[proposalId];
+  delete state.consentBanners[proposalId];
+  if (tabId == null) return;
+  try {
+    chrome.tabs.sendMessage(tabId, { kind: "jbb.banner.dismiss", proposalId: proposalId })
+      .catch(function () {});
+  } catch (e) { /* tab gone */ }
+}
 
 // Make sure the relay socket is up (and paired) before sending anything that
 // must reach the driver — e.g. a consent grant after a worker restart.
@@ -504,6 +617,7 @@ function handleProposal(proposal, source) {
   pushToPanel({ kind: "jbb.ui.consentRequest", proposal: proposal });
   // Universal prompt: the panel card is invisible when the panel is closed.
   notifyConsent(proposal);
+  showBannerConsent(proposal);
 }
 
 function resolveConsent(proposal, answer) {
@@ -770,6 +884,19 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
 
     case "jbb.ui.testNotif":
       testNotification();
+      done();
+      break;
+
+    case "jbb.banner.decision": {
+      var bEntry = state.pending.get(msg.proposalId);
+      if (bEntry) bEntry.resolve({ choice: msg.choice });
+      else dismissBannerConsent(msg.proposalId);
+      done();
+      break;
+    }
+
+    case "jbb.ui.panelState":
+      state.panelOpen = !!msg.open;
       done();
       break;
 

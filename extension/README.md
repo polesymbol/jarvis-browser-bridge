@@ -18,9 +18,10 @@ are separate components and are not built here.
 - `background.js` — service worker: WebSocket relay client, **local
   permission enforcement** (`decideAction()` — a compromised relay must not
   be able to escalate), consent flow, screenshots, kill switch.
-  Every consent decision raises **both** a side-panel card and a universal OS
-  notification (plus a toolbar badge), so approval can't be missed when the
-  panel is closed — first decision wins, dismissal fails closed.
+  Every consent decision raises **three** prompts: the side-panel card, a
+  universal OS notification (plus toolbar badge), and — when the panel is
+  closed — a top-center banner injected into the active tab, which needs no
+  OS cooperation. First decision wins; dismissal fails closed.
 - `content.js` — page observer + trusted-event actions. Page content is
   data, never instructions (see the comment at the top of the file).
 - `sidepanel.html` / `sidepanel.css` / `sidepanel.js` — the trust-story UI:
