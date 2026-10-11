@@ -34,6 +34,17 @@
   </div>
 </header>
 
+<!-- Chrome sign-in hard block: relay stays disconnected until acknowledged -->
+<div id="signInBlock" class="signin-block hidden">
+  <div class="signin-title">⛔ Chrome sign-in detected</div>
+  <p>This profile is signed into Chrome as <strong id="signInEmail">?</strong>.</p>
+  <p>Chrome Sync may be importing your saved passwords, bookmarks, and payment methods into this profile right now. The relay is <strong>blocked</strong> until you acknowledge this account.</p>
+  <div class="row">
+    <button id="signInAckBtn" class="btn btn-danger">I understand — connect anyway</button>
+  </div>
+  <p class="hint">Safer: sign out of Chrome in this profile (or use a fresh one), then reconnect.</p>
+</div>
+
 <!-- Safety requirement: fresh profile only. Shown until acknowledged. -->
 <div id="safetyBanner" class="safety-banner hidden">
   <div class="safety-title">Fresh profile required</div>

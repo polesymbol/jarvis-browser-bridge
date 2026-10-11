@@ -28,7 +28,8 @@ var K = {
   SITES: "jbb.sites",          // { hostname: "allow" | "deny" }
   AUDIT: "jbb.audit",          // [ entries ], capped
   PENDING: "jbb.pending",      // { proposalId: { proposal, createdAt } } — survives worker restarts
-  SESSION: "jbb.session"       // { site, grantedAt, expiresAt, label } — time-boxed grant, survives restarts
+  SESSION: "jbb.session",      // { site, grantedAt, expiresAt, label } — time-boxed grant, survives restarts
+  SIGNIN_ACK: "jbb.signInAck"  // email the user acknowledged for Chrome sign-in (hard block until acked)
 };
 
 var AUDIT_CAP = 500;
@@ -46,7 +47,9 @@ var state = {
   pending: new Map(),          // proposalId -> { proposal, resolve, timer }
   consentNotifs: {},           // notificationId -> proposalId (universal prompt)
   consentBanners: {},          // proposalId -> tabId (in-page banner)
-  session: null                // time-boxed grant: { site, grantedAt, expiresAt, label }
+  session: null,               // time-boxed grant: { site, grantedAt, expiresAt, label }
+  chromeSignedInEmail: null,   // Chrome profile sign-in email (null = not signed in)
+  signInBlocked: false          // true when signed in but the account is unacknowledged
 };
 
 var proposalSeq = 0;
@@ -73,14 +76,17 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
   hydratePendings();
   // Hard expiry for session grants — no silent extension, ever.
   if (state.session && Date.now() >= state.session.expiresAt) expireSession("expired");
-  chrome.storage.local.get([K.SETTINGS], function (res) {
-    var s = res[K.SETTINGS] || {};
-    if (s.relayUrl && !state.connected && !s.killed) {
-      state.relayUrl = s.relayUrl;
-      state.mode = s.mode || state.mode;
-      state.sessionKilled = false;
-      connectRelay(s.relayUrl);
-    }
+  // Re-check sign-in state: a later sign-in can't slip through unnoticed.
+  checkSignInState(function () {
+    chrome.storage.local.get([K.SETTINGS], function (res) {
+      var s = res[K.SETTINGS] || {};
+      if (s.relayUrl && !state.connected && !s.killed) {
+        state.relayUrl = s.relayUrl;
+        state.mode = s.mode || state.mode;
+        state.sessionKilled = false;
+        connectRelay(s.relayUrl);
+      }
+    });
   });
 });
 
@@ -94,6 +100,7 @@ function loadPersisted() {
     var sess = res[K.SESSION];
     state.session = (sess && sess.expiresAt > Date.now()) ? sess : null;
     if (!state.session && sess) chrome.storage.local.remove([K.SESSION]);
+    checkSignInState();
     refreshBadge();
   });
 }
@@ -102,6 +109,40 @@ function saveSettings() {
   chrome.storage.local.set({
     [K.SETTINGS]: { mode: state.mode, relayUrl: state.relayUrl, killed: state.sessionKilled },
     [K.SITES]: state.sites
+  });
+}
+
+// ---------------------------------------------------------------- Chrome sign-in guard
+//
+// Sync requires Chrome sign-in: no sign-in = sync definitively off = no
+// silent import of passwords/payment data. If signed in, we cannot verify
+// sync state (no API exposes it), so the relay stays HARD BLOCKED until the
+// user explicitly acknowledges the specific account. Re-checked on every
+// keepalive so a later sign-in can't slip through unnoticed.
+function checkSignInState(callback) {
+  var done = function () { if (callback) callback(); };
+  if (!chrome.identity || !chrome.identity.getProfileUserInfo) { done(); return; }
+  chrome.identity.getProfileUserInfo(function (info) {
+    var email = (info && info.email) || null;
+    var prevEmail = state.chromeSignedInEmail;
+    var wasBlocked = state.signInBlocked;
+    state.chromeSignedInEmail = email;
+    chrome.storage.local.get([K.SIGNIN_ACK], function (res) {
+      var ackedEmail = res[K.SIGNIN_ACK] || null;
+      state.signInBlocked = !!email && email !== ackedEmail;
+      if (state.signInBlocked && state.connected) {
+        // Signed in mid-session (or switched account): drop the relay now.
+        // The local kill-switch state is untouched; the user can reconnect
+        // after acknowledging.
+        disconnectRelay("Chrome sign-in detected: " + email);
+      }
+      if (state.signInBlocked !== wasBlocked || email !== prevEmail) {
+        pushToPanel({ kind: "jbb.ui.signInChanged",
+          signedIn: !!email, email: email, blocked: state.signInBlocked });
+        refreshBadge();
+      }
+      done();
+    });
   });
 }
 
@@ -558,6 +599,17 @@ function connectRelay(url) {
   // Never stack duplicate connections: if a socket exists or one is dialing,
   // there is nothing to do.
   if (state.ws || state.connecting) return;
+  // HARD BLOCK: signed into Chrome with an unacknowledged account. Sync may
+  // be importing passwords and payment data — no relay until the user
+  // explicitly acknowledges the account. No warn-and-allow.
+  if (state.signInBlocked) {
+    pushToPanel({ kind: "jbb.ui.status", connected: false,
+      error: "Blocked: Chrome sign-in (" + (state.chromeSignedInEmail || "?") +
+             ") not acknowledged. Acknowledge it in the panel or sign out." });
+    audit({ site: "-", action: "relay connect", tier: "T0",
+            result: "denied", detail: "blocked: unacknowledged Chrome sign-in" });
+    return;
+  }
   state.connecting = true;
   state.relayUrl = url;
   saveSettings();
@@ -983,7 +1035,10 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       break;
 
     case "jbb.ui.connect":
-      if (state.relayUrl) { state.sessionKilled = false; connectRelay(state.relayUrl); }
+      // Check sign-in state first: the block must apply to manual connects too.
+      checkSignInState(function () {
+        if (state.relayUrl) { state.sessionKilled = false; connectRelay(state.relayUrl); }
+      });
       done();
       break;
 
@@ -991,6 +1046,26 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       disconnectRelay("user disconnect");
       pushToPanel({ kind: "jbb.ui.status", connected: false });
       done();
+      break;
+
+    case "jbb.ui.ackSignIn":
+      // User explicitly acknowledges the signed-in account, accepting that
+      // Sync may import passwords/payment data. Stored per-email: a different
+      // account re-blocks.
+      if (state.chromeSignedInEmail) {
+        var ackEmail = state.chromeSignedInEmail;
+        chrome.storage.local.set({ [K.SIGNIN_ACK]: ackEmail }, function () {
+          state.signInBlocked = false;
+          audit({ site: "-", action: "Chrome sign-in acknowledged", tier: "T0",
+                  result: "allowed", detail: ackEmail + " (user accepted sync risk)" });
+          pushToPanel({ kind: "jbb.ui.signInChanged",
+            signedIn: true, email: ackEmail, blocked: false });
+          refreshBadge();
+          done();
+        });
+        return true; // async
+      }
+      done({ error: "not signed in" });
       break;
 
     case "jbb.ui.consent":
@@ -1038,6 +1113,14 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       revokeSession();
       done();
       break;
+
+    case "jbb.ui.getSignInState":
+      checkSignInState(function () {
+        done({ signedIn: !!state.chromeSignedInEmail,
+               email: state.chromeSignedInEmail,
+               blocked: state.signInBlocked });
+      });
+      return true; // async
 
     case "jbb.ui.blockSite":
       if (msg.host) {

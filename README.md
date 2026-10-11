@@ -9,6 +9,7 @@ This extension can see every page you visit. **Install it only in a fresh Chrome
 - **Never use your main profile.** Banking, email, saved passwords — keep all of that in a separate profile this extension never touches.
 - **Never sign into Chrome with your existing Gmail** to create the profile. Chrome Sync would pull your saved passwords, bookmarks, payment methods, and addresses from your Google account straight into this profile — defeating the entire purpose. Use a brand-new email or skip sign-in entirely.
 - Inside the fresh profile, log into **only** the sites you want the assistant to automate. Login itself is the consent mechanism.
+- **Enforced, not just advised:** the extension detects Chrome sign-in via the identity API. If the profile is signed in, the relay stays **hard-blocked** — no connection, no warn-and-allow — until you explicitly acknowledge that specific account. Signing in mid-session drops the relay immediately. (No sign-in = Sync is definitively off.)
 
 ## How it works
 

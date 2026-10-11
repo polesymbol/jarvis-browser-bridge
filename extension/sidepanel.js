@@ -285,6 +285,10 @@ chrome.runtime.onMessage.addListener(function (msg) {
     case "jbb.ui.sessionChanged":
       refresh();
       break;
+    case "jbb.ui.signInChanged":
+      renderSignInBlock(msg);
+      refresh();
+      break;
     case "jbb.ui.notifFailed":
       el("notifWarnErr").textContent = msg.error || "unknown error";
       el("notifWarn").classList.remove("hidden");
@@ -327,6 +331,13 @@ document.addEventListener("DOMContentLoaded", function () {
     applyTheme(next);
   });
 
+  // Sign-in hard block UI.
+  function renderSignInBlock(s) {
+    var show = !!(s && s.blocked);
+    el("signInBlock").classList.toggle("hidden", !show);
+    if (s && s.email) el("signInEmail").textContent = s.email;
+    el("connectBtn").disabled = show;
+  }
   // Safety banner: fresh-profile requirement. Shown until acknowledged.
   chrome.storage.local.get(["jbb.safetyAcked"], function (res) {
     if (!res["jbb.safetyAcked"]) el("safetyBanner").classList.remove("hidden");
@@ -334,6 +345,13 @@ document.addEventListener("DOMContentLoaded", function () {
   el("safetyAckBtn").addEventListener("click", function () {
     chrome.storage.local.set({ "jbb.safetyAcked": true });
     el("safetyBanner").classList.add("hidden");
+  });
+  el("signInAckBtn").addEventListener("click", function () {
+    api({ kind: "jbb.ui.ackSignIn" }).then(function () { refresh(); });
+  });
+  // Ask the background for current sign-in state on panel open.
+  api({ kind: "jbb.ui.getSignInState" }).then(function (s) {
+    if (s && s.ok) renderSignInBlock(s);
   });
 
   // Tabs

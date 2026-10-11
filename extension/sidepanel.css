@@ -381,3 +381,19 @@ main { padding: 14px 16px 90px; }
 }
 .safety-banner p { margin: 0 0 8px; font-size: 12.5px; line-height: 1.5; color: var(--text); }
 .safety-banner .btn { margin-top: 4px; }
+
+/* ---------- sign-in hard block ---------- */
+.signin-block {
+  margin: 12px 12px 0; padding: 14px;
+  border: 1px solid var(--danger); border-left: 4px solid var(--danger);
+  border-radius: 10px; background: var(--surface);
+}
+.signin-title {
+  font-family: "Fraunces", Georgia, serif; font-weight: 700; font-size: 15px;
+  color: var(--danger); margin-bottom: 8px;
+}
+.signin-block p { margin: 0 0 8px; font-size: 12.5px; line-height: 1.5; color: var(--text); }
+.signin-block .btn { margin-top: 4px; }
+
+/* disabled buttons (e.g. Connect while sign-in blocked) */
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
