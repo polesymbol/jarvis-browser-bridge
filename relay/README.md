@@ -15,6 +15,22 @@ TLS_CERT=/path/to/cert.pem TLS_KEY=/path/to/key.pem PORT=8787 node relay/server.
 
 `GET /health` returns `{ ok: true, rooms: <n> }` (plain-ws mode only).
 
+## Deploy (one click)
+
+The repo ships `Dockerfile`, `render.yaml`, and `railway.json`. The relay
+listens on `$PORT` and answers `GET /health` — hosts terminate TLS at the
+edge, so run it **without** `TLS_CERT`/`TLS_KEY` and connect clients over
+`wss://<your-host>`.
+
+- **Railway:** New Project → Deploy from GitHub repo → it builds the
+  Dockerfile automatically. Add a public domain; the relay URL becomes
+  `wss://<your-app>.up.railway.app`.
+- **Render:** New → Blueprint → point at the repo (`render.yaml`). The relay
+  URL becomes `wss://jbb-relay.onrender.com`.
+
+Then: extension side panel → Relay URL = the `wss://` URL → Connect; driver
+uses `--relay wss://<your-host>`. Same connector key as before.
+
 ## Auth
 
 Both sides open a WebSocket and send first:
