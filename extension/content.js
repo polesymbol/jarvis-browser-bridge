@@ -103,17 +103,28 @@
     return document.querySelector("[" + REF_ATTR + "='" + ref + "']");
   }
 
-  function doClick(ref) {
-    var el = findByRef(ref);
+  // SECURITY (enemy audit round 2): the page owns its DOM and can move
+  // data-jbb-ref attributes between observe and act, rebinding an approved
+  // ref to a different element. Verify the element still matches what the
+  // user approved; fail closed on mismatch (the driver re-observes).
+  function verifyTarget(el, ref, expectedLabel) {
     if (!el) throw new Error("no element for ref " + ref);
+    if (expectedLabel && labelFor(el) !== expectedLabel) {
+      throw new Error("element changed since observation (expected '" +
+        expectedLabel + "')");
+    }
+    return el;
+  }
+
+  function doClick(ref, expectedLabel) {
+    var el = verifyTarget(findByRef(ref), ref, expectedLabel);
     el.scrollIntoView({ block: "center", behavior: "instant" });
     el.click(); // trusted event, same as a user click
     return "clicked '" + labelFor(el) + "'";
   }
 
-  function doType(ref, value) {
-    var el = findByRef(ref);
-    if (!el) throw new Error("no element for ref " + ref);
+  function doType(ref, value, expectedLabel) {
+    var el = verifyTarget(findByRef(ref), ref, expectedLabel);
     if (!("value" in el) && el.tagName.toLowerCase() !== "textarea") {
       throw new Error("element is not typable: " + labelFor(el));
     }
@@ -150,9 +161,10 @@
         sendResponse({ ok: true, snapshot: buildSnapshot() });
       } else if (msg.kind === "jbb.content.act") {
         var a = msg.action || {};
+        var t = a.target || {};
         var detail;
-        if (a.type === "click") detail = doClick(a.target && a.target.ref);
-        else if (a.type === "type") detail = doType(a.target && a.target.ref, a.value);
+        if (a.type === "click") detail = doClick(t.ref, t.label);
+        else if (a.type === "type") detail = doType(t.ref, a.value, t.label);
         else if (a.type === "scroll") detail = doScroll(a.direction, a.amount);
         else throw new Error("unknown action type: " + a.type);
         sendResponse({ ok: true, detail: detail });

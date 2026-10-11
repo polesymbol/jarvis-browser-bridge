@@ -733,6 +733,13 @@ function handleProposal(proposal, source) {
 }
 
 function resolveConsent(proposal, answer) {
+  // SECURITY (enemy audit round 2): fail closed on unknown choice values.
+  // Anything that isn't an explicit approval becomes a denial — never execute
+  // on garbage input.
+  var VALID_CHOICES = { "once": 1, "site": 1, "session1h": 1, "session24h": 1, "deny": 1 };
+  if (!answer || !VALID_CHOICES[answer.choice]) {
+    answer = { choice: "deny", reason: "invalid consent choice" };
+  }
   if (answer.choice === "deny") {
     sendToRelay(JBB.Message.consentDeny(proposal.proposalId, answer.reason || "user denied"));
     sendToRelay(JBB.Message.actResult(proposal.proposalId, false, "denied by user"));
