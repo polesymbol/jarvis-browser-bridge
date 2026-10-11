@@ -365,3 +365,6 @@ main { padding: 14px 16px 90px; }
 .theme-btn:hover { color: var(--ember); border-color: var(--ember); }
 .theme-btn svg { display: block; }
 .header-right { display: flex; align-items: center; }
+
+/* key reconnect row (was inline style; CSP blocks inline styles) */
+.key-reconnect-row { margin-top: 8px; }
