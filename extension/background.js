@@ -223,9 +223,13 @@ function clearConsentPrompt(proposalId) {
 }
 
 function decideFromNotification(proposalId, choice, reason) {
-  var entry = state.pending.get(proposalId);
-  if (entry) entry.resolve({ choice: choice, reason: reason });
-  else clearConsentPrompt(proposalId); // already decided elsewhere
+  // The worker may have slept since the proposal arrived — hydrate from
+  // storage before looking it up, or the decision is silently dropped.
+  hydratePendings(function () {
+    var entry = state.pending.get(proposalId);
+    if (entry) entry.resolve({ choice: choice, reason: reason });
+    else clearConsentPrompt(proposalId); // already decided elsewhere
+  });
 }
 
 // Self-test so the user can verify OS notification settings at any time.
@@ -796,7 +800,8 @@ function mockPropose() {
 
 // ---------------------------------------------------------------- messages from the side panel
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
-  if (!msg || typeof msg.kind !== "string" || msg.kind.indexOf("jbb.ui.") !== 0) {
+  if (!msg || typeof msg.kind !== "string" ||
+      (msg.kind.indexOf("jbb.ui.") !== 0 && msg.kind !== "jbb.banner.decision")) {
     return false;
   }
   var done = function (payload) { sendResponse(Object.assign({ ok: true }, payload || {})); };
@@ -904,13 +909,16 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       done();
       break;
 
-    case "jbb.banner.decision": {
-      var bEntry = state.pending.get(msg.proposalId);
-      if (bEntry) bEntry.resolve({ choice: msg.choice });
-      else dismissBannerConsent(msg.proposalId);
-      done();
-      break;
-    }
+    case "jbb.banner.decision":
+      // Same hydration need as notifications: the worker may have slept
+      // since the proposal arrived.
+      hydratePendings(function () {
+        var bEntry = state.pending.get(msg.proposalId);
+        if (bEntry) bEntry.resolve({ choice: msg.choice });
+        else dismissBannerConsent(msg.proposalId);
+        done();
+      });
+      return true; // async
 
     case "jbb.ui.observe":
       observeActiveTab(!!msg.screenshot).then(
