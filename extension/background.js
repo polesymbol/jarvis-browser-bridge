@@ -456,6 +456,13 @@ function handleProposal(proposal, source) {
     return;
   }
   if (verdict.decision === "allow") {
+    // Auto-allowed (e.g. trusted site): the driver still needs the verdict —
+    // otherwise it waits for a consent message that never comes.
+    var autoScope = (function () {
+      var h = hostOf(proposal.site || "");
+      return (h && state.sites[h] === "allow") ? "site" : "once";
+    })();
+    sendToRelay(JBB.Message.consentGrant(proposal.proposalId, autoScope));
     executeProposal(proposal);
     return;
   }

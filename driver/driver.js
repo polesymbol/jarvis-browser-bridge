@@ -140,18 +140,26 @@ async function main() {
       type: opt('--type', 'click'),
       target: { ref: opt('--ref', null), label: opt('--target', '') },
       value: opt('--value', undefined),
+      url: opt('--url', undefined),
       site: opt('--site', ''),
       description: `${opt('--type', 'click')} '${opt('--target', '')}'`,
     };
     const id = `act-${Date.now()}`;
     console.error('[sent] act.propose — waiting for user consent…');
-    const consent = await sendResilient(ws, { v: 1, type: 'act.propose', id, proposal }, ['consent.grant', 'consent.deny'], 120000);
-    console.error(`[consent] ${consent.type}${consent.scope ? ` scope=${consent.scope}` : ''}`);
-    if (consent.type === 'consent.grant') {
-      const result = await waitFor(ws, ['act.result'], 60000);
-      console.log(JSON.stringify(result, null, 2));
+    // Accept act.result during the consent wait too: a verdict may arrive
+    // implicitly (auto-allow executes without a separate grant on old builds).
+    const first = await sendResilient(ws, { v: 1, type: 'act.propose', id, proposal }, ['consent.grant', 'consent.deny', 'act.result'], 120000);
+    if (first.type === 'act.result') {
+      console.log(JSON.stringify(first, null, 2));
     } else {
-      console.log(JSON.stringify({ denied: true, consent }, null, 2));
+      const consent = first;
+      console.error(`[consent] ${consent.type}${consent.scope ? ` scope=${consent.scope}` : ''}`);
+      if (consent.type === 'consent.grant') {
+        const result = await waitFor(ws, ['act.result'], 60000);
+        console.log(JSON.stringify(result, null, 2));
+      } else {
+        console.log(JSON.stringify({ denied: true, consent }, null, 2));
+      }
     }
   } else if (CMD === 'abort') {
     ws.send(JSON.stringify({ v: 1, type: 'session.abort', reason: 'driver CLI abort' }));
