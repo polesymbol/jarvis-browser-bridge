@@ -26,6 +26,8 @@
       --ember-ink: #180b05;
       --session: #79c873;
       --session-ink: #071208;
+      --warn: #f0a43a;
+      --warn-ink: #201204;
       --paper: #eee5d7;
       --paper-ink: #1b1711;
       --shadow: 0 34px 100px rgba(0, 0, 0, .42);
@@ -48,6 +50,8 @@
         --ember-ink: #fff9f2;
         --session: #2e7b3a;
         --session-ink: #f7fff7;
+        --warn: #9a5700;
+        --warn-ink: #fff8e8;
         --paper: #19150f;
         --paper-ink: #f1e9dc;
         --shadow: 0 34px 100px rgba(74, 55, 31, .16);
@@ -320,6 +324,30 @@
     .trust-block h3 { max-width: 470px; margin: 0; font: 600 clamp(31px, 3.6vw, 50px)/1.02 "Fraunces", serif; letter-spacing: -.035em; }
     .trust-block p { max-width: 540px; margin: 24px 0 0; color: var(--ink-soft); font-size: 17px; line-height: 1.7; }
 
+    .safety-panel {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(320px, .78fr) minmax(0, 1.22fr);
+      margin-top: clamp(72px, 10vw, 124px);
+      border: 1px solid var(--warn);
+      background: color-mix(in srgb, var(--warn) 7%, var(--surface));
+      overflow: hidden;
+    }
+    .safety-panel::before { content: ""; position: absolute; inset: 0 0 auto; height: 5px; background: var(--warn); }
+    .safety-lead { padding: clamp(40px, 6vw, 72px); border-right: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line)); }
+    .safety-kicker { display: flex; align-items: center; gap: 10px; margin: 0 0 34px; color: var(--warn); font: 500 11px/1.4 "IBM Plex Mono", monospace; }
+    .safety-kicker::before { content: ""; width: 9px; height: 9px; background: var(--warn); box-shadow: 0 0 0 5px color-mix(in srgb, var(--warn) 14%, transparent); }
+    .safety-lead h2 { max-width: 520px; margin: 0; font: 600 clamp(42px, 5vw, 66px)/.95 "Fraunces", serif; letter-spacing: -.045em; text-wrap: balance; }
+    .safety-lede { max-width: 520px; margin: 28px 0 0; color: var(--ink-soft); font-size: 17px; line-height: 1.68; }
+    .safety-command { display: block; margin-top: 34px; padding: 17px 18px; background: var(--warn); color: var(--warn-ink); font-size: 15px; line-height: 1.45; }
+    .safety-rules { padding: clamp(28px, 4vw, 48px) clamp(30px, 5vw, 64px); }
+    .safety-rule { display: grid; grid-template-columns: 42px 1fr; gap: 18px; padding: 24px 0; border-bottom: 1px solid color-mix(in srgb, var(--warn) 38%, var(--line)); }
+    .safety-rule:last-child { border-bottom: 0; }
+    .safety-no { color: var(--warn); font: 500 10px/1.5 "IBM Plex Mono", monospace; }
+    .safety-rule h3 { margin: 0; font: 600 23px/1.12 "Fraunces", serif; letter-spacing: -.02em; }
+    .safety-rule p { max-width: 660px; margin: 9px 0 0; color: var(--ink-soft); font-size: 15px; line-height: 1.65; }
+    .safety-rule strong { color: var(--ink); font-weight: 600; }
+
     .session-section { padding: clamp(110px, 15vw, 180px) 0; border-top: 1px solid var(--line); }
     .session-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(390px, .82fr); gap: clamp(62px, 9vw, 128px); align-items: center; }
     .session-copy h2 { max-width: 720px; margin: 20px 0 0; font-size: clamp(50px, 7vw, 90px); }
@@ -400,6 +428,8 @@
       .proof-cell:nth-child(3) { border-left: 1px solid var(--line); border-top: 1px solid var(--line); }
       .proof-cell:nth-child(4) { border-top: 1px solid var(--line); }
       .demo-intro, .session-layout, .beta { grid-template-columns: 1fr; align-items: start; }
+      .safety-panel { grid-template-columns: 1fr; }
+      .safety-lead { border-right: 0; border-bottom: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line)); }
       .grant-console { width: min(640px, 100%); }
       .sequence-top { align-items: start; flex-direction: column; }
       .steps { grid-template-columns: 1fr 1fr; }
@@ -437,6 +467,12 @@
       .trust-grid { grid-template-columns: 1fr; }
       .trust-block, .trust-block:nth-child(even) { padding: 38px 0 44px; border-left: 0; }
       .trust-word { margin-bottom: 34px; }
+      .safety-panel { margin-top: 56px; }
+      .safety-lead { padding: 40px 22px 32px; }
+      .safety-rules { padding: 10px 22px 18px; }
+      .safety-rule { grid-template-columns: 30px 1fr; gap: 10px; padding: 22px 0; }
+      .safety-rule h3 { font-size: 21px; }
+      .safety-command { margin-top: 28px; }
       .session-layout { gap: 48px; }
       .session-rules { grid-template-columns: 1fr; }
       .grant-options { grid-template-columns: 1fr; }
@@ -570,6 +606,33 @@
           <p>The agent observes what is needed for the current task, acts with explicit permission, then moves on. Private page contents do not need to become retained personal history.</p>
         </article>
       </div>
+
+      <aside class="safety-panel" aria-labelledby="safetyTitle">
+        <div class="safety-lead">
+          <p class="safety-kicker">Safety first / required setup</p>
+          <h2 id="safetyTitle">A fresh Chrome profile is not optional.</h2>
+          <p class="safety-lede">The bridge can see every page visited inside the profile where it runs. Its privacy promise depends on keeping that profile clean and deliberately limited.</p>
+          <strong class="safety-command">Never install Musebridge in your main everyday Chrome profile.</strong>
+        </div>
+        <div class="safety-rules" aria-label="Required Chrome profile safety rules">
+          <div class="safety-rule">
+            <span class="safety-no">01</span>
+            <div><h3>Start empty.</h3><p>Use a <strong>brand-new Chrome profile</strong> with no saved passwords, payment methods, addresses or personal data.</p></div>
+          </div>
+          <div class="safety-rule">
+            <span class="safety-no">02</span>
+            <div><h3>Keep your everyday profile separate.</h3><p>Do not add the extension to the profile you use for personal browsing, banking, email or daily work.</p></div>
+          </div>
+          <div class="safety-rule">
+            <span class="safety-no">03</span>
+            <div><h3>Do not bring Chrome Sync with you.</h3><p>Never sign into the new profile with an existing Gmail account. Chrome Sync can pull in saved passwords, bookmarks, payment methods and addresses, defeating the separation. <strong>Use a brand-new email or skip Chrome sign-in.</strong></p></div>
+          </div>
+          <div class="safety-rule">
+            <span class="safety-no">04</span>
+            <div><h3>Choose access site by site.</h3><p>Inside the fresh profile, log into only the sites you want the assistant to automate. <strong>Signing into a site is the consent mechanism</strong> that makes that account available to the bridge.</p></div>
+          </div>
+        </div>
+      </aside>
     </section>
 
     <section class="session-section" id="session-grants">
