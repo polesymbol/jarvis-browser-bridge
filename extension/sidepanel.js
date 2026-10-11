@@ -77,19 +77,20 @@ function setKey(key, showOnce) {
 // ---------------------------------------------------------------- status / mode
 function renderStatus(s) {
   var pill = el("statusPill");
+  var label = pill.querySelector(".signal-text") || pill;
+  function setSignal(cls, text) {
+    pill.className = "signal" + (cls ? " " + cls : "");
+    label.textContent = text;
+  }
   if (s.killed) {
-    pill.textContent = "Killed";
-    pill.className = "pill pill-bad";
+    setSignal("dead", "Killed");
   } else if (s.connected) {
-    pill.textContent = "Connected";
-    pill.className = "pill pill-ok";
+    setSignal("on", "Connected");
     el("keyReconnectNotice").classList.add("hidden");
   } else if (s.mockMode) {
-    pill.textContent = "Mock mode";
-    pill.className = "pill pill-warn";
+    setSignal("", "Mock mode");
   } else {
-    pill.textContent = "Idle";
-    pill.className = "pill pill-idle";
+    setSignal("", "Idle");
   }
   el("mockBanner").classList.toggle("hidden", !s.mockMode);
   el("killBtn").classList.toggle("hidden", !!s.killed);
@@ -199,10 +200,10 @@ function renderSites(sites) {
   hosts.sort().forEach(function (host) {
     var row = document.createElement("div");
     row.className = "site-row";
-    var pill = sites[host] === "deny"
-      ? '<span class="pill pill-bad">Blocked</span>'
-      : '<span class="pill pill-ok">Allowed</span>';
-    row.innerHTML = '<span class="site-host">' + esc(host) + "</span>" + pill;
+    var tag = sites[host] === "deny"
+      ? '<span class="mini-tag tag-bad">blocked</span>'
+      : '<span class="mini-tag tag-ok">allowed</span>';
+    row.innerHTML = '<span class="site-host">' + esc(host) + "</span>" + tag;
     var btn = document.createElement("button");
     btn.className = "btn btn-danger";
     btn.textContent = "Revoke";

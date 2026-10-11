@@ -4,19 +4,28 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Jarvis Browser Bridge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="sidepanel.css">
 </head>
 <body>
 
 <header class="app-header">
   <div class="brand">
-    <div class="brand-mark">J</div>
+    <div class="brand-mark" aria-hidden="true">
+      <svg width="20" height="20" viewBox="0 0 32 32" fill="none">
+        <path d="M4 21 Q16 7 28 21" stroke="#e8710a" stroke-width="2.6" stroke-linecap="round"/>
+        <path d="M9.5 21 v7 M16 21 v7 M22.5 21 v7" stroke="#e8710a" stroke-width="2" stroke-linecap="round"/>
+        <path d="M4 28 h24" stroke="#8f8875" stroke-width="2" stroke-linecap="round"/>
+      </svg>
+    </div>
     <div>
-      <div class="brand-name">Jarvis Browser Bridge</div>
-      <div class="brand-sub" id="brandSub">· protocol 1.0</div>
+      <div class="brand-name">Jarvis Bridge</div>
+      <div class="brand-sub" id="brandSub">v0.2.0 · protocol 1.0</div>
     </div>
   </div>
-  <div id="statusPill" class="pill pill-idle">Idle</div>
+  <div id="statusPill" class="signal"><span class="dot"></span><span class="signal-text">Idle</span></div>
 </header>
 
 <!-- Consent requests always surface at the top, whatever tab is open -->
@@ -25,13 +34,6 @@
 <!-- Active time-boxed session grant, with one-click revoke -->
 <div id="sessionBar" class="session-bar hidden"></div>
 
-<!-- Kill switch: always visible, always one tap -->
-<div class="kill-wrap">
-  <button id="killBtn" class="kill-btn" title="Shortcut: Ctrl+Shift+K / Cmd+Shift+K">
-    ⛔ Kill session
-  </button>
-  <button id="reviveBtn" class="revive-btn hidden">Start new session</button>
-</div>
 <div id="killedBanner" class="killed-banner hidden">
   Session killed. Nothing can act until you start a new session.
 </div>
@@ -114,7 +116,7 @@
       <div id="keyMasked" class="hidden">
         <div class="row between">
           <code id="keyMaskedValue" class="key-masked"></code>
-          <span class="pill pill-ok">Active</span>
+          <span class="mini-tag tag-ok">active</span>
         </div>
         <div class="row">
           <button id="regenKeyBtn" class="btn btn-secondary">Regenerate</button>
@@ -164,6 +166,13 @@
 </main>
 
 <div id="toast" class="toast hidden"></div>
+
+<!-- Kill dock: pinned to the bottom, always in thumb's reach -->
+<footer class="dock">
+  <button id="killBtn" class="kill-btn" title="Shortcut: Ctrl+Shift+K / Cmd+Shift+K">Kill session</button>
+  <button id="reviveBtn" class="revive-btn hidden">Start new session</button>
+  <div class="dock-meta" id="dockMeta">jarvis bridge · local enforcement</div>
+</footer>
 
 <script src="protocol.js"></script>
 <script src="sidepanel.js"></script>

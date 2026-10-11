@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Jarvis Browser Bridge",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "Lets your AI assistant drive your own Chrome \u2014 your IP, your logins \u2014 under permissions you control. Private v1.",
   "minimum_chrome_version": "114",
   "host_permissions": [
@@ -43,5 +43,8 @@
     "16": "icon16.png",
     "48": "icon48.png",
     "128": "icon128.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com"
   }
 }
