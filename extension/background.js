@@ -27,7 +27,8 @@ var K = {
   SETTINGS: "jbb.settings",    // { mode, relayUrl }
   SITES: "jbb.sites",          // { hostname: "allow" | "deny" }
   AUDIT: "jbb.audit",          // [ entries ], capped
-  PENDING: "jbb.pending"       // { proposalId: { proposal, createdAt } } — survives worker restarts
+  PENDING: "jbb.pending",      // { proposalId: { proposal, createdAt } } — survives worker restarts
+  SESSION: "jbb.session"       // { site, grantedAt, expiresAt, label } — time-boxed grant, survives restarts
 };
 
 var AUDIT_CAP = 500;
@@ -44,7 +45,8 @@ var state = {
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer }
   consentNotifs: {},           // notificationId -> proposalId (universal prompt)
-  consentBanners: {}           // proposalId -> tabId (in-page banner)
+  consentBanners: {},          // proposalId -> tabId (in-page banner)
+  session: null                // time-boxed grant: { site, grantedAt, expiresAt, label }
 };
 
 var proposalSeq = 0;
@@ -69,6 +71,8 @@ chrome.runtime.onStartup.addListener(function () { loadPersisted(); hydratePendi
 chrome.alarms.onAlarm.addListener(function (alarm) {
   if (!alarm || alarm.name !== "jbb-keepalive") return;
   hydratePendings();
+  // Hard expiry for session grants — no silent extension, ever.
+  if (state.session && Date.now() >= state.session.expiresAt) expireSession("expired");
   chrome.storage.local.get([K.SETTINGS], function (res) {
     var s = res[K.SETTINGS] || {};
     if (s.relayUrl && !state.connected && !s.killed) {
@@ -81,12 +85,16 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
 });
 
 function loadPersisted() {
-  chrome.storage.local.get([K.SETTINGS, K.SITES], function (res) {
+  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION], function (res) {
     var s = res[K.SETTINGS] || {};
     state.mode = s.mode || "ask-some";
     state.relayUrl = s.relayUrl || "";
     state.sites = res[K.SITES] || {};
     state.sessionKilled = !!s.killed;
+    var sess = res[K.SESSION];
+    state.session = (sess && sess.expiresAt > Date.now()) ? sess : null;
+    if (!state.session && sess) chrome.storage.local.remove([K.SESSION]);
+    refreshBadge();
   });
 }
 
@@ -95,6 +103,63 @@ function saveSettings() {
     [K.SETTINGS]: { mode: state.mode, relayUrl: state.relayUrl, killed: state.sessionKilled },
     [K.SITES]: state.sites
   });
+}
+
+// ---------------------------------------------------------------- session grants
+// Time-boxed consent: the user grants Muse a window (1 hour / 24 hours) to act
+// on a site without per-action prompts. T3 actions are NEVER covered — they
+// always ask. Expiry is hard: no silent extension. One-click revoke anytime.
+function saveSession() {
+  if (state.session) chrome.storage.local.set({ [K.SESSION]: state.session });
+  else chrome.storage.local.remove([K.SESSION]);
+}
+
+function sessionAllows(proposal) {
+  var s = state.session;
+  if (!s) return false;
+  if (Date.now() >= s.expiresAt) { expireSession("expired"); return false; }
+  return hostOf(proposal.site || "") === s.site;
+}
+
+function sessionRemaining() {
+  var s = state.session;
+  if (!s) return "";
+  var ms = Math.max(0, s.expiresAt - Date.now());
+  var m = Math.floor(ms / 60000);
+  if (m < 60) return m + "m";
+  var h = Math.floor(m / 60);
+  if (h < 24) return h + "h " + (m % 60) + "m";
+  return Math.floor(h / 24) + "d " + (h % 24) + "h";
+}
+
+function expireSession(reason) {
+  var s = state.session;
+  if (!s) return;
+  state.session = null;
+  saveSession();
+  audit({ site: s.site, action: "session grant", tier: "T0",
+          result: "ended", detail: "session " + reason + " (" + s.label + ")" });
+  refreshBadge();
+  pushToPanel({ kind: "jbb.ui.sessionChanged" });
+}
+
+function revokeSession() {
+  if (!state.session) return;
+  expireSession("revoked by user");
+}
+
+function refreshBadge() {
+  if (Object.keys(state.consentNotifs).length > 0) {
+    chrome.action.setBadgeText({ text: "?" });
+    chrome.action.setBadgeBackgroundColor({ color: "#E8710A" });
+    return;
+  }
+  if (state.session && Date.now() < state.session.expiresAt) {
+    chrome.action.setBadgeText({ text: "S" });
+    chrome.action.setBadgeBackgroundColor({ color: "#2E9E5B" });
+    return;
+  }
+  chrome.action.setBadgeText({ text: "" });
 }
 
 // ---------------------------------------------------------------- pending-proposal durability
@@ -206,8 +271,7 @@ function notifyConsent(proposal) {
       pushToPanel({ kind: "jbb.ui.notifFailed", error: err });
     }
   });
-  chrome.action.setBadgeText({ text: "?" });
-  chrome.action.setBadgeBackgroundColor({ color: "#E8710A" });
+  refreshBadge();
 }
 
 function clearConsentPrompt(proposalId) {
@@ -218,7 +282,7 @@ function clearConsentPrompt(proposalId) {
     }
   });
   if (Object.keys(state.consentNotifs).length === 0) {
-    chrome.action.setBadgeText({ text: "" });
+    refreshBadge();
   }
 }
 
@@ -302,7 +366,7 @@ function jbbConsentBanner(summary) {
   bar.id = BANNER_ID;
   bar.setAttribute("style", [
     "position:fixed", "top:12px", "left:50%", "transform:translateX(-50%)",
-    "z-index:2147483647", "display:flex", "align-items:center", "gap:10px",
+    "z-index:2147483647", "display:flex", "flex-wrap:wrap", "align-items:center", "gap:10px",
     "background:#17171c", "color:#f5f5f7", "border:1px solid #3a3a44",
     "border-left:4px solid #e8710a", "border-radius:12px",
     "padding:10px 14px", "font:14px/1.4 -apple-system,'Segoe UI',Roboto,sans-serif",
@@ -343,6 +407,8 @@ function jbbConsentBanner(summary) {
   bar.appendChild(txt);
   bar.appendChild(btn("Allow once", true, "once"));
   bar.appendChild(btn("This site", false, "site"));
+  bar.appendChild(btn("1 hour", false, "session1h"));
+  bar.appendChild(btn("1 day", false, "session24h"));
   bar.appendChild(btn("Deny", false, "deny"));
   (document.documentElement || document.body).appendChild(bar);
 }
@@ -605,12 +671,19 @@ function handleProposal(proposal, source) {
   // LOCAL ENFORCEMENT: the gate runs before anything else.
   var verdict = decideAction(proposal);
 
+  // Session grants layer on top of "ask": a live time-boxed grant auto-allows
+  // T1/T2 on its site. T3 is NEVER covered — sensitive actions always ask.
+  var viaSession = verdict.decision === "ask" &&
+                   proposal.actionTier !== "T3" &&
+                   sessionAllows(proposal);
+
   audit({
     site: proposal.site || "-",
     action: proposal.description || proposal.type,
     tier: proposal.actionTier || "?",
-    result: verdict.decision === "allow" ? "allowed" : verdict.decision === "deny" ? "denied" : "awaiting consent",
-    detail: verdict.reason || null
+    result: verdict.decision === "deny" ? "denied" :
+            (verdict.decision === "allow" || viaSession) ? "allowed" : "awaiting consent",
+    detail: viaSession ? "session grant (" + sessionRemaining() + " left)" : (verdict.reason || null)
   });
 
   if (verdict.decision === "deny") {
@@ -618,10 +691,10 @@ function handleProposal(proposal, source) {
     sendToRelay(JBB.Message.actResult(proposal.proposalId, false, verdict.reason));
     return;
   }
-  if (verdict.decision === "allow") {
+  if (verdict.decision === "allow" || viaSession) {
     // Auto-allowed (e.g. trusted site): the driver still needs the verdict —
     // otherwise it waits for a consent message that never comes.
-    var autoScope = (function () {
+    var autoScope = viaSession ? "session" : (function () {
       var h = hostOf(proposal.site || "");
       return (h && state.sites[h] === "allow") ? "site" : "once";
     })();
@@ -667,6 +740,30 @@ function resolveConsent(proposal, answer) {
         .catch(function () {});
       pushToPanel({ kind: "jbb.ui.sitesChanged" });
     }
+  }
+
+  // Time-boxed session grant: Muse may act on this site without per-action
+  // prompts until the window lapses. T3 actions are still never covered.
+  if (answer.choice === "session1h" || answer.choice === "session24h") {
+    var shost = hostOf(proposal.site || "");
+    var sms = answer.choice === "session1h" ? 3600e3 : 86400e3;
+    state.session = {
+      site: shost,
+      grantedAt: Date.now(),
+      expiresAt: Date.now() + sms,
+      label: answer.choice === "session1h" ? "1 hour" : "24 hours"
+    };
+    saveSession();
+    audit({
+      site: proposal.site || "-",
+      action: "session grant",
+      tier: proposal.actionTier,
+      result: "allowed",
+      detail: "granted " + state.session.label + " for " + shost + " (T3 still asks)"
+    });
+    refreshBadge();
+    pushToPanel({ kind: "jbb.ui.sessionChanged" });
+    answer = { choice: "session" };
   }
   sendToRelay(JBB.Message.consentGrant(proposal.proposalId, answer.choice));
   pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: proposal.proposalId, choice: answer.choice });
@@ -809,6 +906,8 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   switch (msg.kind) {
     case "jbb.ui.getState":
       chrome.storage.local.get([K.AUDIT], function (res) {
+        var sess = state.session;
+        if (sess && Date.now() >= sess.expiresAt) { expireSession("expired"); sess = null; }
         done({
           connected: state.connected,
           mockMode: !state.relayUrl,
@@ -817,6 +916,8 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           sites: state.sites,
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
+          session: sess ? { site: sess.site, label: sess.label,
+                            remainingMs: Math.max(0, sess.expiresAt - Date.now()) } : null,
           audit: res[K.AUDIT] || []
         });
       });
@@ -887,6 +988,11 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           .catch(function () {});
         pushToPanel({ kind: "jbb.ui.sitesChanged" });
       }
+      done();
+      break;
+
+    case "jbb.ui.revokeSession":
+      revokeSession();
       done();
       break;
 

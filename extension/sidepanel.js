@@ -138,6 +138,8 @@ function renderConsentCard(proposal) {
     '<div class="consent-actions">' +
       '<button class="btn btn-primary" data-choice="once">Allow once</button>' +
       '<button class="btn btn-secondary" data-choice="site">Always on this site</button>' +
+      '<button class="btn btn-secondary" data-choice="session1h">For 1 hour</button>' +
+      '<button class="btn btn-secondary" data-choice="session24h">For 1 day</button>' +
       '<button class="btn btn-danger" data-choice="deny">Deny</button>' +
     "</div>";
 
@@ -150,6 +152,39 @@ function renderConsentCard(proposal) {
   });
 
   area.prepend(card);
+}
+
+// ---------------------------------------------------------------- session grant
+function fmtRemaining(ms) {
+  var m = Math.max(0, Math.floor(ms / 60000));
+  if (m < 60) return m + "m left";
+  var h = Math.floor(m / 60);
+  return h + "h " + (m % 60) + "m left";
+}
+
+function renderSession(session) {
+  var bar = el("sessionBar");
+  if (!session) { bar.classList.add("hidden"); bar.innerHTML = ""; return; }
+  bar.classList.remove("hidden");
+  bar.innerHTML = "";
+  var dot = document.createElement("span");
+  dot.className = "session-dot";
+  var txt = document.createElement("span");
+  txt.className = "session-text";
+  var strong = document.createElement("strong");
+  strong.textContent = "Session active";
+  txt.appendChild(strong);
+  txt.appendChild(document.createTextNode(
+    " — " + session.site + " · " + fmtRemaining(session.remainingMs) + " · T3 still asks"));
+  var revoke = document.createElement("button");
+  revoke.className = "session-revoke";
+  revoke.textContent = "Revoke";
+  revoke.addEventListener("click", function () {
+    api({ kind: "jbb.ui.revokeSession" }).then(function () { refresh(); });
+  });
+  bar.appendChild(dot);
+  bar.appendChild(txt);
+  bar.appendChild(revoke);
 }
 
 // ---------------------------------------------------------------- sites
@@ -218,6 +253,7 @@ function refresh() {
     renderStatus(s);
     renderModes(s.mode);
     renderSites(s.sites);
+    renderSession(s.session);
     renderAudit(s.audit);
     // Don't clobber the relay URL while the user is typing it: status
     // updates arrive on every (re)connect attempt, and the old code wiped
@@ -244,6 +280,9 @@ chrome.runtime.onMessage.addListener(function (msg) {
     case "jbb.ui.status":
       refresh();
       if (msg.error) toast(msg.error);
+      break;
+    case "jbb.ui.sessionChanged":
+      refresh();
       break;
     case "jbb.ui.notifFailed":
       el("notifWarnErr").textContent = msg.error || "unknown error";
