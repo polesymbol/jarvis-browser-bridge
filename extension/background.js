@@ -42,7 +42,8 @@ var state = {
   mode: "ask-some",            // readonly | ask-some | always-ask
   sites: {},
   sessionKilled: false,
-  pending: new Map()           // proposalId -> { proposal, resolve, timer }
+  pending: new Map(),          // proposalId -> { proposal, resolve, timer }
+  consentNotifs: {}            // notificationId -> proposalId (universal prompt)
 };
 
 var proposalSeq = 0;
@@ -135,9 +136,13 @@ function trackPending(proposal, remainingMs) {
     proposal: proposal,
     timer: timer,
     resolve: function (answer) {
+      // Idempotent: the card and the notification are two paths to one
+      // decision — the first one wins, the second is a no-op.
+      if (!state.pending.has(proposal.proposalId)) return;
       clearTimeout(timer);
       state.pending.delete(proposal.proposalId);
       unpersistPending(proposal.proposalId);
+      clearConsentPrompt(proposal.proposalId);
       resolveConsent(proposal, answer);
     }
   };
@@ -157,6 +162,10 @@ function hydratePendings(done) {
       var remaining = CONSENT_TIMEOUT_MS - (now - rec.createdAt);
       if (remaining > 0 && !state.pending.has(id)) {
         trackPending(rec.proposal, remaining);
+        // The worker restarted mid-consent: the visible notification's click
+        // mapping died with the old worker, so re-raise it (same ID updates
+        // it in place; runs once — next tick sees it in state.pending).
+        notifyConsent(rec.proposal);
       } else if (remaining <= 0) {
         unpersistPending(id);
       }
@@ -164,6 +173,65 @@ function hydratePendings(done) {
     if (done) done();
   });
 }
+
+// ---------------------------------------------------------------- universal consent prompt
+//
+// The side-panel card is invisible when the panel is closed — a consent gate
+// the user can miss is not a consent gate. So every "ask" also raises an OS
+// notification (works with the panel closed) and a badge on the toolbar
+// icon. Card and notification are two paths to the same pending proposal;
+// the first decision wins (see the idempotent resolve above).
+
+function notifyConsent(proposal) {
+  var notifId = "jbb-consent-" + proposal.proposalId;
+  state.consentNotifs[notifId] = proposal.proposalId;
+  var where = hostOf(proposal.site || "") || "this site";
+  chrome.notifications.create(notifId, {
+    type: "basic",
+    iconUrl: "icon128.png",
+    title: "Jarvis wants your approval",
+    message: (proposal.description || proposal.type) + " — on " + where,
+    buttons: [{ title: "Allow once" }, { title: "Deny" }],
+    priority: 2,
+    requireInteraction: true
+  }, function () {
+    if (chrome.runtime.lastError) delete state.consentNotifs[notifId];
+  });
+  chrome.action.setBadgeText({ text: "?" });
+  chrome.action.setBadgeBackgroundColor({ color: "#E8710A" });
+}
+
+function clearConsentPrompt(proposalId) {
+  Object.keys(state.consentNotifs).forEach(function (notifId) {
+    if (state.consentNotifs[notifId] === proposalId) {
+      delete state.consentNotifs[notifId];
+      chrome.notifications.clear(notifId);
+    }
+  });
+  if (Object.keys(state.consentNotifs).length === 0) {
+    chrome.action.setBadgeText({ text: "" });
+  }
+}
+
+function decideFromNotification(proposalId, choice, reason) {
+  var entry = state.pending.get(proposalId);
+  if (entry) entry.resolve({ choice: choice, reason: reason });
+  else clearConsentPrompt(proposalId); // already decided elsewhere
+}
+
+chrome.notifications.onButtonClicked.addListener(function (notifId, btnIdx) {
+  var proposalId = state.consentNotifs[notifId];
+  if (!proposalId) return;
+  if (btnIdx === 0) decideFromNotification(proposalId, "once");
+  else decideFromNotification(proposalId, "deny", "denied from notification");
+});
+
+chrome.notifications.onClosed.addListener(function (notifId, byUser) {
+  var proposalId = state.consentNotifs[notifId];
+  if (!proposalId) return;
+  // Dismissed without a decision: fail closed.
+  decideFromNotification(proposalId, "deny", "notification dismissed");
+});
 
 // Make sure the relay socket is up (and paired) before sending anything that
 // must reach the driver — e.g. a consent grant after a worker restart.
@@ -398,6 +466,8 @@ function handleProposal(proposal, source) {
   persistPending(proposal);
 
   pushToPanel({ kind: "jbb.ui.consentRequest", proposal: proposal });
+  // Universal prompt: the panel card is invisible when the panel is closed.
+  notifyConsent(proposal);
 }
 
 function resolveConsent(proposal, answer) {

@@ -10,14 +10,17 @@ Full product spec: `~/workspace/your_files/browser-control-extension/ARCHITECTUR
 The **extension only** (the hands). The relay server and the Jarvis driver
 are separate components and are not built here.
 
-- `manifest.json` — Manifest V3. Minimal install permissions
-  (`activeTab`, `sidePanel`, `storage`, `tabs`, `scripting`).
-  Host access is requested **on demand per site** via
-  `optional_host_permissions` — never `<all_urls>`.
+- `manifest.json` — Manifest V3. Install permissions
+  (`activeTab`, `alarms`, `sidePanel`, `storage`, `tabs`, `scripting`,
+  `notifications`); host access via `<all_urls>` (page observation and actions
+  need it; the extension's own permission modes govern actual use).
 - `protocol.js` — protocol v1.0 message shapes shared by all parts.
 - `background.js` — service worker: WebSocket relay client, **local
   permission enforcement** (`decideAction()` — a compromised relay must not
   be able to escalate), consent flow, screenshots, kill switch.
+  Every consent decision raises **both** a side-panel card and a universal OS
+  notification (plus a toolbar badge), so approval can't be missed when the
+  panel is closed — first decision wins, dismissal fails closed.
 - `content.js` — page observer + trusted-event actions. Page content is
   data, never instructions (see the comment at the top of the file).
 - `sidepanel.html` / `sidepanel.css` / `sidepanel.js` — the trust-story UI:
