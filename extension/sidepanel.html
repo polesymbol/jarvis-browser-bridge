@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis Browser Bridge</title>
+<link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+
+<header class="app-header">
+  <div class="brand">
+    <div class="brand-mark">J</div>
+    <div>
+      <div class="brand-name">Jarvis Browser Bridge</div>
+      <div class="brand-sub">v0.1.0 · protocol 1.0</div>
+    </div>
+  </div>
+  <div id="statusPill" class="pill pill-idle">Idle</div>
+</header>
+
+<!-- Consent requests always surface at the top, whatever tab is open -->
+<div id="consentArea"></div>
+
+<!-- Kill switch: always visible, always one tap -->
+<div class="kill-wrap">
+  <button id="killBtn" class="kill-btn" title="Shortcut: Ctrl+Shift+K / Cmd+Shift+K">
+    ⛔ Kill session
+  </button>
+  <button id="reviveBtn" class="revive-btn hidden">Start new session</button>
+</div>
+<div id="killedBanner" class="killed-banner hidden">
+  Session killed. Nothing can act until you start a new session.
+</div>
+
+<nav class="tabs">
+  <button class="tab active" data-tab="session">Session</button>
+  <button class="tab" data-tab="key">Key</button>
+  <button class="tab" data-tab="sites">Sites</button>
+  <button class="tab" data-tab="audit">Audit</button>
+</nav>
+
+<main>
+  <!-- ================= SESSION ================= -->
+  <section id="tab-session" class="tab-panel active">
+    <div id="mockBanner" class="mock-banner hidden">
+      <strong>Mock mode</strong> — no relay configured. The bridge runs
+      standalone; nothing leaves this machine.
+      <button id="mockBtn" class="btn btn-secondary">Simulate action proposal</button>
+      <p class="hint">Opens a real consent card against the current tab so you can review the flow.</p>
+    </div>
+
+    <div class="card">
+      <h2>Permission mode</h2>
+      <p class="hint">Mirrors your Muse permission settings. This is the language the bridge speaks.</p>
+      <div id="modeList" class="mode-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>Relay</h2>
+      <label class="field">
+        <span>Relay URL (wss)</span>
+        <input id="relayUrl" type="text" placeholder="wss://relay.example.com/bridge" spellcheck="false">
+      </label>
+      <div class="row">
+        <button id="saveRelayBtn" class="btn btn-secondary">Save</button>
+        <button id="connectBtn" class="btn btn-primary">Connect</button>
+        <button id="disconnectBtn" class="btn btn-secondary">Disconnect</button>
+      </div>
+      <p class="hint">Leave empty to stay in mock mode. The relay only passes messages through — it never stores page content.</p>
+    </div>
+
+    <div class="card">
+      <h2>Current page</h2>
+      <div class="row">
+        <button id="observeBtn" class="btn btn-secondary">Snapshot this page</button>
+      </div>
+      <pre id="snapshotOut" class="snapshot hidden"></pre>
+    </div>
+  </section>
+
+  <!-- ================= KEY ================= -->
+  <section id="tab-key" class="tab-panel">
+    <div class="card">
+      <h2>Connector key</h2>
+      <p class="hint">
+        This key links <em>this browser</em> to your assistant — the same idea as an API key.
+        Anyone holding it can drive this browser as you.
+      </p>
+
+      <div id="keyReveal" class="key-reveal hidden">
+        <div class="key-warning">
+          ⚠️ <strong>Shown once. Never share it.</strong><br>
+          Treat this like a password. If it leaks, revoke it immediately below.
+        </div>
+        <code id="keyValue" class="key-value"></code>
+        <div class="row">
+          <button id="copyKeyBtn" class="btn btn-secondary">Copy</button>
+          <button id="keySavedBtn" class="btn btn-primary">I've saved it securely</button>
+        </div>
+      </div>
+
+      <div id="keyMasked" class="hidden">
+        <div class="row between">
+          <code id="keyMaskedValue" class="key-masked"></code>
+          <span class="pill pill-ok">Active</span>
+        </div>
+        <div class="row">
+          <button id="regenKeyBtn" class="btn btn-secondary">Regenerate</button>
+          <button id="revokeKeyBtn" class="btn btn-danger">Revoke</button>
+        </div>
+        <p class="hint">Regenerating replaces the key everywhere — the old one stops working instantly.</p>
+      </div>
+
+      <div id="keyNone" class="hidden">
+        <p class="hint">No key yet.</p>
+        <button id="genKeyBtn" class="btn btn-primary">Generate connector key</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= SITES ================= -->
+  <section id="tab-sites" class="tab-panel">
+    <div class="card">
+      <h2>Site permissions</h2>
+      <p class="hint">Grant or remove per-site access. One tap to revoke.</p>
+      <div class="row">
+        <button id="blockCurrentBtn" class="btn btn-secondary">Block current site</button>
+      </div>
+      <div id="sitesList" class="sites-list"></div>
+    </div>
+  </section>
+
+  <!-- ================= AUDIT ================= -->
+  <section id="tab-audit" class="tab-panel">
+    <div class="card">
+      <div class="row between">
+        <h2>Audit log</h2>
+        <button id="exportAuditBtn" class="btn btn-secondary">Export JSON</button>
+      </div>
+      <p class="hint">Every proposed and executed action, kept only on this machine.</p>
+      <div id="auditList" class="audit-list"></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="protocol.js"></script>
+<script src="sidepanel.js"></script>
+</body>
+</html>

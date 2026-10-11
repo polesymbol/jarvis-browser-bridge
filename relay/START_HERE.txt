@@ -1,0 +1,14 @@
+=== Jarvis Browser Bridge - relay package ===
+
+1. Install Node.js 18+ from https://nodejs.org
+2. Unzip, then in this folder run:  npm install
+3. Start the relay:  node relay/server.js
+   (leave it running; it only talks to YOUR extension and Jarvis)
+4. In another terminal, expose it:  cloudflared tunnel --url http://127.0.0.1:8787
+   (get cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+5. Copy the https://xxx.trycloudflare.com URL it prints.
+6. In the extension side panel, set Relay URL to:  wss://xxx.trycloudflare.com
+   (same URL, https -> wss)
+7. In the side panel Key tab: Generate key (shown once), then paste it to Jarvis in chat.
+
+To stop everything: Ctrl+C both terminals. To revoke access: Regenerate the key.
