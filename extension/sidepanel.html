@@ -34,6 +34,14 @@
   </div>
 </header>
 
+<!-- Safety requirement: fresh profile only. Shown until acknowledged. -->
+<div id="safetyBanner" class="safety-banner hidden">
+  <div class="safety-title">Fresh profile required</div>
+  <p>This bridge sees every page you visit. Run it <strong>only</strong> in a fresh Chrome profile — no saved passwords, payment methods, addresses, or personal data.</p>
+  <p>Never sign into Chrome with your existing Gmail here: Sync would pull your passwords, bookmarks, and payment methods into this profile, defeating the point. Use a brand-new email or skip sign-in.</p>
+  <button id="safetyAckBtn" class="btn btn-primary">I understand — fresh profile only</button>
+</div>
+
 <!-- Consent requests always surface at the top, whatever tab is open -->
 <div id="consentArea"></div>
 

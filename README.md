@@ -2,6 +2,14 @@
 
 Your AI assistant drives **your own Chrome** — your IP, your logged-in sessions — under permissions you control. Not a competing browser. An extension of the assistant to the rest of the web, with explicit per-site consent.
 
+## ⚠️ Safety first: fresh Chrome profile required
+
+This extension can see every page you visit. **Install it only in a fresh Chrome profile** — no saved passwords, payment methods, addresses, or other personal data.
+
+- **Never use your main profile.** Banking, email, saved passwords — keep all of that in a separate profile this extension never touches.
+- **Never sign into Chrome with your existing Gmail** to create the profile. Chrome Sync would pull your saved passwords, bookmarks, payment methods, and addresses from your Google account straight into this profile — defeating the entire purpose. Use a brand-new email or skip sign-in entirely.
+- Inside the fresh profile, log into **only** the sites you want the assistant to automate. Login itself is the consent mechanism.
+
 ## How it works
 
 Three parts, one protocol (v1):

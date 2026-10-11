@@ -327,6 +327,15 @@ document.addEventListener("DOMContentLoaded", function () {
     applyTheme(next);
   });
 
+  // Safety banner: fresh-profile requirement. Shown until acknowledged.
+  chrome.storage.local.get(["jbb.safetyAcked"], function (res) {
+    if (!res["jbb.safetyAcked"]) el("safetyBanner").classList.remove("hidden");
+  });
+  el("safetyAckBtn").addEventListener("click", function () {
+    chrome.storage.local.set({ "jbb.safetyAcked": true });
+    el("safetyBanner").classList.add("hidden");
+  });
+
   // Tabs
   document.querySelectorAll(".tab").forEach(function (tab) {
     tab.addEventListener("click", function () {

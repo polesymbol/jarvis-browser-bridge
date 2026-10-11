@@ -131,7 +131,7 @@ User-facing language mirrors Muse's native **Settings > Permissions** model: **"
 
 ## 5. Safety & trust architecture
 
-1. **Fresh Chrome profile (mandatory):** no saved passwords, no bank details, no sensitive data in the agent's reach. The user logs into only what they want automated — **login is consent**.
+1. **Fresh Chrome profile (mandatory):** no saved passwords, no bank details, no sensitive data in the agent's reach. The user logs into only what they want automated — **login is consent**. **Critical:** never sign into Chrome with an existing Gmail to create this profile — Chrome Sync would import saved passwords, payment methods, bookmarks, and addresses from the Google account, directly violating this rule. Use a brand-new email or skip sign-in.
 2. **Local enforcement:** the extension's service worker re-checks permissions before every action. A compromised relay cannot escalate.
 3. **Instruction hierarchy:** page content is data, never instructions. The driver is prompted to treat on-page text as untrusted.
 4. **v1 injection heuristics:** flag hidden text, instruction-like language in page content, and unexpected auth/payment flows → pause and ask the user. (Full classifier = v2.)

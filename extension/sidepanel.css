@@ -368,3 +368,16 @@ main { padding: 14px 16px 90px; }
 
 /* key reconnect row (was inline style; CSP blocks inline styles) */
 .key-reconnect-row { margin-top: 8px; }
+
+/* ---------- safety banner: fresh-profile requirement ---------- */
+.safety-banner {
+  margin: 12px 12px 0; padding: 14px;
+  border: 1px solid var(--warn); border-left: 4px solid var(--warn);
+  border-radius: 10px; background: var(--surface);
+}
+.safety-title {
+  font-family: "Fraunces", Georgia, serif; font-weight: 700; font-size: 15px;
+  color: var(--warn); margin-bottom: 8px;
+}
+.safety-banner p { margin: 0 0 8px; font-size: 12.5px; line-height: 1.5; color: var(--text); }
+.safety-banner .btn { margin-top: 4px; }
