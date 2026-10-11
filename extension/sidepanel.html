@@ -116,6 +116,14 @@
         <p class="hint">No key yet.</p>
         <button id="genKeyBtn" class="btn btn-primary">Generate connector key</button>
       </div>
+
+      <div id="keyReconnectNotice" class="key-warning hidden">
+        🔑 <strong>New key generated.</strong><br>
+        The relay is still using the old one — reconnect for the new key to take effect.
+        <div class="row" style="margin-top:8px">
+          <button id="reconnectKeyBtn" class="btn btn-primary">Reconnect now</button>
+        </div>
+      </div>
     </div>
   </section>
 

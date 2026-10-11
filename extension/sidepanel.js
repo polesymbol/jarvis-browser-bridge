@@ -83,6 +83,7 @@ function renderStatus(s) {
   } else if (s.connected) {
     pill.textContent = "Connected";
     pill.className = "pill pill-ok";
+    el("keyReconnectNotice").classList.add("hidden");
   } else if (s.mockMode) {
     pill.textContent = "Mock mode";
     pill.className = "pill pill-warn";
@@ -283,6 +284,7 @@ document.addEventListener("DOMContentLoaded", function () {
   // Key management
   el("genKeyBtn").addEventListener("click", function () {
     setKey(generateKey(), true);
+    el("keyReconnectNotice").classList.remove("hidden");
   });
   el("copyKeyBtn").addEventListener("click", function () {
     navigator.clipboard.writeText(el("keyValue").textContent).then(
@@ -296,7 +298,8 @@ document.addEventListener("DOMContentLoaded", function () {
   el("regenKeyBtn").addEventListener("click", function () {
     if (confirm("Regenerate the connector key? The old key stops working immediately.")) {
       setKey(generateKey(), true);
-      toast("Key regenerated — update it wherever it was linked");
+      el("keyReconnectNotice").classList.remove("hidden");
+      toast("Key regenerated — reconnect for it to take effect");
     }
   });
   el("revokeKeyBtn").addEventListener("click", function () {
@@ -319,6 +322,15 @@ document.addEventListener("DOMContentLoaded", function () {
   });
   el("disconnectBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.disconnect" }).then(refresh);
+  });
+  el("reconnectKeyBtn").addEventListener("click", function () {
+    api({ kind: "jbb.ui.disconnect" }).then(function () {
+      return api({ kind: "jbb.ui.connect" });
+    }).then(function () {
+      el("keyReconnectNotice").classList.add("hidden");
+      toast("Reconnected with the new key");
+      refresh();
+    });
   });
 
   // Mock mode
