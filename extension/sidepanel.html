@@ -13,7 +13,7 @@
     <div class="brand-mark">J</div>
     <div>
       <div class="brand-name">Jarvis Browser Bridge</div>
-      <div class="brand-sub">v0.1.0 · protocol 1.0</div>
+      <div class="brand-sub" id="brandSub">· protocol 1.0</div>
     </div>
   </div>
   <div id="statusPill" class="pill pill-idle">Idle</div>
@@ -68,6 +68,14 @@
         <button id="disconnectBtn" class="btn btn-secondary">Disconnect</button>
       </div>
       <p class="hint">Leave empty to stay in mock mode. The relay only passes messages through — it never stores page content.</p>
+      <div class="row">
+        <button id="testNotifBtn" class="btn btn-secondary">Test approval notification</button>
+      </div>
+      <div id="notifWarn" class="key-warning hidden">
+        ⚠️ <strong>Approval notifications are blocked</strong> (<span id="notifWarnErr"></span>).
+        Without them you can miss consent requests when this panel is closed.
+        Check Windows notification settings for Chrome, then test again.
+      </div>
     </div>
 
     <div class="card">

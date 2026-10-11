@@ -195,7 +195,14 @@ function notifyConsent(proposal) {
     priority: 2,
     requireInteraction: true
   }, function () {
-    if (chrome.runtime.lastError) delete state.consentNotifs[notifId];
+    if (chrome.runtime.lastError) {
+      // Never fail silent: a broken approval prompt is a security issue.
+      delete state.consentNotifs[notifId];
+      var err = chrome.runtime.lastError.message || "unknown error";
+      audit({ site: "-", action: "consent notification", tier: "T0", result: "failed",
+              detail: "notification failed (" + err + ") — check OS/browser notification settings for Chrome" });
+      pushToPanel({ kind: "jbb.ui.notifFailed", error: err });
+    }
   });
   chrome.action.setBadgeText({ text: "?" });
   chrome.action.setBadgeBackgroundColor({ color: "#E8710A" });
@@ -219,7 +226,28 @@ function decideFromNotification(proposalId, choice, reason) {
   else clearConsentPrompt(proposalId); // already decided elsewhere
 }
 
+// Self-test so the user can verify OS notification settings at any time.
+function testNotification() {
+  var notifId = "jbb-test-" + Date.now().toString(36);
+  chrome.notifications.create(notifId, {
+    type: "basic",
+    iconUrl: "icon128.png",
+    title: "Jarvis Browser Bridge",
+    message: "Test — approval prompts will look like this.",
+    buttons: [{ title: "Looks good" }, { title: "Dismiss" }],
+    priority: 2
+  }, function () {
+    if (chrome.runtime.lastError) {
+      pushToPanel({ kind: "jbb.ui.notifFailed",
+                    error: chrome.runtime.lastError.message || "unknown error" });
+    } else {
+      pushToPanel({ kind: "jbb.ui.notifOk" });
+    }
+  });
+}
+
 chrome.notifications.onButtonClicked.addListener(function (notifId, btnIdx) {
+  if (notifId.indexOf("jbb-test-") === 0) { chrome.notifications.clear(notifId); return; }
   var proposalId = state.consentNotifs[notifId];
   if (!proposalId) return;
   if (btnIdx === 0) decideFromNotification(proposalId, "once");
@@ -227,6 +255,7 @@ chrome.notifications.onButtonClicked.addListener(function (notifId, btnIdx) {
 });
 
 chrome.notifications.onClosed.addListener(function (notifId, byUser) {
+  if (notifId.indexOf("jbb-test-") === 0) return;
   var proposalId = state.consentNotifs[notifId];
   if (!proposalId) return;
   // Dismissed without a decision: fail closed.
@@ -736,6 +765,11 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
 
     case "jbb.ui.mockPropose":
       mockPropose();
+      done();
+      break;
+
+    case "jbb.ui.testNotif":
+      testNotification();
       done();
       break;
 

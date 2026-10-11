@@ -245,6 +245,14 @@ chrome.runtime.onMessage.addListener(function (msg) {
       refresh();
       if (msg.error) toast(msg.error);
       break;
+    case "jbb.ui.notifFailed":
+      el("notifWarnErr").textContent = msg.error || "unknown error";
+      el("notifWarn").classList.remove("hidden");
+      break;
+    case "jbb.ui.notifOk":
+      el("notifWarn").classList.add("hidden");
+      toast("Notification works — approval prompts will reach you");
+      break;
     case "jbb.ui.killed":
     case "jbb.ui.revived":
     case "jbb.ui.modeChanged":
@@ -323,6 +331,9 @@ document.addEventListener("DOMContentLoaded", function () {
   el("disconnectBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.disconnect" }).then(refresh);
   });
+  el("testNotifBtn").addEventListener("click", function () {
+    api({ kind: "jbb.ui.testNotif" });
+  });
   el("reconnectKeyBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.disconnect" }).then(function () {
       return api({ kind: "jbb.ui.connect" });
@@ -381,4 +392,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   refreshKeyUI();
   refresh();
+  try {
+    el("brandSub").textContent = "v" + chrome.runtime.getManifest().version + " · protocol 1.0";
+  } catch (e) { /* cosmetic only */ }
 });
