@@ -51,7 +51,7 @@ v0.2.1 ships a dark precision-instrument UI — warm tinted ink, ember reserved 
 node driver/driver.js --relay wss://relay.musebridge.avinyahub.com --key <connector-key> observe
 ```
 
-Or self-host the relay: `cd relay && npm install && node server.js` (see [relay/README.md](relay/README.md)).
+Or self-host the relay: `npm install && node relay/server.js` (deps live in the root `package.json`; see [relay/README.md](relay/README.md)).
 
 ## Security note
 
