@@ -264,7 +264,7 @@
       padding: clamp(110px, 15vw, 190px) 0;
     }
     .section-index { color: var(--ember); font: 500 11px/1.5 "IBM Plex Mono", monospace; }
-    .manifesto h2, .split-heading, .demo-heading, .session-copy h2, .beta h2 {
+    .manifesto h2, .split-heading, .beta h2 {
       margin: 0;
       font-family: "Fraunces", serif;
       font-weight: 600;
@@ -276,18 +276,44 @@
     .manifesto p { max-width: 720px; margin: 36px 0 0; color: var(--ink-soft); font-size: clamp(18px, 2vw, 22px); line-height: 1.65; }
     .manifesto strong { color: var(--ink); font-weight: 500; }
 
-    .proof-band { border-block: 1px solid var(--line); background: var(--surface); }
-    .proof-grid { display: grid; grid-template-columns: repeat(4, 1fr); }
-    .proof-cell { min-height: 230px; padding: 32px 26px; border-right: 1px solid var(--line); display: flex; flex-direction: column; justify-content: space-between; }
-    .proof-cell:first-child { border-left: 1px solid var(--line); }
-    .proof-cell strong { display: block; max-width: 210px; font: 600 26px/1.05 "Fraunces", serif; letter-spacing: -.025em; }
-    .proof-cell span { color: var(--ink-soft); font: 400 10px/1.55 "IBM Plex Mono", monospace; }
+    /* ——— Bento grid: the feature sections as instrument panels ——— */
+    .bento-section { padding: clamp(100px, 13vw, 170px) 0 clamp(110px, 15vw, 190px); }
+    .bento-head { max-width: 900px; margin-bottom: clamp(48px, 6vw, 72px); }
+    .split-heading { font-size: clamp(50px, 7vw, 94px); }
+    .bento-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 16px; }
+    .tile {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--surface);
+      padding: clamp(26px, 3.2vw, 40px);
+      overflow: hidden;
+      scroll-margin-top: 24px;
+    }
+    .tile-kicker {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin: 0 0 24px;
+      color: var(--ember);
+      font: 500 10px/1.4 "IBM Plex Mono", monospace;
+      letter-spacing: .05em;
+      text-transform: uppercase;
+    }
+    .tile-kicker::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+    .tile-title {
+      margin: 0;
+      font: 600 clamp(32px, 3.4vw, 46px)/1 "Fraunces", serif;
+      letter-spacing: -.04em;
+      text-wrap: balance;
+    }
+    .tile-lede { margin: 18px 0 0; color: var(--ink-soft); font-size: 16px; line-height: 1.65; }
+    .tile-lede strong { color: var(--ink); font-weight: 500; }
 
-    .demo-wrap { padding: clamp(110px, 15vw, 180px) 0; }
-    .demo-intro { display: grid; grid-template-columns: 1.1fr .9fr; gap: 60px; align-items: end; margin-bottom: 58px; }
-    .demo-heading { font-size: clamp(48px, 7vw, 90px); }
-    .demo-intro p { max-width: 520px; margin: 0 0 8px; color: var(--ink-soft); font-size: 18px; line-height: 1.65; }
-    .bridge-demo { position: relative; min-height: 520px; border-block: 1px solid var(--line-bright); background: var(--surface); overflow: hidden; }
+    .tile-consent { grid-column: span 7; display: flex; flex-direction: column; }
+    .tile-session { grid-column: span 5; display: flex; flex-direction: column; }
+
+    .bridge-demo { position: relative; flex: 1; min-height: 470px; margin-top: 30px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg); overflow: hidden; }
     .bridge-demo::before { content: ""; position: absolute; inset: 0; background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px); background-size: 40px 40px; opacity: .2; }
     .bridge-route { position: absolute; top: 49%; left: 12%; right: 12%; height: 2px; background: var(--line-bright); }
     .bridge-route::before { content: ""; display: block; width: var(--beam-width, 0%); height: 100%; background: var(--ember); box-shadow: 0 0 24px color-mix(in srgb, var(--ember) 50%, transparent); transition: width .72s cubic-bezier(.2,.8,.2,1); }
@@ -315,25 +341,63 @@
     .consent-choice.allow { background: var(--ember); border-color: var(--ember); color: var(--ember-ink); font-weight: 600; }
     .consent-choice.deny { grid-column: 1 / -1; color: var(--ink-soft); }
 
-    .trust-section { padding: 0 0 clamp(110px, 15vw, 190px); }
-    .split-heading { max-width: 900px; font-size: clamp(50px, 7vw, 94px); }
-    .trust-grid { display: grid; grid-template-columns: 1fr 1fr; margin-top: 74px; border-top: 1px solid var(--line); }
-    .trust-block { padding: 48px 7vw 54px 0; border-bottom: 1px solid var(--line); }
-    .trust-block:nth-child(even) { padding-left: 7vw; padding-right: 0; border-left: 1px solid var(--line); }
-    .trust-word { display: inline-block; margin-bottom: 60px; color: var(--ember); font: 500 11px/1.4 "IBM Plex Mono", monospace; }
-    .trust-block h3 { max-width: 470px; margin: 0; font: 600 clamp(31px, 3.6vw, 50px)/1.02 "Fraunces", serif; letter-spacing: -.035em; }
-    .trust-block p { max-width: 540px; margin: 24px 0 0; color: var(--ink-soft); font-size: 17px; line-height: 1.7; }
+    .grant-console { position: relative; margin-top: 28px; border: 1px solid var(--line-bright); border-radius: 10px; background: var(--bg); overflow: hidden; }
+    .grant-pulse { height: 3px; background: var(--line); overflow: hidden; }
+    .grant-pulse::after { content: ""; display: block; width: 32%; height: 100%; background: var(--session); box-shadow: 0 0 18px color-mix(in srgb, var(--session) 65%, transparent); transform: translateX(-110%); }
+    .grant-console.active .grant-pulse::after { animation: sessionPulse 1.8s ease-in-out infinite; }
+    @keyframes sessionPulse { from { transform: translateX(-110%); } to { transform: translateX(330%); } }
+    .grant-console-inner { padding: clamp(22px, 3vw, 32px); }
+    .grant-topline { display: flex; align-items: center; justify-content: space-between; gap: 18px; color: var(--ink-soft); font: 500 10px/1.4 "IBM Plex Mono", monospace; }
+    .session-badge { display: inline-flex; align-items: center; gap: 8px; color: var(--session); }
+    .session-badge::before { content: "S"; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: var(--session); color: var(--session-ink); font-weight: 600; }
+    .grant-console h3 { margin: 30px 0 10px; font: 600 clamp(29px, 2.8vw, 38px)/1 "Fraunces", serif; letter-spacing: -.035em; }
+    .grant-console-copy { margin: 0; color: var(--ink-soft); line-height: 1.62; }
+    .grant-options { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 24px; }
+    .grant-option, .revoke-session { min-height: 48px; padding: 0 14px; border: 1px solid var(--line); background: transparent; color: var(--ink); font-weight: 600; }
+    .grant-option:hover { border-color: var(--session); color: var(--session); }
+    .grant-status { display: none; margin-top: 24px; padding-top: 20px; border-top: 1px solid var(--line); }
+    .grant-console.active .grant-status { display: block; }
+    .grant-console.active .grant-options { display: none; }
+    .grant-status-row { display: flex; justify-content: space-between; gap: 18px; color: var(--ink-soft); font: 400 10px/1.5 "IBM Plex Mono", monospace; }
+    .grant-status-row strong { color: var(--session); font-weight: 500; }
+    .scenario-strip { margin-top: 20px; padding-top: 16px; border-top: 1px solid var(--line); }
+    .scenario-label { margin: 0 0 10px; color: var(--ink-soft); font: 400 9px/1.4 "IBM Plex Mono", monospace; }
+    .scenario-buttons { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--line); }
+    .scenario-button { min-height: 36px; background: transparent; border-right: 1px solid var(--line); color: var(--ink-soft); font: 500 10px/1 "IBM Plex Mono", monospace; }
+    .scenario-button:last-child { border-right: 0; }
+    .scenario-button:hover, .scenario-button.active { background: var(--surface-raised); color: var(--ink); }
+    .scenario-result { min-height: 42px; margin: 12px 0 0; color: var(--ink-soft); font: 400 10px/1.55 "IBM Plex Mono", monospace; }
+    .scenario-result strong { color: var(--ember); font-weight: 500; }
+    .revoke-session { width: 100%; margin-top: 16px; border-color: var(--ember); color: var(--ember); }
+    .revoke-session:hover { background: var(--ember); color: var(--ember-ink); }
+    .audit-line { margin: 20px 0 0; color: var(--ink-soft); font: 400 9px/1.55 "IBM Plex Mono", monospace; }
+    .audit-line::before { content: "AUDIT / "; color: var(--ember); }
+    .session-rules { display: grid; grid-template-columns: 1fr 1fr; gap: 0 24px; margin-top: 28px; border-top: 1px solid var(--line); }
+    .session-rule { padding: 18px 0; border-bottom: 1px solid var(--line); }
+    .session-rule strong { display: block; margin-bottom: 7px; font-size: 14px; }
+    .session-rule span { display: block; color: var(--ink-soft); font: 400 10px/1.6 "IBM Plex Mono", monospace; }
 
-    .safety-panel {
+    .tile-win { grid-column: span 6; }
+    .trust-word { display: inline-block; margin-bottom: 44px; color: var(--ember); font: 500 11px/1.4 "IBM Plex Mono", monospace; }
+    .tile-win h3 { max-width: 470px; margin: 0; font: 600 clamp(28px, 3vw, 40px)/1.02 "Fraunces", serif; letter-spacing: -.035em; }
+    .tile-win p { max-width: 540px; margin: 22px 0 0; color: var(--ink-soft); font-size: 16px; line-height: 1.7; }
+
+    .tile-proof { grid-column: span 3; min-height: 190px; display: flex; flex-direction: column; justify-content: space-between; gap: 28px; }
+    .tile-proof strong { display: block; max-width: 210px; font: 600 24px/1.05 "Fraunces", serif; letter-spacing: -.025em; }
+    .tile-proof span { color: var(--ink-soft); font: 400 10px/1.55 "IBM Plex Mono", monospace; }
+
+    .tile-safety {
+      grid-column: span 12;
       position: relative;
       display: grid;
       grid-template-columns: minmax(320px, .78fr) minmax(0, 1.22fr);
-      margin-top: clamp(72px, 10vw, 124px);
       border: 1px solid var(--warn);
+      border-radius: 12px;
       background: color-mix(in srgb, var(--warn) 7%, var(--surface));
       overflow: hidden;
+      scroll-margin-top: 24px;
     }
-    .safety-panel::before { content: ""; position: absolute; inset: 0 0 auto; height: 5px; background: var(--warn); }
+    .tile-safety::before { content: ""; position: absolute; inset: 0 0 auto; height: 5px; background: var(--warn); }
     .safety-lead { padding: clamp(40px, 6vw, 72px); border-right: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line)); }
     .safety-kicker { display: flex; align-items: center; gap: 10px; margin: 0 0 34px; color: var(--warn); font: 500 11px/1.4 "IBM Plex Mono", monospace; }
     .safety-kicker::before { content: ""; width: 9px; height: 9px; background: var(--warn); box-shadow: 0 0 0 5px color-mix(in srgb, var(--warn) 14%, transparent); }
@@ -348,58 +412,30 @@
     .safety-rule p { max-width: 660px; margin: 9px 0 0; color: var(--ink-soft); font-size: 15px; line-height: 1.65; }
     .safety-rule strong { color: var(--ink); font-weight: 600; }
 
-    .session-section { padding: clamp(110px, 15vw, 180px) 0; border-top: 1px solid var(--line); }
-    .session-layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(390px, .82fr); gap: clamp(62px, 9vw, 128px); align-items: center; }
-    .session-copy h2 { max-width: 720px; margin: 20px 0 0; font-size: clamp(50px, 7vw, 90px); }
-    .session-lede { max-width: 680px; margin: 32px 0 0; color: var(--ink-soft); font-size: clamp(18px, 2vw, 22px); line-height: 1.62; }
-    .session-lede strong { color: var(--ink); font-weight: 500; }
-    .session-rules { display: grid; grid-template-columns: 1fr 1fr; gap: 0 30px; margin-top: 46px; border-top: 1px solid var(--line); }
-    .session-rule { padding: 22px 0; border-bottom: 1px solid var(--line); }
-    .session-rule strong { display: block; margin-bottom: 7px; font-size: 15px; }
-    .session-rule span { display: block; color: var(--ink-soft); font: 400 10px/1.6 "IBM Plex Mono", monospace; }
-    .grant-console { position: relative; border: 1px solid var(--line-bright); background: var(--surface); box-shadow: var(--shadow); overflow: hidden; }
-    .grant-pulse { height: 3px; background: var(--line); overflow: hidden; }
-    .grant-pulse::after { content: ""; display: block; width: 32%; height: 100%; background: var(--session); box-shadow: 0 0 18px color-mix(in srgb, var(--session) 65%, transparent); transform: translateX(-110%); }
-    .grant-console.active .grant-pulse::after { animation: sessionPulse 1.8s ease-in-out infinite; }
-    @keyframes sessionPulse { from { transform: translateX(-110%); } to { transform: translateX(330%); } }
-    .grant-console-inner { padding: clamp(24px, 4vw, 38px); }
-    .grant-topline { display: flex; align-items: center; justify-content: space-between; gap: 18px; color: var(--ink-soft); font: 500 10px/1.4 "IBM Plex Mono", monospace; }
-    .session-badge { display: inline-flex; align-items: center; gap: 8px; color: var(--session); }
-    .session-badge::before { content: "S"; width: 22px; height: 22px; display: grid; place-items: center; border-radius: 50%; background: var(--session); color: var(--session-ink); font-weight: 600; }
-    .grant-console h3 { margin: 36px 0 10px; font: 600 clamp(32px, 3vw, 43px)/1 "Fraunces", serif; letter-spacing: -.035em; }
-    .grant-console-copy { margin: 0; color: var(--ink-soft); line-height: 1.62; }
-    .grant-options { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 28px; }
-    .grant-option, .revoke-session { min-height: 48px; padding: 0 14px; border: 1px solid var(--line); background: transparent; color: var(--ink); font-weight: 600; }
-    .grant-option:hover { border-color: var(--session); color: var(--session); }
-    .grant-status { display: none; margin-top: 28px; padding-top: 22px; border-top: 1px solid var(--line); }
-    .grant-console.active .grant-status { display: block; }
-    .grant-console.active .grant-options { display: none; }
-    .grant-status-row { display: flex; justify-content: space-between; gap: 18px; color: var(--ink-soft); font: 400 10px/1.5 "IBM Plex Mono", monospace; }
-    .grant-status-row strong { color: var(--session); font-weight: 500; }
-    .scenario-strip { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
-    .scenario-label { margin: 0 0 10px; color: var(--ink-soft); font: 400 9px/1.4 "IBM Plex Mono", monospace; }
-    .scenario-buttons { display: grid; grid-template-columns: repeat(3, 1fr); border: 1px solid var(--line); }
-    .scenario-button { min-height: 36px; background: transparent; border-right: 1px solid var(--line); color: var(--ink-soft); font: 500 10px/1 "IBM Plex Mono", monospace; }
-    .scenario-button:last-child { border-right: 0; }
-    .scenario-button:hover, .scenario-button.active { background: var(--surface-raised); color: var(--ink); }
-    .scenario-result { min-height: 42px; margin: 12px 0 0; color: var(--ink-soft); font: 400 10px/1.55 "IBM Plex Mono", monospace; }
-    .scenario-result strong { color: var(--ember); font-weight: 500; }
-    .revoke-session { width: 100%; margin-top: 18px; border-color: var(--ember); color: var(--ember); }
-    .revoke-session:hover { background: var(--ember); color: var(--ember-ink); }
-    .audit-line { margin: 22px 0 0; color: var(--ink-soft); font: 400 9px/1.55 "IBM Plex Mono", monospace; }
-    .audit-line::before { content: "AUDIT / "; color: var(--ember); }
-
-    .sequence { padding: clamp(100px, 13vw, 160px) 0; background: var(--paper); color: var(--paper-ink); }
+    .tile-sequence { grid-column: span 12; background: var(--paper); color: var(--paper-ink); border-color: transparent; }
     .sequence-top { display: flex; justify-content: space-between; align-items: end; gap: 48px; }
-    .sequence-title { max-width: 760px; margin: 0; font: 600 clamp(46px, 6.5vw, 82px)/.97 "Fraunces", serif; letter-spacing: -.045em; }
+    .sequence-title { max-width: 760px; margin: 0; font: 600 clamp(38px, 4.6vw, 58px)/.97 "Fraunces", serif; letter-spacing: -.045em; }
     .relay-proof { max-width: 320px; padding-bottom: 8px; color: color-mix(in srgb, var(--paper-ink) 66%, transparent); font: 400 10px/1.65 "IBM Plex Mono", monospace; }
     .relay-proof strong { color: var(--paper-ink); font-weight: 500; }
-    .steps { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 78px; border-top: 2px solid currentColor; }
-    .step { min-height: 250px; padding: 28px 28px 0 0; position: relative; }
+    .steps { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 56px; border-top: 2px solid currentColor; }
+    .step { min-height: 230px; padding: 28px 28px 0 0; position: relative; }
     .step::before { content: ""; position: absolute; top: -7px; left: 0; width: 12px; height: 12px; background: var(--ember); }
     .step-no { font: 500 10px/1.5 "IBM Plex Mono", monospace; opacity: .68; }
-    .step h3 { margin: 72px 0 10px; font: 600 28px/1 "Fraunces", serif; letter-spacing: -.025em; }
+    .step h3 { margin: 60px 0 10px; font: 600 28px/1 "Fraunces", serif; letter-spacing: -.025em; }
     .step p { max-width: 230px; margin: 0; opacity: .7; line-height: 1.6; }
+
+    .tile-github { grid-column: span 7; display: flex; flex-direction: column; }
+    .tile-github .proof-statement { margin: 0; font: 600 clamp(28px, 3vw, 40px)/1.05 "Fraunces", serif; letter-spacing: -.03em; }
+    .tile-github .detail-rows { margin-top: 26px; border-top: 1px solid var(--line); }
+    .tile-link { display: inline-block; margin-top: auto; padding-top: 26px; color: var(--ink); text-decoration: none; font: 500 11px/1.4 "IBM Plex Mono", monospace; }
+    .tile-link span { border-bottom: 1px solid var(--line-bright); padding-bottom: 2px; }
+    .tile-link:hover span { border-color: var(--ember); color: var(--ember); }
+
+    .tile-relay { grid-column: span 5; }
+    .tile-relay h3 { margin: 0; font: 600 clamp(26px, 2.8vw, 36px)/1.05 "Fraunces", serif; letter-spacing: -.03em; }
+    .tile-relay p { margin: 18px 0 0; color: var(--ink-soft); font-size: 15px; line-height: 1.68; }
+    .tile-relay p strong { color: var(--ink); font-weight: 600; }
+    .tile-relay .mono { font-size: 13px; }
 
     .quote { padding: clamp(110px, 16vw, 200px) 0; text-align: center; }
     .quote-mark { display: block; margin-bottom: 30px; color: var(--ember); font: 500 11px/1.4 "IBM Plex Mono", monospace; }
@@ -412,7 +448,6 @@
     .beta-copy > p { margin: 0 0 24px; font-size: 19px; line-height: 1.6; }
     .copy-request { min-height: 50px; padding: 0 18px; border: 1px solid currentColor; background: transparent; color: inherit; font-weight: 600; }
     .copy-request:hover { background: var(--ember-ink); color: var(--ember); }
-    .security-note { margin-top: 58px; padding-top: 22px; border-top: 1px solid color-mix(in srgb, currentColor 38%, transparent); font: 400 10px/1.65 "IBM Plex Mono", monospace; }
     .build-note { display: grid; grid-template-columns: 1fr auto; gap: 40px; padding: 26px 0 42px; color: var(--ink-soft); font: 400 10px/1.55 "IBM Plex Mono", monospace; }
     .build-note a { text-decoration: none; border-bottom: 1px solid var(--line-bright); padding-bottom: 2px; }
     .build-note a:hover { color: var(--ink); border-color: var(--ember); }
@@ -420,17 +455,20 @@
     .reveal-mask { overflow: hidden; }
     .reveal-line { display: block; will-change: transform; }
 
+    @media (max-width: 1080px) {
+      .tile-consent, .tile-session { grid-column: span 12; }
+      .bridge-demo { min-height: 520px; }
+    }
+
     @media (max-width: 940px) {
       .hero { grid-template-columns: 1fr; min-height: auto; }
       .instrument { width: min(600px, 100%); }
       .manifesto { grid-template-columns: 1fr; }
-      .proof-grid { grid-template-columns: 1fr 1fr; }
-      .proof-cell:nth-child(3) { border-left: 1px solid var(--line); border-top: 1px solid var(--line); }
-      .proof-cell:nth-child(4) { border-top: 1px solid var(--line); }
-      .demo-intro, .session-layout, .beta { grid-template-columns: 1fr; align-items: start; }
-      .safety-panel { grid-template-columns: 1fr; }
+      .beta { grid-template-columns: 1fr; align-items: start; }
+      .tile-proof { grid-column: span 6; }
+      .tile-github, .tile-relay { grid-column: span 12; }
+      .tile-safety { grid-template-columns: 1fr; }
       .safety-lead { border-right: 0; border-bottom: 1px solid color-mix(in srgb, var(--warn) 55%, var(--line)); }
-      .grant-console { width: min(640px, 100%); }
       .sequence-top { align-items: start; flex-direction: column; }
       .steps { grid-template-columns: 1fr 1fr; }
       .step:nth-child(n+3) { border-top: 2px solid currentColor; }
@@ -451,9 +489,9 @@
       .instrument-head { padding-inline: 14px; }
       .instrument-body { padding-inline: 14px; }
       .bridge-label { font-size: 16px; }
-      .proof-grid { grid-template-columns: 1fr; }
-      .proof-cell, .proof-cell:first-child, .proof-cell:nth-child(3) { min-height: 170px; border: 0; border-bottom: 1px solid var(--line); }
-      .demo-intro { grid-template-columns: 1fr; gap: 28px; }
+      .tile { padding: 26px 18px; }
+      .tile-win, .tile-proof { grid-column: span 12; }
+      .tile-proof { min-height: 0; }
       .bridge-demo { min-height: 690px; }
       .bridge-route { top: 100px; bottom: 140px; left: 50%; right: auto; width: 2px; height: auto; }
       .bridge-route::before { width: 100%; height: var(--beam-height, 0%); transition: height .72s cubic-bezier(.2,.8,.2,1); }
@@ -464,23 +502,19 @@
       .demo-button { bottom: 25px; width: calc(100% - 32px); }
       .consent-actions { grid-template-columns: 1fr; }
       .consent-choice.deny { grid-column: auto; }
-      .trust-grid { grid-template-columns: 1fr; }
-      .trust-block, .trust-block:nth-child(even) { padding: 38px 0 44px; border-left: 0; }
-      .trust-word { margin-bottom: 34px; }
-      .safety-panel { margin-top: 56px; }
+      .trust-word { margin-bottom: 30px; }
       .safety-lead { padding: 40px 22px 32px; }
       .safety-rules { padding: 10px 22px 18px; }
       .safety-rule { grid-template-columns: 30px 1fr; gap: 10px; padding: 22px 0; }
       .safety-rule h3 { font-size: 21px; }
       .safety-command { margin-top: 28px; }
-      .session-layout { gap: 48px; }
       .session-rules { grid-template-columns: 1fr; }
       .grant-options { grid-template-columns: 1fr; }
       .grant-status-row { flex-direction: column; gap: 4px; }
       .scenario-buttons { grid-template-columns: 1fr; }
       .scenario-button { border-right: 0; border-bottom: 1px solid var(--line); }
       .scenario-button:last-child { border-bottom: 0; }
-      .steps { grid-template-columns: 1fr; border-top: 0; margin-top: 54px; }
+      .steps { grid-template-columns: 1fr; border-top: 0; margin-top: 44px; }
       .step, .step:nth-child(n+3) { min-height: auto; padding: 28px 0 32px 32px; border-top: 1px solid currentColor; }
       .step::before, .step:nth-child(n+3)::before { top: 24px; width: 9px; height: 9px; }
       .step h3 { margin: 0 0 8px; }
@@ -552,144 +586,154 @@
       </div>
     </section>
 
-    <section class="proof-band" aria-label="What the shipped extension proves">
-      <div class="proof-grid page-shell">
-        <div class="proof-cell"><strong>Credentials stay local.</strong><span>Passwords never leave your machine. Sign-in becomes a human takeover.</span></div>
-        <div class="proof-cell"><strong>Context stays live.</strong><span>Observe what the task needs instead of retaining a private-page archive.</span></div>
-        <div class="proof-cell"><strong>Consent is explicit.</strong><span>Every prompt offers once, site, hour, day or deny.</span></div>
-        <div class="proof-cell"><strong>Authority fails closed.</strong><span>Dismissal means no action. T3 always asks.</span></div>
-      </div>
-    </section>
+    <section class="bento-section page-shell" aria-label="Musebridge feature panels">
+      <h2 class="split-heading bento-head reveal-mask"><span class="reveal-line">Two liabilities removed at the architecture.</span></h2>
 
-    <section class="demo-wrap page-shell" id="experience">
-      <div class="demo-intro">
-        <h2 class="demo-heading reveal-mask"><span class="reveal-line">Consent is not a setting. It is a moment.</span></h2>
-        <p>Stage the action, then choose its exact scope. The route does not complete until you decide. This demo keeps no state when you leave.</p>
-      </div>
+      <div class="bento-grid">
+        <article class="tile tile-consent" id="experience">
+          <p class="tile-kicker">Consent gate / live demo</p>
+          <h3 class="tile-title reveal-mask"><span class="reveal-line">Consent is not a setting. It is a moment.</span></h3>
+          <p class="tile-lede">Stage the action, then choose its exact scope. The route does not complete until you decide. This demo keeps no state when you leave.</p>
 
-      <div class="bridge-demo" id="bridgeDemo">
-        <div class="demo-status" id="demoStatus" aria-live="polite">READY / stage a browser action</div>
-        <div class="bridge-route" aria-hidden="true"></div>
-        <div class="node agent" id="agentNode">Muse<small>intent ready</small></div>
-        <div class="node gate" id="gateNode">Consent gate<small>human authority</small></div>
-        <div class="node browser" id="browserNode">Your browser<small>action target</small></div>
-        <button class="demo-button" id="stageAction" type="button">Stage a browser action</button>
+          <div class="bridge-demo" id="bridgeDemo">
+            <div class="demo-status" id="demoStatus" aria-live="polite">READY / stage a browser action</div>
+            <div class="bridge-route" aria-hidden="true"></div>
+            <div class="node agent" id="agentNode">Muse<small>intent ready</small></div>
+            <div class="node gate" id="gateNode">Consent gate<small>human authority</small></div>
+            <div class="node browser" id="browserNode">Your browser<small>action target</small></div>
+            <button class="demo-button" id="stageAction" type="button">Stage a browser action</button>
 
-        <div class="consent-panel" id="consentPanel" role="dialog" aria-modal="true" aria-labelledby="consentTitle" aria-describedby="consentDetail" aria-hidden="true">
-          <div class="consent-kicker"><span>PERMISSION REQUIRED</span><span>T1 / ROUTINE</span></div>
-          <div class="consent-body">
-            <h3 id="consentTitle">Open a new website?</h3>
-            <div class="detail" id="consentDetail">Choose exactly how much authority this request receives.</div>
-            <div class="consent-actions">
-              <button class="consent-choice allow" type="button" data-decision="Allow once">Allow once</button>
-              <button class="consent-choice" type="button" data-decision="This site">This site</button>
-              <button class="consent-choice" type="button" data-decision="For 1 hour">For 1 hour</button>
-              <button class="consent-choice" type="button" data-decision="For 1 day">For 1 day</button>
-              <button class="consent-choice deny" type="button" data-decision="Deny">Deny</button>
+            <div class="consent-panel" id="consentPanel" role="dialog" aria-modal="true" aria-labelledby="consentTitle" aria-describedby="consentDetail" aria-hidden="true">
+              <div class="consent-kicker"><span>PERMISSION REQUIRED</span><span>T1 / ROUTINE</span></div>
+              <div class="consent-body">
+                <h3 id="consentTitle">Open a new website?</h3>
+                <div class="detail" id="consentDetail">Choose exactly how much authority this request receives.</div>
+                <div class="consent-actions">
+                  <button class="consent-choice allow" type="button" data-decision="Allow once">Allow once</button>
+                  <button class="consent-choice" type="button" data-decision="This site">This site</button>
+                  <button class="consent-choice" type="button" data-decision="For 1 hour">For 1 hour</button>
+                  <button class="consent-choice" type="button" data-decision="For 1 day">For 1 day</button>
+                  <button class="consent-choice deny" type="button" data-decision="Deny">Deny</button>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
-    </section>
-
-    <section class="trust-section page-shell">
-      <h2 class="split-heading reveal-mask"><span class="reveal-line">Two liabilities removed at the architecture.</span></h2>
-      <div class="trust-grid">
-        <article class="trust-block">
-          <span class="trust-word">01 / Credential exposure</span>
-          <h3>The password never enters the conversation.</h3>
-          <p>Muse drives the authenticated browser session you already own. When sign-in is needed, control returns to you on your machine. Passwords and one-time codes never need to touch the agent or relay.</p>
         </article>
-        <article class="trust-block">
-          <span class="trust-word">02 / Sensitive-data memory</span>
-          <h3>Live observation replaces retention.</h3>
-          <p>The agent observes what is needed for the current task, acts with explicit permission, then moves on. Private page contents do not need to become retained personal history.</p>
-        </article>
-      </div>
 
-      <aside class="safety-panel" aria-labelledby="safetyTitle">
-        <div class="safety-lead">
-          <p class="safety-kicker">Safety first / required setup</p>
-          <h2 id="safetyTitle">A fresh Chrome profile is not optional.</h2>
-          <p class="safety-lede">The bridge can see every page visited inside the profile where it runs. Its privacy promise depends on keeping that profile clean and deliberately limited.</p>
-          <strong class="safety-command">Never install Musebridge in your main everyday Chrome profile.</strong>
-        </div>
-        <div class="safety-rules" aria-label="Required Chrome profile safety rules">
-          <div class="safety-rule">
-            <span class="safety-no">01</span>
-            <div><h3>Start empty.</h3><p>Use a <strong>brand-new Chrome profile</strong> with no saved passwords, payment methods, addresses or personal data.</p></div>
-          </div>
-          <div class="safety-rule">
-            <span class="safety-no">02</span>
-            <div><h3>Keep your everyday profile separate.</h3><p>Do not add the extension to the profile you use for personal browsing, banking, email or daily work.</p></div>
-          </div>
-          <div class="safety-rule">
-            <span class="safety-no">03</span>
-            <div><h3>Do not bring Chrome Sync with you.</h3><p>Never sign into the new profile with an existing Gmail account. Chrome Sync can pull in saved passwords, bookmarks, payment methods and addresses, defeating the separation. <strong>Use a brand-new email or skip Chrome sign-in.</strong></p></div>
-          </div>
-          <div class="safety-rule">
-            <span class="safety-no">04</span>
-            <div><h3>Choose access site by site.</h3><p>Inside the fresh profile, log into only the sites you want the assistant to automate. <strong>Signing into a site is the consent mechanism</strong> that makes that account available to the bridge.</p></div>
-          </div>
-        </div>
-      </aside>
-    </section>
+        <article class="tile tile-session" id="session-grants">
+          <p class="tile-kicker">Session grants / shipped in 0.1.9</p>
+          <h3 class="tile-title reveal-mask"><span class="reveal-line">Consent that protects the flow.</span></h3>
+          <p class="tile-lede">For multi-step work, choose <strong>1 hour or 1 day</strong>. T1 and T2 actions can continue inside that window. T3 sensitive actions still stop and ask—every time.</p>
 
-    <section class="session-section" id="session-grants">
-      <div class="session-layout page-shell">
-        <div class="session-copy">
-          <span class="section-index">Session grants / shipped in 0.1.9</span>
-          <h2 class="reveal-mask"><span class="reveal-line">Consent that protects the flow.</span></h2>
-          <p class="session-lede">For multi-step work, choose <strong>1 hour or 1 day</strong>. T1 and T2 actions can continue inside that window. T3 sensitive actions still stop and ask—every time.</p>
+          <div class="grant-console" id="grantConsole" aria-label="Interactive session grant demonstration">
+            <div class="grant-pulse" aria-hidden="true"></div>
+            <div class="grant-console-inner">
+              <div class="grant-topline"><span>SESSION CONTROL</span><span class="session-badge" id="sessionBadge">Ready</span></div>
+              <h3 id="grantTitle">Let routine actions continue?</h3>
+              <p class="grant-console-copy" id="grantCopy">Choose a hard time limit. The extension persists the choice on this machine; this preview does not.</p>
+              <div class="grant-options" id="grantOptions">
+                <button class="grant-option" type="button" data-duration="1 hour">For 1 hour</button>
+                <button class="grant-option" type="button" data-duration="1 day">For 1 day</button>
+              </div>
+              <div class="grant-status" id="grantStatus" aria-live="polite">
+                <div class="grant-status-row"><strong id="grantDuration">Session active</strong><span>HARD EXPIRY / NO EXTENSION</span></div>
+                <div class="scenario-strip">
+                  <p class="scenario-label">TEST AN ACTION DURING THE GRANT</p>
+                  <div class="scenario-buttons">
+                    <button class="scenario-button" type="button" data-tier="T1">T1 routine</button>
+                    <button class="scenario-button" type="button" data-tier="T2">T2 elevated</button>
+                    <button class="scenario-button" type="button" data-tier="T3">T3 sensitive</button>
+                  </div>
+                  <p class="scenario-result" id="scenarioResult">Select an action tier.</p>
+                </div>
+                <button class="revoke-session" id="revokeSession" type="button">Revoke session now</button>
+              </div>
+              <p class="audit-line" id="auditLine">Awaiting your choice.</p>
+            </div>
+          </div>
+
           <div class="session-rules" aria-label="Session grant safeguards">
             <div class="session-rule"><strong>Hard expiry.</strong><span>The grant ends when promised, with no silent extension.</span></div>
             <div class="session-rule"><strong>T3 always asks.</strong><span>Payments and sensitive account changes never auto-allow.</span></div>
             <div class="session-rule"><strong>Visible while live.</strong><span>A green S badge and pulsing status bar stay in view.</span></div>
             <div class="session-rule"><strong>One-click revoke.</strong><span>Every grant, expiry and revoke event is audit-logged.</span></div>
           </div>
-        </div>
+        </article>
 
-        <div class="grant-console" id="grantConsole" aria-label="Interactive session grant demonstration">
-          <div class="grant-pulse" aria-hidden="true"></div>
-          <div class="grant-console-inner">
-            <div class="grant-topline"><span>SESSION CONTROL</span><span class="session-badge" id="sessionBadge">Ready</span></div>
-            <h3 id="grantTitle">Let routine actions continue?</h3>
-            <p class="grant-console-copy" id="grantCopy">Choose a hard time limit. The extension persists the choice on this machine; this preview does not.</p>
-            <div class="grant-options" id="grantOptions">
-              <button class="grant-option" type="button" data-duration="1 hour">For 1 hour</button>
-              <button class="grant-option" type="button" data-duration="1 day">For 1 day</button>
-            </div>
-            <div class="grant-status" id="grantStatus" aria-live="polite">
-              <div class="grant-status-row"><strong id="grantDuration">Session active</strong><span>HARD EXPIRY / NO EXTENSION</span></div>
-              <div class="scenario-strip">
-                <p class="scenario-label">TEST AN ACTION DURING THE GRANT</p>
-                <div class="scenario-buttons">
-                  <button class="scenario-button" type="button" data-tier="T1">T1 routine</button>
-                  <button class="scenario-button" type="button" data-tier="T2">T2 elevated</button>
-                  <button class="scenario-button" type="button" data-tier="T3">T3 sensitive</button>
-                </div>
-                <p class="scenario-result" id="scenarioResult">Select an action tier.</p>
-              </div>
-              <button class="revoke-session" id="revokeSession" type="button">Revoke session now</button>
-            </div>
-            <p class="audit-line" id="auditLine">Awaiting your choice.</p>
+        <article class="tile tile-win">
+          <span class="trust-word">01 / Credential exposure</span>
+          <h3>The password never enters the conversation.</h3>
+          <p>Muse drives the authenticated browser session you already own. When sign-in is needed, control returns to you on your machine. Passwords and one-time codes never need to touch the agent or relay.</p>
+        </article>
+
+        <article class="tile tile-win">
+          <span class="trust-word">02 / Sensitive-data memory</span>
+          <h3>Live observation replaces retention.</h3>
+          <p>The agent observes what is needed for the current task, acts with explicit permission, then moves on. Private page contents do not need to become retained personal history.</p>
+        </article>
+
+        <article class="tile tile-proof"><strong>Credentials stay local.</strong><span>Passwords never leave your machine. Sign-in becomes a human takeover.</span></article>
+        <article class="tile tile-proof"><strong>Context stays live.</strong><span>Observe what the task needs instead of retaining a private-page archive.</span></article>
+        <article class="tile tile-proof"><strong>Consent is explicit.</strong><span>Every prompt offers once, site, hour, day or deny.</span></article>
+        <article class="tile tile-proof"><strong>Authority fails closed.</strong><span>Dismissal means no action. T3 always asks.</span></article>
+
+        <aside class="tile-safety" aria-labelledby="safetyTitle">
+          <div class="safety-lead">
+            <p class="safety-kicker">Safety first / required setup</p>
+            <h2 id="safetyTitle">A fresh Chrome profile is not optional.</h2>
+            <p class="safety-lede">The bridge can see every page visited inside the profile where it runs. Its privacy promise depends on keeping that profile clean and deliberately limited.</p>
+            <strong class="safety-command">Never install Musebridge in your main everyday Chrome profile.</strong>
           </div>
-        </div>
-      </div>
-    </section>
+          <div class="safety-rules" aria-label="Required Chrome profile safety rules">
+            <div class="safety-rule">
+              <span class="safety-no">01</span>
+              <div><h3>Start empty.</h3><p>Use a <strong>brand-new Chrome profile</strong> with no saved passwords, payment methods, addresses or personal data.</p></div>
+            </div>
+            <div class="safety-rule">
+              <span class="safety-no">02</span>
+              <div><h3>Keep your everyday profile separate.</h3><p>Do not add the extension to the profile you use for personal browsing, banking, email or daily work.</p></div>
+            </div>
+            <div class="safety-rule">
+              <span class="safety-no">03</span>
+              <div><h3>Do not bring Chrome Sync with you.</h3><p>Never sign into the new profile with an existing Gmail account. Chrome Sync can pull in saved passwords, bookmarks, payment methods and addresses, defeating the separation. <strong>Use a brand-new email or skip Chrome sign-in.</strong></p></div>
+            </div>
+            <div class="safety-rule">
+              <span class="safety-no">04</span>
+              <div><h3>Choose access site by site.</h3><p>Inside the fresh profile, log into only the sites you want the assistant to automate. <strong>Signing into a site is the consent mechanism</strong> that makes that account available to the bridge.</p></div>
+            </div>
+          </div>
+        </aside>
 
-    <section class="sequence">
-      <div class="page-shell">
-        <div class="sequence-top">
-          <h2 class="sequence-title">What happens between “do this” and done.</h2>
-          <p class="relay-proof"><strong>LIVE RELAY</strong><br />relay.musebridge.avinyahub.com<br />TLS via Let’s Encrypt</p>
-        </div>
-        <div class="steps">
-          <article class="step"><span class="step-no">01</span><h3>You ask</h3><p>Name the website and the outcome. Muse prepares the next action.</p></article>
-          <article class="step"><span class="step-no">02</span><h3>You see</h3><p>The action, target and risk tier appear where the decision happens.</p></article>
-          <article class="step"><span class="step-no">03</span><h3>You decide</h3><p>Allow once, this site, one hour, one day—or deny.</p></article>
-          <article class="step"><span class="step-no">04</span><h3>It acts</h3><p>Your own authenticated browser performs only what you approved.</p></article>
-        </div>
+        <article class="tile tile-sequence">
+          <div class="sequence-top">
+            <h3 class="sequence-title">What happens between “do this” and done.</h3>
+            <p class="relay-proof"><strong>LIVE RELAY</strong><br />relay.musebridge.avinyahub.com<br />TLS via Let’s Encrypt</p>
+          </div>
+          <div class="steps">
+            <article class="step"><span class="step-no">01</span><h3>You ask</h3><p>Name the website and the outcome. Muse prepares the next action.</p></article>
+            <article class="step"><span class="step-no">02</span><h3>You see</h3><p>The action, target and risk tier appear where the decision happens.</p></article>
+            <article class="step"><span class="step-no">03</span><h3>You decide</h3><p>Allow once, this site, one hour, one day—or deny.</p></article>
+            <article class="step"><span class="step-no">04</span><h3>It acts</h3><p>Your own authenticated browser performs only what you approved.</p></article>
+          </div>
+        </article>
+
+        <article class="tile tile-github">
+          <p class="tile-kicker">Public proof / GitHub</p>
+          <p class="proof-statement">Built in the open, timestamped in public.</p>
+          <div class="detail-rows">
+            <div class="detail-row"><span>SHIPPED</span><span>11 Oct 2026</span></div>
+            <div class="detail-row"><span>VERSION</span><span>v0.2.1 / The Instrument</span></div>
+            <div class="detail-row"><span>COMMITS</span><span>13 public commits</span></div>
+            <div class="detail-row"><span>REPOSITORY</span><span>polesymbol/jarvis-browser-bridge</span></div>
+          </div>
+          <a class="tile-link" href="https://github.com/polesymbol/jarvis-browser-bridge" target="_blank" rel="noopener"><span>Open the 13-commit proof</span></a>
+        </article>
+
+        <article class="tile tile-relay">
+          <p class="tile-kicker">Relay / security note</p>
+          <h3>Honest about the one open seam.</h3>
+          <p><strong>Honest relay note:</strong> traffic is encrypted to the relay at <span class="mono">relay.musebridge.avinyahub.com</span>, where TLS terminates. The relay could technically observe traffic in transit. End-to-end encrypted payloads are the v2 answer.</p>
+        </article>
       </div>
     </section>
 
@@ -704,7 +748,6 @@
       <div class="beta-copy">
         <p>Musebridge is preparing a small, free beta for people who want useful browser automation without surrendering control.</p>
         <button class="copy-request" id="copyRequest" type="button">Copy beta request</button>
-        <div class="security-note"><strong>Honest relay note:</strong> traffic is encrypted to the relay at <span class="mono">relay.musebridge.avinyahub.com</span>, where TLS terminates. The relay could technically observe traffic in transit. End-to-end encrypted payloads are the v2 answer.</div>
       </div>
     </section>
 
@@ -867,8 +910,8 @@
         });
 
         gsap.timeline({
-          scrollTrigger: { trigger: '.proof-band', start: 'top 82%', end: 'bottom 42%', scrub: 1 }
-        }).from('.proof-cell', { opacity: .18, y: 34, stagger: .16, ease: 'none' });
+          scrollTrigger: { trigger: '.bento-grid', start: 'top 82%', end: 'bottom 42%', scrub: 1 }
+        }).from('.tile-proof', { opacity: .18, y: 34, stagger: .16, ease: 'none' });
 
         gsap.to('.instrument', {
           y: -34,
