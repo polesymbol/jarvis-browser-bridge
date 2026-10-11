@@ -382,7 +382,11 @@ function jbbConsentBanner(summary) {
       "color:#fff", "border-radius:8px", "padding:6px 12px", "font-size:13px",
       "font-weight:" + (primary ? "600" : "400"), "white-space:nowrap"
     ].join(";"));
-    b.addEventListener("click", function () {
+    b.addEventListener("click", function (ev) {
+      // SECURITY (enemy audit 2026-10-11): only real user clicks count.
+      // Page JavaScript can dispatch synthetic clicks on banner buttons
+      // (clickjacking self-approval); those have isTrusted === false.
+      if (ev && ev.isTrusted === false) return;
       chrome.runtime.sendMessage({ kind: "jbb.banner.decision",
         proposalId: summary.proposalId, choice: choice });
       remove();
@@ -656,9 +660,23 @@ function handleRelayMessage(raw) {
       );
       break;
     }
-    case "session.abort":
-      killSession("relay requested abort: " + (msg.reason || "no reason"));
+    case "session.abort": {
+      // SECURITY (enemy audit 2026-10-11): a remote abort is the peer hanging
+      // up, NOT the local kill switch. A compromised relay/driver must not be
+      // able to kill the user's session (DoS). Fail pendings, drop the socket,
+      // keep local kill state untouched so the user can reconnect.
+      var abortReason = "peer aborted: " + (msg.reason || "no reason");
+      state.pending.forEach(function (p) {
+        clearTimeout(p.timer);
+        p.resolve({ choice: "deny", reason: abortReason });
+      });
+      state.pending.clear();
+      audit({ site: "-", action: "session abort", tier: "T0",
+              result: "ended", detail: abortReason + " (remote; local kill switch untouched)" });
+      pushToPanel({ kind: "jbb.ui.status", connected: false, error: abortReason });
+      if (state.ws) { try { state.ws.close(); } catch (e) {} }
       break;
+    }
     // observe.request is answered on demand; unknown types are ignored.
   }
 }
@@ -801,6 +819,24 @@ function runOnPage(proposal) {
     if (!tab || !tab.id) throw new Error("no active tab");
     if (/^chrome:|^edge:|^about:/.test(tab.url || "")) {
       throw new Error("cannot act on browser-internal pages");
+    }
+    // SECURITY (enemy audit 2026-10-11): bind execution to the consented site.
+    // proposal.site is driver-supplied and untrusted; the tab URL is ground
+    // truth. Without this, a malicious driver could get a grant for site A
+    // and silently act on the user's site B tab. Fail closed on mismatch.
+    var claimedHost = hostOf(proposal.site || "");
+    var actualHost = hostOf(tab.url || "");
+    if (claimedHost) {
+      if (proposal.type === "navigate" && proposal.url) {
+        var destHost = hostOf(proposal.url);
+        if (destHost !== claimedHost) {
+          throw new Error("site mismatch: consented for " + claimedHost +
+            " but navigate targets " + destHost);
+        }
+      } else if (actualHost !== claimedHost) {
+        throw new Error("site mismatch: consented for " + claimedHost +
+          " but active tab is " + (actualHost || "unknown"));
+      }
     }
     return chrome.scripting.executeScript({
       target: { tabId: tab.id },

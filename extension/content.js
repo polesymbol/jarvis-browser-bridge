@@ -47,14 +47,19 @@
   }
 
   function labelFor(el) {
+    // SECURITY (enemy audit 2026-10-11): never include the value of a password
+    // field. Autofilled/typed passwords would otherwise ship in plaintext
+    // inside observe snapshots to the relay and driver.
+    var tag = el.tagName.toLowerCase();
+    var isPassword = tag === "input" && (el.type || "text").toLowerCase() === "password";
     return (
       el.getAttribute("aria-label") ||
       el.innerText ||
-      el.value ||
+      (!isPassword && el.value) ||
       el.getAttribute("placeholder") ||
       el.getAttribute("name") ||
       el.getAttribute("title") ||
-      el.tagName.toLowerCase()
+      tag
     ).trim().replace(/\s+/g, " ").slice(0, 80);
   }
 
