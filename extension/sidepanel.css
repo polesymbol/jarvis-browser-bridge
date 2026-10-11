@@ -327,3 +327,41 @@ main { padding: 14px 16px 90px; }
 }
 .mini-tag.tag-ok { color: var(--ok); }
 .mini-tag.tag-bad { color: var(--danger); }
+
+/* ---------- day mode: the same instrument, in daylight ---------- */
+[data-theme="light"] {
+  --bg: #faf8f2;
+  --surface: #ffffff;
+  --surface-2: #f1ece0;
+  --hairline: #e3dac6;
+  --text: #1b1611;
+  --faint: #6e6555;
+  --ember: #c2410a;
+  --ember-deep: #9a3412;
+  --ember-ink: #ffffff;
+  --danger: #b42318;
+  --danger-deep: #912018;
+  --ok: #15803d;
+  --warn: #b45309;
+}
+[data-theme="light"] .app-header,
+[data-theme="light"] .dock {
+  background: rgba(250, 248, 242, 0.94);
+}
+[data-theme="light"] .brand-mark { background: #fff; }
+[data-theme="light"] .field input::placeholder { color: #a89e8a; }
+[data-theme="light"] .dock-meta { color: #a89e8a; }
+[data-theme="light"] .snapshot { background: #141610; color: #c9d4b8; }
+[data-theme="light"] .tab.active { box-shadow: inset 0 0 0 1px var(--hairline); }
+
+/* theme toggle */
+.theme-btn {
+  display: flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: none;
+  border: 1px solid var(--hairline); border-radius: 8px;
+  background: var(--surface); cursor: pointer; color: var(--faint);
+  margin-left: 8px;
+}
+.theme-btn:hover { color: var(--ember); border-color: var(--ember); }
+.theme-btn svg { display: block; }
+.header-right { display: flex; align-items: center; }

@@ -311,6 +311,22 @@ chrome.runtime.onMessage.addListener(function (msg) {
 });
 
 document.addEventListener("DOMContentLoaded", function () {
+  // Theme: day / night. Applied first to avoid a flash.
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    var isLight = theme === "light";
+    el("iconMoon").classList.toggle("hidden", isLight);
+    el("iconSun").classList.toggle("hidden", !isLight);
+  }
+  chrome.storage.local.get(["jbb.theme"], function (res) {
+    applyTheme(res["jbb.theme"] === "light" ? "light" : "dark");
+  });
+  el("themeBtn").addEventListener("click", function () {
+    var next = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+    chrome.storage.local.set({ "jbb.theme": next });
+    applyTheme(next);
+  });
+
   // Tabs
   document.querySelectorAll(".tab").forEach(function (tab) {
     tab.addEventListener("click", function () {
