@@ -44,8 +44,7 @@ var state = {
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer }
   consentNotifs: {},           // notificationId -> proposalId (universal prompt)
-  consentBanners: {},          // proposalId -> tabId (in-page banner)
-  panelOpen: false             // side panel visibility (banner only when closed)
+  consentBanners: {}           // proposalId -> tabId (in-page banner)
 };
 
 var proposalSeq = 0;
@@ -345,11 +344,17 @@ function jbbConsentBanner(summary) {
 }
 
 function showBannerConsent(proposal) {
-  if (state.panelOpen) return; // the card covers the open-panel case
+  // Always attempt the banner when the tab allows it — panel-open tracking
+  // proved too fragile to gate on, and a redundant banner next to the card
+  // is merely ugly, never wrong. First decision wins everywhere.
   chrome.tabs.query({ active: true, lastFocusedWindow: true }, function (tabs) {
     var tab = tabs && tabs[0];
     var url = (tab && tab.url) || "";
-    if (!tab || !tab.id || !/^https?:\/\//i.test(url)) return; // can't inject here
+    var base = { site: proposal.site || "-", action: "consent banner", tier: "T0" };
+    if (!tab || !tab.id || !/^https?:\/\//i.test(url)) {
+      base.result = "skipped"; base.detail = "no injectable active tab";
+      audit(base); return;
+    }
     var summary = {
       proposalId: proposal.proposalId,
       description: proposal.description || proposal.type || "action",
@@ -360,8 +365,20 @@ function showBannerConsent(proposal) {
     try {
       chrome.scripting.executeScript(
         { target: { tabId: tab.id }, func: jbbConsentBanner, args: [summary] }
-      ).catch(function () { delete state.consentBanners[proposal.proposalId]; });
-    } catch (e) { delete state.consentBanners[proposal.proposalId]; }
+      ).then(function () {
+        base.result = "shown"; base.detail = "banner injected into active tab";
+        audit(base);
+      }, function (err) {
+        delete state.consentBanners[proposal.proposalId];
+        base.result = "failed";
+        base.detail = "injection failed: " + String((err && err.message) || err);
+        audit(base);
+      });
+    } catch (e) {
+      delete state.consentBanners[proposal.proposalId];
+      base.result = "failed"; base.detail = "injection threw: " + String(e && e.message || e);
+      audit(base);
+    }
   });
 }
 
@@ -894,11 +911,6 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       done();
       break;
     }
-
-    case "jbb.ui.panelState":
-      state.panelOpen = !!msg.open;
-      done();
-      break;
 
     case "jbb.ui.observe":
       observeActiveTab(!!msg.screenshot).then(

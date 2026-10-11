@@ -395,11 +395,4 @@ document.addEventListener("DOMContentLoaded", function () {
   try {
     el("brandSub").textContent = "v" + chrome.runtime.getManifest().version + " · protocol 1.0";
   } catch (e) { /* cosmetic only */ }
-  // Let the worker know the panel is visible so it can skip the in-page
-  // banner (the card covers the open-panel case).
-  api({ kind: "jbb.ui.panelState", open: true });
-  window.addEventListener("pagehide", function () {
-    try { chrome.runtime.sendMessage({ kind: "jbb.ui.panelState", open: false }); }
-    catch (e) { /* worker may be asleep; default is closed */ }
-  });
 });
