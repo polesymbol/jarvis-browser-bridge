@@ -11,13 +11,21 @@
 
   var ctx = null;
 
-  function ensureCtx() {
-    if (!ctx) {
-      var AC = window.AudioContext || window.webkitAudioContext;
-      if (AC) ctx = new AC();
-    }
-    if (ctx && ctx.state === "suspended") ctx.resume();
-    return ctx;
+  function ensureCtx(cb) {
+    try {
+      if (!ctx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) ctx = new AC();
+      }
+      if (!ctx) { cb(null); return; }
+      if (ctx.state === "suspended") {
+        // Must wait for resume: notes scheduled on a suspended context
+        // never sound. This was the v0.2.8 no-tone bug.
+        ctx.resume().then(function () { cb(ctx); }, function () { cb(null); });
+      } else {
+        cb(ctx);
+      }
+    } catch (e) { cb(null); }
   }
 
   function tone(freq, startAt, dur) {
@@ -36,11 +44,12 @@
   }
 
   function playChime() {
-    var ac = ensureCtx();
-    if (!ac) return;
-    var t = ac.currentTime;
-    tone(880, t, 0.22);        // A5
-    tone(659.25, t + 0.18, 0.3); // E5 — soft "attention" interval
+    ensureCtx(function (ac) {
+      if (!ac) return;
+      var t = ac.currentTime;
+      tone(880, t, 0.22);          // A5
+      tone(659.25, t + 0.18, 0.3); // E5 — soft "attention" interval
+    });
   }
 
   chrome.runtime.onMessage.addListener(function (msg) {

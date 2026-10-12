@@ -1306,6 +1306,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
 
     case "jbb.ui.testNotif":
       testNotification();
+      playConsentTone(); // preview the attention chime alongside the test toast
       done();
       break;
 
