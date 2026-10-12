@@ -45,16 +45,34 @@
 
   function playChime() {
     ensureCtx(function (ac) {
-      if (!ac) return;
-      var t = ac.currentTime;
-      tone(880, t, 0.22);          // A5
-      tone(659.25, t + 0.18, 0.3); // E5 — soft "attention" interval
+      if (!ac) {
+        report("no-context");
+        return;
+      }
+      try {
+        var t = ac.currentTime;
+        tone(880, t, 0.22);          // A5
+        tone(659.25, t + 0.18, 0.3); // E5 — soft "attention" interval
+        report("played");
+      } catch (e) {
+        report("play-threw: " + String(e && e.message || e));
+      }
     });
+  }
+
+  function report(status) {
+    try { chrome.runtime.sendMessage({ kind: "jbb.offscreen.report", status: status }); }
+    catch (e) { /* background gone */ }
   }
 
   chrome.runtime.onMessage.addListener(function (msg) {
     if (msg && msg.kind === "jbb.offscreen.playTone") {
-      try { playChime(); } catch (e) { /* audio unavailable */ }
+      try { playChime(); } catch (e) { report("listener-threw"); }
     }
   });
+
+  // Ready handshake: the createDocument callback fires before this script
+  // runs — without this, the first playTone message is lost. (v0.2.10 no-tone bug)
+  try { chrome.runtime.sendMessage({ kind: "jbb.offscreen.ready" }); }
+  catch (e) { /* background gone */ }
 })();

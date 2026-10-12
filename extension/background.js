@@ -310,9 +310,11 @@ function hydratePendings(done) {
 // paths all funnel through notifyConsent, so one call site covers them.
 
 var offscreenReady = false;
+var offscreenWantTone = false; // a tone was requested before the page signalled ready
 
 function ensureOffscreenDocument(cb) {
   if (offscreenReady) { cb(); return; }
+  // Remember the intent: the ready handshake (below) will flush it.
   var create = function () {
     chrome.offscreen.createDocument(
       { url: "offscreen.html", reasons: ["AUDIO_PLAYBACK"],
@@ -325,8 +327,15 @@ function ensureOffscreenDocument(cb) {
                   detail: "offscreen document failed: " + chrome.runtime.lastError.message });
           return;
         }
-        offscreenReady = true;
-        cb();
+        // Do NOT mark ready here: the create callback fires before the
+        // page's script runs, so an immediate playTone would be lost.
+        // Readiness comes from the page's own jbb.offscreen.ready signal.
+        if (chrome.runtime.lastError) {
+          // Document already existed — its script is running; treat as ready.
+          offscreenReady = true;
+          cb();
+        }
+        // else: wait for the ready signal.
       });
   };
   try {
@@ -338,12 +347,26 @@ function ensureOffscreenDocument(cb) {
   } catch (e) { create(); }
 }
 
+// Called when the offscreen page signals its script is running.
+function onOffscreenReady() {
+  offscreenReady = true;
+  if (offscreenWantTone) {
+    offscreenWantTone = false;
+    sendPlayTone();
+  }
+}
+
+function sendPlayTone() {
+  try { chrome.runtime.sendMessage({ kind: "jbb.offscreen.playTone" }); }
+  catch (e) { /* offscreen gone */ }
+}
+
 function playConsentTone() {
   if (!state.soundOn) return;
   try {
     ensureOffscreenDocument(function () {
-      try { chrome.runtime.sendMessage({ kind: "jbb.offscreen.playTone" }); }
-      catch (e) { /* offscreen gone */ }
+      if (offscreenReady) sendPlayTone();
+      else offscreenWantTone = true; // flushed by the ready handshake
     });
   } catch (e) { /* audio unavailable — visual prompt still stands */ }
 }
@@ -1161,7 +1184,16 @@ function mockPropose() {
 // ---------------------------------------------------------------- messages from the side panel
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   if (!msg || typeof msg.kind !== "string" ||
-      (msg.kind.indexOf("jbb.ui.") !== 0 && msg.kind !== "jbb.banner.decision")) {
+      (msg.kind.indexOf("jbb.ui.") !== 0 && msg.kind !== "jbb.banner.decision" &&
+       msg.kind.indexOf("jbb.offscreen.") !== 0)) {
+    return false;
+  }
+  // Offscreen page signals (no response needed).
+  if (msg.kind === "jbb.offscreen.ready") { onOffscreenReady(); return false; }
+  if (msg.kind === "jbb.offscreen.report") {
+    audit({ site: "-", action: "consent tone", tier: "T0",
+            result: msg.status === "played" ? "played" : "failed",
+            detail: "offscreen player reports: " + (msg.status || "unknown") });
     return false;
   }
   var done = function (payload) { sendResponse(Object.assign({ ok: true }, payload || {})); };
