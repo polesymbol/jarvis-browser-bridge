@@ -1034,26 +1034,36 @@ function executeProposal(proposal) {
 function runOnPage(proposal) {
   return getActiveTab().then(function (tab) {
     if (!tab || !tab.id) throw new Error("no active tab");
-    if (/^chrome:|^edge:|^about:/.test(tab.url || "")) {
+    var isInternal = /^chrome:|^edge:|^about:/.test(tab.url || "");
+    // navigate needs no content script — chrome.tabs.update can leave a
+    // chrome:// page for a web URL. So it is allowed from internal pages;
+    // the site binding below still guards the destination.
+    if (proposal.type === "navigate" && proposal.url) {
+      // SECURITY (enemy audit 2026-10-11): bind execution to the consented site.
+      // proposal.site is driver-supplied and untrusted; without this check a
+      // malicious driver could get a grant for site A and silently send the
+      // user's tab to site B. Fail closed on mismatch.
+      var claimedHost = hostOf(proposal.site || "");
+      var destHost = hostOf(proposal.url);
+      if (claimedHost && destHost !== claimedHost) {
+        throw new Error("site mismatch: consented for " + claimedHost +
+          " but navigate targets " + destHost);
+      }
+      return chrome.tabs.update(tab.id, { url: proposal.url }).then(function () {
+        return "navigated to " + proposal.url;
+      });
+    }
+    if (isInternal) {
       throw new Error("cannot act on browser-internal pages");
     }
-    // SECURITY (enemy audit 2026-10-11): bind execution to the consented site.
-    // proposal.site is driver-supplied and untrusted; the tab URL is ground
-    // truth. Without this, a malicious driver could get a grant for site A
-    // and silently act on the user's site B tab. Fail closed on mismatch.
+    // SECURITY (enemy audit 2026-10-11): bind execution to the consented site
+    // for page actions too. proposal.site is driver-supplied and untrusted;
+    // the tab URL is ground truth.
     var claimedHost = hostOf(proposal.site || "");
     var actualHost = hostOf(tab.url || "");
-    if (claimedHost) {
-      if (proposal.type === "navigate" && proposal.url) {
-        var destHost = hostOf(proposal.url);
-        if (destHost !== claimedHost) {
-          throw new Error("site mismatch: consented for " + claimedHost +
-            " but navigate targets " + destHost);
-        }
-      } else if (actualHost !== claimedHost) {
-        throw new Error("site mismatch: consented for " + claimedHost +
-          " but active tab is " + (actualHost || "unknown"));
-      }
+    if (claimedHost && actualHost !== claimedHost) {
+      throw new Error("site mismatch: consented for " + claimedHost +
+        " but active tab is " + (actualHost || "unknown"));
     }
     return chrome.scripting.executeScript({
       target: { tabId: tab.id },
