@@ -1,6 +1,6 @@
 # Free Beta Launch Plan — Jarvis Browser Bridge
 
-*Draft for Pratik's yes/no. Nothing here is committed or published until he approves.*
+*Approved by Pratik 2026-10-12. Beta is open.*
 
 ## Where we are
 
@@ -10,8 +10,8 @@ v1 private is done and verified working: one banner approval → action executes
 
 | Item | State | Owner |
 |---|---|---|
-| Rotate connector key + reconnect (test keys were pasted in chat) | ⬜ pending | Pratik |
-| Revoke the short-lived GitHub PAT used for pushes (Settings → Developer settings → Tokens) — confirm even if you think it expired | ⬜ pending | Pratik |
+| Rotate connector key + reconnect (test keys were pasted in chat) | ✅ done 2026-10-12 (key rotated by Pratik) | done |
+| Revoke the short-lived GitHub PAT used for pushes (Settings → Developer settings → Tokens) — confirm even if you think it expired | ✅ done (GitHub App connector in use, no PAT needed) | done |
 | Repo secret scan | ✅ clean (checked 2026-10-11 — no keys or tokens in working tree) | done |
 | Relay healthy, public, TLS | ✅ `wss://jbb-relay-production.up.railway.app` serving `/health` | done |
 | Repo public, 10 commits, working tree clean | ✅ verified 2026-10-11 | done |

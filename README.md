@@ -1,6 +1,6 @@
 # Jarvis Browser Bridge
 
-Your AI assistant drives **your own Chrome** — your IP, your logged-in sessions — under permissions you control. Not a competing browser. An extension of the assistant to the rest of the web, with explicit per-site consent.
+> **🧪 Free beta is open.** Your AI assistant drives **your own Chrome** — your IP, your logged-in sessions — under permissions you control. Not a competing browser. An extension of the assistant to the rest of the web, with explicit per-site consent. **Join:** install from [Releases](https://github.com/polesymbol/jarvis-browser-bridge/releases) and follow Quick start below — then tell us what broke via [Issues](https://github.com/polesymbol/jarvis-browser-bridge/issues).
 
 ## ⚠️ Safety first: fresh Chrome profile required
 
@@ -47,7 +47,7 @@ v0.2.1 ships a dark precision-instrument UI — warm tinted ink, ember reserved 
 
 ## Status
 
-**v0.2.8** — private v1, end-to-end tested October 2026 (observe → consent → approved action → result, all through the public relay). Consent prompts now escalate: if the OS silently swallows an approval toast, it is re-raised (capped, audited) so no ask degrades to badge-only — and every ask now plays a soft audible tone (toggleable) since Jarvis works in a separate window while you work elsewhere. Now in beta preparation. See [ARCHITECTURE.md](ARCHITECTURE.md) and [TRANSPORT.md](TRANSPORT.md).
+**v0.2.13** — free beta open (October 2026). Full consent stack verified live: OS notification toast, audible chime, in-page banner, toolbar badge, capped re-raise of swallowed toasts, audit-logged throughout. Navigate works from browser-internal pages; relay hardened (rate limits, room caps, payload limits). See [ARCHITECTURE.md](ARCHITECTURE.md), [TRANSPORT.md](TRANSPORT.md), and [BETA_PLAN.md](BETA_PLAN.md).
 
 ## Quick start
 
