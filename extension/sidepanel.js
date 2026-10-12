@@ -262,6 +262,7 @@ function refresh() {
     if (document.activeElement !== el("relayUrl")) {
       el("relayUrl").value = s.relayUrl || "";
     }
+    el("soundToggle").checked = (typeof s.soundOn === "boolean") ? s.soundOn : true;
     (s.pending || []).forEach(renderConsentCard);
   });
 }
@@ -291,6 +292,11 @@ chrome.runtime.onMessage.addListener(function (msg) {
       break;
     case "jbb.ui.notifFailed":
       el("notifWarnErr").textContent = msg.error || "unknown error";
+      el("notifWarn").classList.remove("hidden");
+      break;
+    case "jbb.ui.notifPermission":
+      el("notifWarnErr").textContent = "Notifications blocked (" + (msg.level || "?") +
+        ") — approval prompts fall back to badge + banner. Enable Chrome notifications in OS settings.";
       el("notifWarn").classList.remove("hidden");
       break;
     case "jbb.ui.notifOk":
@@ -416,6 +422,9 @@ document.addEventListener("DOMContentLoaded", function () {
   });
   el("testNotifBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.testNotif" });
+  });
+  el("soundToggle").addEventListener("change", function () {
+    api({ kind: "jbb.ui.setSound", on: el("soundToggle").checked }).then(refresh);
   });
   el("reconnectKeyBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.disconnect" }).then(function () {

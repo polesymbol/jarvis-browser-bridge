@@ -397,3 +397,8 @@ main { padding: 14px 16px 90px; }
 
 /* disabled buttons (e.g. Connect while sign-in blocked) */
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* Consent sound toggle */
+.check-row { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; font-size: 13px; cursor: pointer; }
+.check-row input[type="checkbox"] { margin-top: 2px; accent-color: #e8710a; }
+.hint-inline { color: var(--faint); font-size: 12px; }

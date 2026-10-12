@@ -47,7 +47,7 @@ v0.2.1 ships a dark precision-instrument UI — warm tinted ink, ember reserved 
 
 ## Status
 
-**v0.2.1** — private v1, end-to-end tested October 2026 (observe → consent → approved action → result, all through the public relay). Now in beta preparation. See [ARCHITECTURE.md](ARCHITECTURE.md) and [TRANSPORT.md](TRANSPORT.md).
+**v0.2.8** — private v1, end-to-end tested October 2026 (observe → consent → approved action → result, all through the public relay). Consent prompts now escalate: if the OS silently swallows an approval toast, it is re-raised (capped, audited) so no ask degrades to badge-only — and every ask now plays a soft audible tone (toggleable) since Jarvis works in a separate window while you work elsewhere. Now in beta preparation. See [ARCHITECTURE.md](ARCHITECTURE.md) and [TRANSPORT.md](TRANSPORT.md).
 
 ## Quick start
 

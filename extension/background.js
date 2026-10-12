@@ -34,6 +34,11 @@ var K = {
 
 var AUDIT_CAP = 500;
 var CONSENT_TIMEOUT_MS = 120000;
+// Notification escalation: the initial raise plus this many re-raises of an
+// OS-swallowed toast. Capped so a runaway loop is impossible; exhaustion is
+// audited and the ask stays on badge + banner + panel card until timeout.
+var NOTIF_MAX_RAISES = 3;
+var NOTIF_VERIFY_DELAY_MS = 4000;
 
 // ---------------------------------------------------------------- state
 var state = {
@@ -46,10 +51,12 @@ var state = {
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer }
   consentNotifs: {},           // notificationId -> proposalId (universal prompt)
+  raiseCount: {},              // proposalId -> number of toast raises (escalation cap)
   consentBanners: {},          // proposalId -> tabId (in-page banner)
   session: null,               // time-boxed grant: { site, grantedAt, expiresAt, label }
   chromeSignedInEmail: null,   // Chrome profile sign-in email (null = not signed in)
-  signInBlocked: false          // true when signed in but the account is unacknowledged
+  signInBlocked: false,        // true when signed in but the account is unacknowledged
+  soundOn: true                // audible tone on consent prompts (user works in other windows)
 };
 
 var proposalSeq = 0;
@@ -66,14 +73,16 @@ chrome.runtime.onInstalled.addListener(function () {
   // and heals a dropped connection.
   chrome.alarms.create("jbb-keepalive", { periodInMinutes: 0.5 });
   loadPersisted();
+  checkNotificationPermission();
 });
 
-chrome.runtime.onStartup.addListener(function () { loadPersisted(); hydratePendings(); });
+chrome.runtime.onStartup.addListener(function () { loadPersisted(); hydratePendings(); checkNotificationPermission(); });
 
 // Fires every ~30s, even after the worker was suspended and restarted.
 chrome.alarms.onAlarm.addListener(function (alarm) {
   if (!alarm || alarm.name !== "jbb-keepalive") return;
   hydratePendings();
+  verifyAllPendingNotifications();
   // Hard expiry for session grants — no silent extension, ever.
   if (state.session && Date.now() >= state.session.expiresAt) expireSession("expired");
   // Re-check sign-in state: a later sign-in can't slip through unnoticed.
@@ -94,6 +103,7 @@ function loadPersisted() {
   chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION], function (res) {
     var s = res[K.SETTINGS] || {};
     state.mode = s.mode || "ask-some";
+    state.soundOn = (typeof s.soundOn === "boolean") ? s.soundOn : true;
     state.relayUrl = s.relayUrl || "";
     state.sites = res[K.SITES] || {};
     state.sessionKilled = !!s.killed;
@@ -107,7 +117,8 @@ function loadPersisted() {
 
 function saveSettings() {
   chrome.storage.local.set({
-    [K.SETTINGS]: { mode: state.mode, relayUrl: state.relayUrl, killed: state.sessionKilled },
+    [K.SETTINGS]: { mode: state.mode, relayUrl: state.relayUrl, killed: state.sessionKilled,
+                    soundOn: state.soundOn },
     [K.SITES]: state.sites
   });
 }
@@ -290,9 +301,58 @@ function hydratePendings(done) {
 // icon. Card and notification are two paths to the same pending proposal;
 // the first decision wins (see the idempotent resolve above).
 
+// ---------------------------------------------------------------- consent attention tone
+//
+// Jarvis works in a separate Chrome window/profile while the user works
+// elsewhere — a silent visual prompt is easy to miss. Every consent ask also
+// plays a soft two-tone chime via an offscreen document (MV3 workers can't
+// play audio directly). Toggleable in the panel; on by default. Re-raise
+// paths all funnel through notifyConsent, so one call site covers them.
+
+var offscreenReady = false;
+
+function ensureOffscreenDocument(cb) {
+  if (offscreenReady) { cb(); return; }
+  var create = function () {
+    chrome.offscreen.createDocument(
+      { url: "offscreen.html", reasons: ["AUDIO_PLAYBACK"],
+        justification: "Play an audible tone when an approval prompt needs attention." },
+      function () {
+        // "Only one offscreen document" just means it's already there.
+        if (chrome.runtime.lastError &&
+            chrome.runtime.lastError.message.indexOf("Only one") === -1) {
+          audit({ site: "-", action: "consent tone", tier: "T0", result: "failed",
+                  detail: "offscreen document failed: " + chrome.runtime.lastError.message });
+          return;
+        }
+        offscreenReady = true;
+        cb();
+      });
+  };
+  try {
+    if (chrome.offscreen.hasDocument) {
+      chrome.offscreen.hasDocument(function (has) {
+        if (has) { offscreenReady = true; cb(); } else create();
+      });
+    } else create();
+  } catch (e) { create(); }
+}
+
+function playConsentTone() {
+  if (!state.soundOn) return;
+  try {
+    ensureOffscreenDocument(function () {
+      try { chrome.runtime.sendMessage({ kind: "jbb.offscreen.playTone" }); }
+      catch (e) { /* offscreen gone */ }
+    });
+  } catch (e) { /* audio unavailable — visual prompt still stands */ }
+}
+
 function notifyConsent(proposal) {
   var notifId = "jbb-consent-" + proposal.proposalId;
   state.consentNotifs[notifId] = proposal.proposalId;
+  var count = (state.raiseCount[proposal.proposalId] || 0) + 1;
+  state.raiseCount[proposal.proposalId] = count;
   var where = hostOf(proposal.site || "") || "this site";
   chrome.notifications.create(notifId, {
     type: "basic",
@@ -310,9 +370,69 @@ function notifyConsent(proposal) {
       audit({ site: "-", action: "consent notification", tier: "T0", result: "failed",
               detail: "notification failed (" + err + ") — check OS/browser notification settings for Chrome" });
       pushToPanel({ kind: "jbb.ui.notifFailed", error: err });
+      checkNotificationPermission();
+    } else {
+      // Audited raise: if the toast never shows, the audit trail proves the
+      // extension asked — the gap is then the OS, not the gate.
+      audit({ site: hostOf(proposal.site || "") || "-", action: "consent notification",
+              tier: "T0", result: "raised",
+              detail: "approval toast raised (" + count + "/" + NOTIF_MAX_RAISES + ")" });
     }
   });
+  // The OS can swallow a toast silently (Focus Assist, Do Not Disturb,
+  // revoked Chrome notification permission) — create() succeeds, no
+  // lastError, nothing on screen, and the ask degrades to badge-only.
+  // Verify the toast is actually visible; re-raise (capped) if it isn't.
+  scheduleNotifVerify(notifId, proposal.proposalId);
+  playConsentTone();
   refreshBadge();
+}
+
+// Verify one toast a few seconds after raising. setTimeout alone is not
+// enough — MV3 can suspend the worker before it fires — so the keepalive
+// alarm also runs verifyAllPendingNotifications() every tick.
+function scheduleNotifVerify(notifId, proposalId) {
+  setTimeout(function () { verifyNotifVisible(notifId, proposalId); }, NOTIF_VERIFY_DELAY_MS);
+}
+
+function verifyNotifVisible(notifId, proposalId) {
+  if (!state.pending.has(proposalId)) return;          // already decided
+  if (state.consentNotifs[notifId] !== proposalId) return; // cleared meanwhile
+  chrome.notifications.getAll(function (all) {
+    if (chrome.runtime.lastError || !all) return;
+    if (!all[notifId]) {
+      var entry = state.pending.get(proposalId);
+      if (!entry) return;
+      var count = state.raiseCount[proposalId] || 0;
+      if (count < NOTIF_MAX_RAISES) {
+        audit({ site: hostOf(entry.proposal.site || "") || "-", action: "consent notification",
+                tier: "T0", result: "re-raised",
+                detail: "approval toast swallowed by OS (not visible " + NOTIF_VERIFY_DELAY_MS +
+                        "ms after raise); re-raising (" + (count + 1) + "/" + NOTIF_MAX_RAISES + ")" });
+        notifyConsent(entry.proposal); // same ID updates in place
+      } else {
+        audit({ site: hostOf(entry.proposal.site || "") || "-", action: "consent notification",
+                tier: "T0", result: "escalation-exhausted",
+                detail: "toast swallowed after " + NOTIF_MAX_RAISES + " raises; ask remains on " +
+                        "badge + banner + panel card until the consent window times out" });
+      }
+    }
+  });
+}
+
+// Sweep every keepalive tick: any pending proposal whose toast is not in
+// the notification center gets the same capped re-raise treatment. This
+// covers worker suspensions the one-shot setTimeout missed.
+function verifyAllPendingNotifications() {
+  chrome.notifications.getAll(function (all) {
+    if (chrome.runtime.lastError || !all) return;
+    state.pending.forEach(function (entry, proposalId) {
+      var notifId = "jbb-consent-" + proposalId;
+      if (state.consentNotifs[notifId] === proposalId && !all[notifId]) {
+        verifyNotifVisible(notifId, proposalId);
+      }
+    });
+  });
 }
 
 function clearConsentPrompt(proposalId) {
@@ -322,6 +442,7 @@ function clearConsentPrompt(proposalId) {
       chrome.notifications.clear(notifId);
     }
   });
+  delete state.raiseCount[proposalId];
   if (Object.keys(state.consentNotifs).length === 0) {
     refreshBadge();
   }
@@ -365,11 +486,48 @@ chrome.notifications.onButtonClicked.addListener(function (notifId, btnIdx) {
   else decideFromNotification(proposalId, "deny", "denied from notification");
 });
 
+// ---------------------------------------------------------------- notification permission pre-check
+//
+// An extension can hold the "notifications" permission while the OS or
+// Chrome silently blocks delivery (Focus Assist, Do Not Disturb, revoked
+// Chrome notification permission). chrome.notifications.create then
+// succeeds — no lastError — and the ask degrades to badge-only. So we
+// check the permission level proactively and warn in the panel + audit,
+// instead of waiting for a swallowed toast.
+function checkNotificationPermission() {
+  if (!chrome.notifications || !chrome.notifications.getPermissionLevel) return;
+  chrome.notifications.getPermissionLevel(function (level) {
+    if (level !== "granted") {
+      var detail = "OS/browser notification permission is '" + level +
+        "' — approval prompts may never appear; the badge, in-page banner and " +
+        "panel card remain as fallbacks. Enable Chrome notifications in OS " +
+        "settings for the full ask.";
+      audit({ site: "-", action: "consent notification", tier: "T0",
+              result: "permission-blocked", detail: detail });
+      pushToPanel({ kind: "jbb.ui.notifPermission", level: level, detail: detail });
+    }
+  });
+}
+
 chrome.notifications.onClosed.addListener(function (notifId, byUser) {
   if (notifId.indexOf("jbb-test-") === 0) return;
   var proposalId = state.consentNotifs[notifId];
   if (!proposalId) return;
-  // Dismissed without a decision: fail closed.
+  var entry = state.pending.get(proposalId);
+  if (!entry) { clearConsentPrompt(proposalId); return; }
+  if (!byUser && (state.raiseCount[proposalId] || 0) < NOTIF_MAX_RAISES) {
+    // Closed by the system (not the user) with no decision — the ask may
+    // never have been seen. Re-raise it (capped, audited) rather than
+    // degrading to badge-only. Fail closed only at timeout or on an
+    // explicit user dismiss — never on a silent system close.
+    audit({ site: hostOf(entry.proposal.site || "") || "-", action: "consent notification",
+            tier: "T0", result: "re-raised",
+            detail: "toast closed by system without a decision; re-raising (" +
+                    ((state.raiseCount[proposalId] || 0) + 1) + "/" + NOTIF_MAX_RAISES + ")" });
+    notifyConsent(entry.proposal);
+    return;
+  }
+  // User-dismissed, or escalation exhausted: fail closed.
   decideFromNotification(proposalId, "deny", "notification dismissed");
 });
 
@@ -1008,6 +1166,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           mockMode: !state.relayUrl,
           relayUrl: state.relayUrl,
           mode: state.mode,
+          soundOn: state.soundOn,
           sites: state.sites,
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
@@ -1026,6 +1185,15 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         pushToPanel({ kind: "jbb.ui.modeChanged", mode: state.mode });
       }
       done();
+      break;
+
+    case "jbb.ui.setSound":
+      state.soundOn = !!msg.on;
+      saveSettings();
+      audit({ site: "-", action: "consent sound " + (state.soundOn ? "enabled" : "disabled"),
+              tier: "T0", result: "allowed" });
+      if (state.soundOn) playConsentTone(); // preview so the user knows what it sounds like
+      done({ soundOn: state.soundOn });
       break;
 
     case "jbb.ui.setRelayUrl":
