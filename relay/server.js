@@ -33,8 +33,19 @@ import { pathToFileURL } from 'url';
 const PORT = parseInt(process.env.PORT || '8787', 10);
 const DEBUG_TYPES = process.env.DEBUG_TYPES === '1';
 
-/** roomId -> { keyHash: Buffer, extension: WebSocket|null, driver: WebSocket|null, createdAt: number } */
+// --- Hardening limits (2026-10-12 relay audit) ---
+const MAX_PAYLOAD = 1024 * 1024;          // 1MB — protocol messages are small JSON
+const MAX_ROOMS = 10000;                  // cap total rooms (memory DoS via random keys)
+const MAX_CONN_PER_IP = 20;               // cap connections per source IP
+const ROOM_LONELY_TTL_MS = 10 * 60 * 1000; // destroy rooms with <2 peers after 10 min
+const ROOM_MAX_AGE_MS = 24 * 60 * 60 * 1000; // absolute room lifetime cap
+const MSG_RATE_WINDOW_MS = 1000;          // per-connection message rate window
+const MSG_RATE_MAX = 100;                 // max messages per window (flood => close)
+
+/** roomId -> { keyHash: Buffer, extension: WebSocket|null, driver: WebSocket|null, createdAt: number, lastActive: number } */
 const rooms = new Map();
+/** ip -> connection count */
+const connsByIp = new Map();
 
 function roomIdFor(key) {
   const h = createHash('sha256').update(String(key), 'utf8').digest();
@@ -75,14 +86,21 @@ function handlePair(ws, msg) {
     safeClose(ws, 4401, 'invalid pair.request');
     return null;
   }
+  // Cap total rooms: refuse new rooms past the limit (memory DoS guard).
   const roomId = roomIdFor(key);
+  if (!rooms.has(roomId) && rooms.size >= MAX_ROOMS) {
+    safeClose(ws, 4413, 'server busy');
+    return null;
+  }
   let room = rooms.get(roomId);
   if (!room) {
+    const now = Date.now();
     room = {
       keyHash: createHash('sha256').update(key, 'utf8').digest(),
       extension: null,
       driver: null,
-      createdAt: Date.now(),
+      createdAt: now,
+      lastActive: now,
     };
     rooms.set(roomId, room);
   }
@@ -107,6 +125,18 @@ function handlePair(ws, msg) {
 }
 
 function handleMessage(ws, raw) {
+  // Per-connection flood guard.
+  const now = Date.now();
+  if (now - ws._rateWinStart > MSG_RATE_WINDOW_MS) {
+    ws._rateWinStart = now;
+    ws._rateCount = 0;
+  }
+  ws._rateCount = (ws._rateCount || 0) + 1;
+  if (ws._rateCount > MSG_RATE_MAX) {
+    safeClose(ws, 4408, 'rate limit exceeded');
+    return;
+  }
+
   let msg;
   try {
     msg = JSON.parse(raw.toString());
@@ -135,6 +165,7 @@ function handleMessage(ws, raw) {
     safeClose(ws, 4401, 'not paired');
     return;
   }
+  room.lastActive = Date.now();
   if (!forwardToPeer(room, ws._role, raw.toString())) {
     ws.send(JSON.stringify({ v: 1, type: 'peer.unavailable' }));
   }
@@ -166,7 +197,8 @@ export function createRelay(port = PORT) {
     httpServer = createHttpServer((req, res) => {
       if (req.url === '/health') {
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+        // Deliberately no room/session counts — that leaks usage to scanners.
+        res.end(JSON.stringify({ ok: true }));
       } else {
         res.writeHead(404); res.end();
       }
@@ -174,9 +206,34 @@ export function createRelay(port = PORT) {
     log('plain ws (no TLS_CERT/TLS_KEY) — private/dev use only');
   }
 
-  const wss = new WebSocketServer({ server: httpServer });
+  const wss = new WebSocketServer({ server: httpServer, maxPayload: MAX_PAYLOAD });
 
-  wss.on('connection', (ws) => {
+  // Sweeper: destroy lonely rooms (one peer never joined) and ancient rooms.
+  setInterval(() => {
+    const now = Date.now();
+    for (const [roomId, room] of rooms) {
+      const peers = (room.extension ? 1 : 0) + (room.driver ? 1 : 0);
+      if (peers === 0 ||
+          (peers < 2 && now - room.createdAt > ROOM_LONELY_TTL_MS) ||
+          now - room.createdAt > ROOM_MAX_AGE_MS) {
+        destroyRoom(roomId, 'expired');
+      }
+    }
+  }, 60000);
+
+  wss.on('connection', (ws, req) => {
+    // Per-IP connection cap.
+    const ip = (req && req.socket && req.socket.remoteAddress) || 'unknown';
+    const count = (connsByIp.get(ip) || 0) + 1;
+    if (count > MAX_CONN_PER_IP) {
+      safeClose(ws, 4413, 'too many connections');
+      return;
+    }
+    connsByIp.set(ip, count);
+    ws._ip = ip;
+    ws._rateWinStart = Date.now();
+    ws._rateCount = 0;
+
     let paired = false;
     // First message must be pair.request; anything else is rejected.
     const firstTimer = setTimeout(() => {
@@ -203,7 +260,14 @@ export function createRelay(port = PORT) {
       handleMessage(ws, raw);
     });
 
-    ws.on('close', () => { clearTimeout(firstTimer); clearInterval(ws._hb); onDisconnect(ws); });
+    ws.on('close', () => {
+      clearTimeout(firstTimer); clearInterval(ws._hb);
+      if (ws._ip) {
+        const c = (connsByIp.get(ws._ip) || 1) - 1;
+        if (c <= 0) connsByIp.delete(ws._ip); else connsByIp.set(ws._ip, c);
+      }
+      onDisconnect(ws);
+    });
     ws.on('error', () => { /* close event follows */ });
   });
 
