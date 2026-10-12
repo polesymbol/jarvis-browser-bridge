@@ -74,9 +74,16 @@ chrome.runtime.onInstalled.addListener(function () {
   chrome.alarms.create("jbb-keepalive", { periodInMinutes: 0.5 });
   loadPersisted();
   checkNotificationPermission();
+  // Pre-warm the consent tone engine (see onStartup).
+  setTimeout(function () { if (state.soundOn) ensureOffscreenDocument(function () {}); }, 3000);
 });
 
-chrome.runtime.onStartup.addListener(function () { loadPersisted(); hydratePendings(); checkNotificationPermission(); });
+chrome.runtime.onStartup.addListener(function () {
+  loadPersisted(); hydratePendings(); checkNotificationPermission();
+  // Pre-warm the consent tone engine so the first chime isn't slow:
+  // creating the offscreen document + AudioContext takes a beat on cold start.
+  setTimeout(function () { if (state.soundOn) ensureOffscreenDocument(function () {}); }, 3000);
+});
 
 // Fires every ~30s, even after the worker was suspended and restarted.
 chrome.alarms.onAlarm.addListener(function (alarm) {
