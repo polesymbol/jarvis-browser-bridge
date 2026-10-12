@@ -318,8 +318,21 @@ function hydratePendings(done) {
 
 var offscreenReady = false;
 var offscreenWantTone = false; // a tone was requested before the page signalled ready
+var offscreenUnsupported = false; // chrome.offscreen missing (old Chrome) — tone disabled
+
+function offscreenAvailable() {
+  if (offscreenUnsupported) return false;
+  if (!chrome.offscreen || !chrome.offscreen.createDocument) {
+    offscreenUnsupported = true;
+    audit({ site: "-", action: "consent tone", tier: "T0", result: "unavailable",
+            detail: "chrome.offscreen API not present — audible tone disabled, visual prompts unaffected" });
+    return false;
+  }
+  return true;
+}
 
 function ensureOffscreenDocument(cb) {
+  if (!offscreenAvailable()) return;
   if (offscreenReady) { cb(); return; }
   // Remember the intent: the ready handshake (below) will flush it.
   var create = function () {
