@@ -19,12 +19,13 @@
 (function () {
   "use strict";
 
-  // Guard against double-injection (background re-injects before each action).
-  if (window.__jbb_injected) return;
-  window.__jbb_injected = true;
-
   var REF_ATTR = "data-jbb-ref";
-  var MAX_ELEMENTS = 120;
+  var MAX_ELEMENTS = 200;
+  // Per-frame readable-text budget. The background merges frames under a
+  // total cap so a text-heavy LMS page stays well below the relay's 1 MB
+  // payload ceiling while still carrying the actual lesson content.
+  var TEXT_CAP = 15000;
+  var TRANSCRIPT_CAP = 12000;
 
   var INTERACTIVE_SELECTOR = [
     "a[href]",
@@ -38,6 +39,17 @@
     "[role='textbox']",
     "[tabindex]:not([tabindex='-1'])"
   ].join(",");
+
+  // Guard against double-injection (background re-injects before each action).
+  // On re-injection, refresh the snapshot entry point the background calls via
+  // chrome.scripting.executeScript, then stop — one message listener per frame
+  // is enough. (Function declarations below are hoisted, and the constants
+  // above are already initialised, so buildSnapshot is safe to reference here.)
+  if (window.__jbb_injected) {
+    window.__jbbBuildSnapshot = buildSnapshot;
+    return;
+  }
+  window.__jbb_injected = true;
 
   function isVisible(el) {
     var r = el.getBoundingClientRect();
@@ -73,6 +85,112 @@
     return tag;
   }
 
+  function normalizeText(s) {
+    return String(s || "")
+      .replace(/[ \t]+\n/g, "\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }
+
+  function stripCueMarkup(s) {
+    return String(s || "").replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim();
+  }
+
+  /**
+   * Readable text of THIS frame: the rendered body text (innerText skips
+   * display:none / visibility:hidden subtrees, so hidden template stuffing
+   * stays out) plus the text of any open shadow roots — LMS/course players
+   * (and modern component libraries) render lesson bodies inside shadow DOM,
+   * which a plain querySelector walk never sees. Iframe documents are NOT
+   * read from here: the background injects this script into every frame and
+   * merges each frame's own snapshot, which also covers cross-origin player
+   * frames that DOM access from the top page could never reach.
+   */
+  function collectVisibleText() {
+    var parts = [];
+    try {
+      var main = document.body ? (document.body.innerText || "") : "";
+      if (main.trim()) parts.push(main);
+    } catch (e) { /* frame without a body yet */ }
+    try {
+      var all = document.querySelectorAll("*");
+      for (var i = 0; i < all.length; i++) {
+        var sr = all[i].shadowRoot;
+        if (!sr) continue;
+        var t = "";
+        for (var j = 0; j < sr.children.length; j++) {
+          t += (sr.children[j].innerText || sr.children[j].textContent || "") + "\n";
+        }
+        if (t.trim()) parts.push(t);
+      }
+    } catch (e) { /* shadow access is best-effort */ }
+    var text = normalizeText(parts.join("\n"));
+    return { text: text.slice(0, TEXT_CAP), truncated: text.length > TEXT_CAP };
+  }
+
+  /**
+   * Media state for every <video>/<audio> in this frame, including caption /
+   * subtitle transcripts when the browser exposes the cues. A disabled
+   * captions track is switched to "hidden" (loads its cues without rendering
+   * them on screen) so the transcript becomes readable; cross-origin media
+   * may still refuse cue access, which is reported as cuesError instead of
+   * failing the whole snapshot.
+   */
+  function collectMedia() {
+    var out = [];
+    var nodes = document.querySelectorAll("video, audio");
+    for (var i = 0; i < nodes.length && out.length < 10; i++) {
+      var v = nodes[i];
+      var item = {
+        tag: v.tagName.toLowerCase(),
+        duration: (typeof v.duration === "number" && isFinite(v.duration)) ? v.duration : null,
+        currentTime: (typeof v.currentTime === "number") ? v.currentTime : 0,
+        paused: !!v.paused,
+        src: v.currentSrc || v.src || null,
+        tracks: []
+      };
+      try {
+        var tracks = v.textTracks;
+        for (var t = 0; t < tracks.length; t++) {
+          var tr = tracks[t];
+          var ti = { kind: tr.kind, label: tr.label, language: tr.language, mode: tr.mode };
+          try {
+            if ((tr.kind === "captions" || tr.kind === "subtitles") && tr.mode === "disabled") {
+              tr.mode = "hidden";
+              ti.mode = tr.mode;
+            }
+          } catch (e) { /* mode is read-only on some players */ }
+          try {
+            if (tr.activeCues && tr.activeCues.length) {
+              ti.activeCue = stripCueMarkup(tr.activeCues[0].text);
+            }
+          } catch (e) { /* cues not exposed for this media */ }
+          try {
+            if (tr.cues && (tr.kind === "captions" || tr.kind === "subtitles")) {
+              var cues = [];
+              var total = 0;
+              for (var c = 0; c < tr.cues.length; c++) {
+                var txt = stripCueMarkup(tr.cues[c].text);
+                if (!txt) continue;
+                cues.push(txt);
+                total += txt.length + 1;
+                if (total > TRANSCRIPT_CAP) break;
+              }
+              if (cues.length) ti.transcript = cues.join(" ").slice(0, TRANSCRIPT_CAP);
+            }
+          } catch (e) {
+            ti.cuesError = String((e && e.message) || e);
+          }
+          item.tracks.push(ti);
+        }
+      } catch (e) {
+        item.tracksError = String((e && e.message) || e);
+      }
+      out.push(item);
+    }
+    return out;
+  }
+
   /** Build the observation snapshot sent to the agent. */
   function buildSnapshot() {
     var els = document.querySelectorAll(INTERACTIVE_SELECTOR);
@@ -91,13 +209,21 @@
       });
       n++;
     }
+    var text = collectVisibleText();
     return {
       title: document.title,
       url: location.href,
       interactives: interactives,
-      truncated: els.length > MAX_ELEMENTS
+      truncated: els.length > MAX_ELEMENTS,
+      text: text.text,
+      textTruncated: text.truncated,
+      media: collectMedia()
     };
   }
+
+  // Entry point the background calls per frame via chrome.scripting
+  // .executeScript (isolated world is shared with this content script).
+  window.__jbbBuildSnapshot = buildSnapshot;
 
   function findByRef(ref) {
     return document.querySelector("[" + REF_ATTR + "='" + ref + "']");

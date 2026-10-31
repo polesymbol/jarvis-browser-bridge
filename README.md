@@ -34,12 +34,16 @@ Live public relay: `wss://relay.musebridge.avinyahub.com`
 
 - **Permission modes** in plain language: *Readonly*, *Ask for some actions*, *Always ask* — per site.
 - **Action tiers:** T0 observe, T1 low-risk, T2 state-changing, T3 sensitive. T3 *always* asks, in every mode, no exceptions.
-- **Session grants:** approve *Allow once*, *This site*, *For 1 hour*, or *For 1 day* instead of per-action clicks. T1/T2 auto-allow inside a grant; T3 still always asks. Hard expiry, one-click revoke, everything audit-logged.
+- **Grants that end prompt fatigue:** approve *Allow once*, *For 1 hour*, *For 1 day*, *For 1 week*, *Until a date & time you pick* (up to 31 days), or *Always on this site* (permanent, per site) — so a multi-step job on one website or account doesn't ask you to approve every click. Timed grants cover T1/T2 on that one site and expire hard, with no silent extension. **T3 critical actions still ask every single time — inside a timed grant, on a permanently granted site, in every mode — because one mistaken irreversible action is the failure this product refuses to automate.** One-click revoke anytime; everything audit-logged.
 - **Unmissable prompts:** in-page consent banner (works with the panel closed) plus toolbar badge. No silent approvals.
 - **Connector key:** API-key model — generated once, shown once, revocable/regenerable.
 - **Kill switch** (`Ctrl+Shift+K`), per-site allow/block, exportable audit log.
 - **Page content is data, never instructions.** The driver never executes anything found in page content.
 - **Sign-in takeover:** when a login is needed, control returns to you. Passwords never leave your machine.
+
+## What the assistant sees when it observes
+
+An observe snapshot contains: the page's interactive elements (buttons, links, inputs) with labels; the page's **readable text** from the top page and every iframe, including open shadow-DOM content (capped at 15,000 characters per frame, 60,000 merged); and, for video/audio, playback state plus **caption/subtitle transcripts** when the player exposes them (capped at 12,000 characters per element). That's what lets the assistant actually *read* a course or video page instead of guessing from buttons. Snapshots transit the relay (see the security note below) and are never stored by it. One deliberate exception to "observe changes nothing": reading a transcript may switch a disabled captions track to hidden mode so its cues load — nothing appears on screen, and no other page state changes.
 
 ## The panel: "The Instrument"
 
@@ -47,9 +51,11 @@ v0.2.1 ships a dark precision-instrument UI — warm tinted ink, ember reserved 
 
 ## Status
 
-**v0.2.13** — free beta open (October 2026). Full consent stack verified live: OS notification toast, audible chime, in-page banner, toolbar badge, capped re-raise of swallowed toasts, audit-logged throughout. Navigate works from browser-internal pages; relay hardened (rate limits, room caps, payload limits). See [ARCHITECTURE.md](ARCHITECTURE.md), [TRANSPORT.md](TRANSPORT.md), and [BETA_PLAN.md](BETA_PLAN.md).
+**v0.2.15** — free beta open (October 2026). Full consent stack verified live: OS notification toast, audible chime, in-page banner, toolbar badge, capped re-raise of swallowed toasts, audit-logged throughout. Navigate works from browser-internal pages; relay hardened (rate limits, room caps, payload limits). Observe snapshots carry the page's readable text from every frame (top page + iframes, incl. open shadow DOM) plus video/audio caption transcripts — course and video players are legible to the driver, not just clickable. Grants are now flexible: 1 hour, 1 day, 1 week, a custom "until" date & time you pick, or permanent per site — while critical T3 actions keep asking every time, grant or no grant. See [ARCHITECTURE.md](ARCHITECTURE.md), [TRANSPORT.md](TRANSPORT.md), and [BETA_PLAN.md](BETA_PLAN.md).
 
 ## Quick start
+
+**Beta testers:** download the extension ZIP from [Releases](https://github.com/polesymbol/jarvis-browser-bridge/releases), unzip it, then load the `extension/` folder as below. **Developers:** clone this repo and load `extension/` from your checkout — same steps either way.
 
 ```bash
 # 1. Extension: chrome://extensions → Developer mode → Load unpacked → extension/

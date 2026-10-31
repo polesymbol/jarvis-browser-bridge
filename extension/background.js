@@ -165,9 +165,13 @@ function checkSignInState(callback) {
 }
 
 // ---------------------------------------------------------------- session grants
-// Time-boxed consent: the user grants Muse a window (1 hour / 24 hours) to act
-// on a site without per-action prompts. T3 actions are NEVER covered — they
-// always ask. Expiry is hard: no silent extension. One-click revoke anytime.
+// Time-boxed consent: the user grants Muse a window on ONE site — 1 hour,
+// 24 hours, 1 week, or a custom "until" date/time they pick — so a multi-step
+// job does not re-prompt for every action. A permanent per-site grant also
+// exists (scope "site", stored in state.sites). NEITHER kind covers T3:
+// critical actions (auth, payments, email, publishing, deletion, anything
+// hard to undo) ALWAYS ask, even inside a window, even on a permanent site.
+// Expiry is hard: no silent extension. One-click revoke anytime.
 function saveSession() {
   if (state.session) chrome.storage.local.set({ [K.SESSION]: state.session });
   else chrome.storage.local.remove([K.SESSION]);
@@ -655,6 +659,7 @@ function jbbConsentBanner(summary) {
   bar.appendChild(btn("This site", false, "site"));
   bar.appendChild(btn("1 hour", false, "session1h"));
   bar.appendChild(btn("1 day", false, "session24h"));
+  bar.appendChild(btn("1 week", false, "session1w"));
   bar.appendChild(btn("Deny", false, "deny"));
   (document.documentElement || document.body).appendChild(bar);
 }
@@ -989,7 +994,7 @@ function resolveConsent(proposal, answer) {
   // SECURITY (enemy audit round 2): fail closed on unknown choice values.
   // Anything that isn't an explicit approval becomes a denial — never execute
   // on garbage input.
-  var VALID_CHOICES = { "once": 1, "site": 1, "session1h": 1, "session24h": 1, "deny": 1 };
+  var VALID_CHOICES = { "once": 1, "site": 1, "session1h": 1, "session24h": 1, "session1w": 1, "sessionCustom": 1, "deny": 1 };
   if (!answer || !VALID_CHOICES[answer.choice]) {
     answer = { choice: "deny", reason: "invalid consent choice" };
   }
@@ -1022,14 +1027,34 @@ function resolveConsent(proposal, answer) {
 
   // Time-boxed session grant: Muse may act on this site without per-action
   // prompts until the window lapses. T3 actions are still never covered.
-  if (answer.choice === "session1h" || answer.choice === "session24h") {
+  if (answer.choice === "session1h" || answer.choice === "session24h" ||
+      answer.choice === "session1w" || answer.choice === "sessionCustom") {
     var shost = hostOf(proposal.site || "");
-    var sms = answer.choice === "session1h" ? 3600e3 : 86400e3;
+    var SPANS = { session1h: 3600e3, session24h: 86400e3, session1w: 604800e3 };
+    var sexp = SPANS[answer.choice] ? Date.now() + SPANS[answer.choice]
+                                    : Number(answer.expiresAt);
+    // A custom "until" fails closed: it must be a real timestamp, at least a
+    // minute in the future, and at most 31 days out — beyond that the user
+    // should pick the explicit permanent site grant, not a giant window.
+    if (!isFinite(sexp) || sexp <= Date.now() + 60e3 || sexp > Date.now() + 31 * 86400e3) {
+      sendToRelay(JBB.Message.consentDeny(proposal.proposalId, "invalid custom grant expiry"));
+      sendToRelay(JBB.Message.actResult(proposal.proposalId, false, "invalid custom grant expiry"));
+      audit({
+        site: proposal.site || "-",
+        action: proposal.description || proposal.type,
+        tier: proposal.actionTier,
+        result: "denied",
+        detail: "invalid custom grant expiry"
+      });
+      pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: proposal.proposalId, choice: "deny" });
+      return;
+    }
+    var slabels = { session1h: "1 hour", session24h: "24 hours", session1w: "1 week" };
     state.session = {
       site: shost,
       grantedAt: Date.now(),
-      expiresAt: Date.now() + sms,
-      label: answer.choice === "session1h" ? "1 hour" : "24 hours"
+      expiresAt: sexp,
+      label: slabels[answer.choice] || ("until " + new Date(sexp).toLocaleString())
     };
     saveSession();
     audit({
@@ -1109,17 +1134,24 @@ function runOnPage(proposal) {
         " but active tab is " + (actualHost || "unknown"));
     }
     return chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: tab.id, allFrames: true },
       files: ["protocol.js", "content.js"]
     }).then(function () {
-      var msg = { kind: "jbb.content.act", action: proposal };
       // navigate is handled by the background (tabs API), not the page.
       if (proposal.type === "navigate" && proposal.url) {
         return chrome.tabs.update(tab.id, { url: proposal.url }).then(function () {
           return "navigated to " + proposal.url;
         });
       }
-      return chrome.tabs.sendMessage(tab.id, msg).then(function (res) {
+      // A ref of the form "f<frameId>:e<n>" (produced by observe for elements
+      // inside an iframe, e.g. a course player) routes the action to that
+      // frame with its local ref; plain refs go to the top frame as before.
+      var routed = routeFrameRef(proposal);
+      var msg = { kind: "jbb.content.act", action: routed.proposal };
+      var send = routed.frameId != null
+        ? chrome.tabs.sendMessage(tab.id, msg, { frameId: routed.frameId })
+        : chrome.tabs.sendMessage(tab.id, msg);
+      return send.then(function (res) {
         if (!res || !res.ok) throw new Error((res && res.error) || "content script error");
         return res.detail;
       });
@@ -1127,23 +1159,99 @@ function runOnPage(proposal) {
   });
 }
 
+// Split a frame-prefixed ref ("f12:e3") into { frameId, local-proposal }.
+// Returns the proposal untouched when the ref carries no frame prefix.
+function routeFrameRef(proposal) {
+  var target = (proposal && proposal.target) || {};
+  var m = /^f(\d+):(.+)$/.exec(target.ref || "");
+  if (!m) return { frameId: null, proposal: proposal };
+  var clone = {};
+  for (var k in proposal) clone[k] = proposal[k];
+  clone.target = {};
+  for (var k2 in target) clone.target[k2] = target[k2];
+  clone.target.ref = m[2];
+  return { frameId: parseInt(m[1], 10), proposal: clone };
+}
+
+// Serialized into every frame via chrome.scripting.executeScript — must stay
+// fully self-contained. The content script shares this isolated world and
+// exposes window.__jbbBuildSnapshot; frames where injection is impossible
+// (or an older content script is still resident) return null and are skipped.
+function jbbSnapshotInFrame() {
+  try {
+    return window.__jbbBuildSnapshot ? window.__jbbBuildSnapshot() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Total readable-text budget across all merged frames. Per-frame text is
+// already capped in the content script; this keeps a page with many frames
+// (LMS players, embedded widgets) comfortably under the relay's 1 MB limit.
+var JBB_TOTAL_TEXT_CAP = 60000;
+
+function prefixFrameRefs(snap, frameId) {
+  if (!snap || !snap.interactives) return;
+  snap.interactives.forEach(function (it) {
+    it.ref = "f" + frameId + ":" + it.ref;
+  });
+}
+
+function finishObserve(tab, snap, withScreenshot) {
+  if (!withScreenshot) return JBB.Message.observeResult(snap, null);
+  return chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
+    .catch(function () { return null; })
+    .then(function (dataUrl) {
+      return JBB.Message.observeResult(snap, dataUrl);
+    });
+}
+
 function observeActiveTab(withScreenshot) {
   return getActiveTab().then(function (tab) {
     if (!tab || !tab.id) throw new Error("no active tab");
     return chrome.scripting.executeScript({
-      target: { tabId: tab.id },
+      target: { tabId: tab.id, allFrames: true },
       files: ["protocol.js", "content.js"]
     }).then(function () {
-      return chrome.tabs.sendMessage(tab.id, { kind: "jbb.content.observe" });
-    }).then(function (res) {
-      if (!res || !res.ok) throw new Error("observe failed");
-      var snap = res.snapshot;
-      if (!withScreenshot) return JBB.Message.observeResult(snap, null);
-      return chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
-        .catch(function () { return null; })
-        .then(function (dataUrl) {
-          return JBB.Message.observeResult(snap, dataUrl);
-        });
+      return chrome.scripting.executeScript({
+        target: { tabId: tab.id, allFrames: true },
+        func: jbbSnapshotInFrame
+      }).catch(function () { return null; });
+    }).then(function (results) {
+      var frames = [];
+      (results || []).forEach(function (r) {
+        if (r && r.result) frames.push({ frameId: r.frameId, snapshot: r.result });
+      });
+      if (!frames.length) {
+        // Fallback: a content script from an older build may still be the
+        // resident one in this tab (it has no __jbbBuildSnapshot). Its
+        // message-based observe still answers — top frame only, no text.
+        return chrome.tabs.sendMessage(tab.id, { kind: "jbb.content.observe" })
+          .then(function (res) {
+            if (!res || !res.ok) throw new Error("observe failed");
+            return finishObserve(tab, res.snapshot, withScreenshot);
+          });
+      }
+      var top = null;
+      frames.forEach(function (f) { if (f.frameId === 0) top = f; });
+      if (!top) top = frames[0];
+      var snap = top.snapshot;
+      var totalText = (snap.text || "").length;
+      var others = [];
+      frames.forEach(function (f) {
+        if (f === top) return;
+        var s = f.snapshot;
+        s.frameId = f.frameId;
+        prefixFrameRefs(s, f.frameId);
+        if (s.text && totalText + s.text.length > JBB_TOTAL_TEXT_CAP) {
+          s.text = s.text.slice(0, Math.max(0, JBB_TOTAL_TEXT_CAP - totalText));
+          s.textTruncated = true;
+        }
+        totalText += (s.text || "").length;
+        others.push(s);
+      });
+      if (others.length) snap.frames = others;
+      return finishObserve(tab, snap, withScreenshot);
     });
   });
 }
@@ -1305,7 +1413,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         ensureRelayConnected(function () {
           var p = state.pending.get(msg.proposalId);
           if (p) {
-            p.resolve({ choice: msg.choice, reason: msg.reason });
+            p.resolve({ choice: msg.choice, reason: msg.reason, expiresAt: msg.expiresAt });
             done();
           } else {
             pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: msg.proposalId, choice: "deny", reason: "consent expired" });

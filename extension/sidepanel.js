@@ -138,17 +138,30 @@ function renderConsentCard(proposal) {
     '<div class="consent-tier-desc">' + esc(tier.desc) + "</div>" +
     '<div class="consent-actions">' +
       '<button class="btn btn-primary" data-choice="once">Allow once</button>' +
-      '<button class="btn btn-secondary" data-choice="site">Always on this site</button>' +
+      '<button class="btn btn-secondary" data-choice="site">Always on this site (permanent)</button>' +
       '<button class="btn btn-secondary" data-choice="session1h">For 1 hour</button>' +
       '<button class="btn btn-secondary" data-choice="session24h">For 1 day</button>' +
+      '<button class="btn btn-secondary" data-choice="session1w">For 1 week</button>' +
       '<button class="btn btn-danger" data-choice="deny">Deny</button>' +
-    "</div>";
+    "</div>" +
+    '<div class="consent-custom">' +
+      '<label for="until-' + proposal.proposalId + '">Or until</label>' +
+      '<input type="datetime-local" class="consent-until" id="until-' + proposal.proposalId + '">' +
+      '<button class="btn btn-secondary" data-choice="sessionCustom">Allow until then</button>' +
+    "</div>" +
+    '<div class="consent-grant-note">Timed and permanent grants cover routine (T1–T2) actions on this site only. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
 
   card.querySelectorAll("button").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var choice = btn.getAttribute("data-choice");
-      api({ kind: "jbb.ui.consent", proposalId: proposal.proposalId, choice: choice })
-        .then(function () { card.remove(); });
+      var payload = { kind: "jbb.ui.consent", proposalId: proposal.proposalId, choice: choice };
+      if (choice === "sessionCustom") {
+        var input = card.querySelector(".consent-until");
+        var ts = input && input.value ? Date.parse(input.value) : NaN;
+        if (!isFinite(ts) || ts <= Date.now()) { if (input) input.focus(); return; }
+        payload.expiresAt = ts;
+      }
+      api(payload).then(function () { card.remove(); });
     });
   });
 

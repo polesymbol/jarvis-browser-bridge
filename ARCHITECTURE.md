@@ -90,9 +90,9 @@ Three processes, one trust boundary: **nothing acts in the browser without passi
 ### 4.1 Extension (the hands) — Manifest V3
 
 - **Side panel:** agent status, consent cards (Allow once / Always on this site / Deny), session tier indicator, kill switch (button + hotkey), pairing flow.
-- **Content scripts:** build DOM + accessibility-tree snapshots, capture screenshots, perform clicks/types as trusted events.
+- **Content scripts:** build page snapshots — interactive elements with stable refs, the page's readable text from **every frame** (top page + iframes, including open shadow DOM; capped at 15k chars/frame, 60k merged), and video/audio caption transcripts (capped at 12k chars per media element) — capture screenshots, and perform clicks/types as trusted events. One deliberate exception to "observe changes nothing": reading a transcript may switch a disabled captions track to `hidden` mode so its cues load; nothing is displayed on screen and no other page state changes.
 - **Background service worker:** holds the WebSocket session, enforces permission checks locally before executing any action, maintains the audit log.
-- **Install permissions:** `activeTab` + optional host permissions requested **on demand per site** — never `<all_urls>` at install. This is both a security posture and the trust story.
+- **Install permissions:** the manifest declares `<all_urls>` host access (arbitrary-site automation requires it) plus `activeTab`, `scripting`, `tabs`, `storage`, `sidePanel`, `notifications`, `offscreen`. Host access alone grants nothing: the local permission modes, per-site grants, and timed windows in the background worker govern every actual use, and per-site host permission is additionally requested on demand when a site is granted.
 - **Distribution v1:** unpacked/self-hosted (private). **Open-sourced** at beta so anyone can audit what the client sends.
 
 ### 4.2 Relay (the wire)
@@ -100,7 +100,7 @@ Three processes, one trust boundary: **nothing acts in the browser without passi
 - WebSocket Secure (wss) relay between extension and Jarvis.
 - **Auth:** the extension generates a **connector secret key** (API-key model) on first run — displayed once in the side panel with an explicit never-share warning, the same gravity as revealing an API key. The user links it in Muse (chat or settings), the same motion as connecting any service. The key authenticates the wss session; it is revocable and regenerable at any time, and a compromised key dies in one tap. Session tokens derive from it and expire.
 - **v1:** runs on Jarvis's VM (private use only). **Beta:** moves to a small dedicated VPS (Hostinger KVM 2 was the live candidate) so VM replacements never drop sessions.
-- **Storage policy:** passthrough only. DOM snapshots and screenshots transit the relay and are never written to disk.
+- **Storage policy:** passthrough only. Snapshots (interactives, page text, transcripts) and screenshots transit the relay and are never written to disk.
 
 ### 4.3 Jarvis driver (the brain)
 
@@ -111,6 +111,8 @@ Three processes, one trust boundary: **nothing acts in the browser without passi
 ### 4.4 Permission service (the product)
 
 User-facing language mirrors Muse's native **Settings > Permissions** model: **"Ask for some actions"** (default — acts within grants, T3 always confirms) vs **"Always ask"** (every action confirmed), managed per website exactly like the Websites list users already know. The tier table below is the engineering detail behind that language.
+
+**Grants.** So a multi-step job on one site does not re-prompt for every action, the user can scope consent: *Allow once*, a **timed window** on that site (1 hour / 1 day / 1 week / a custom "until" date & time, capped at 31 days, hard expiry, one active window), or a **permanent** per-site grant (until revoked). Grants cover T1–T2 only. **T3 critical actions always ask — inside a window, on a permanently granted site, in every mode — with no exceptions**, because a mistaken irreversible action is the one failure this product must never automate.
 
 **Session tiers**
 | Tier | Name | Behavior |

@@ -33,6 +33,8 @@ This project is held to a higher bar in these areas — reports here get priorit
 ## Known limitations (disclosed, not vulnerabilities)
 
 - The relay terminates TLS, so it could technically observe traffic in transit. It stores nothing and interprets nothing; end-to-end encrypted payloads are the planned v2 answer. See [TRANSPORT.md](TRANSPORT.md).
+- Observe snapshots include the page's readable text (all frames, incl. open shadow DOM; capped at 60k characters merged) and video/audio caption transcripts. That content transits the relay under the same TLS caveat above and is never stored by the relay. Reading a transcript may switch a disabled captions track to `hidden` mode (cues load, nothing displays) — the single deliberate exception to observe being side-effect free.
+- Timed and permanent grants reduce prompting for routine (T1–T2) actions on one site. They never cover T3: critical actions (auth, payments, sending, publishing, deletion) ask for fresh consent every time, grant or no grant.
 
 ## Supported versions
 

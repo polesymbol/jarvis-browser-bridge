@@ -68,7 +68,11 @@
     observeRequest: function (tabId) {
       return base("observe.request", { tabId: tabId || null });
     },
-    // snapshot: { title, url, interactives: [{ref,label,type,name}] }
+    // snapshot: { title, url, interactives: [{ref,label,type,name}],
+    //   text, textTruncated, media: [{tag,duration,currentTime,paused,src,
+    //   tracks:[{kind,label,language,mode,activeCue?,transcript?}]}],
+    //   frames?: [ <same shape per sub-frame, frameId set, its interactives
+    //   refs prefixed "f<frameId>:" so actions can route back to the frame> ] }
     // screenshot: data URL (png) or null
     observeResult: function (snapshot, screenshot) {
       return base("observe.result", { snapshot: snapshot, screenshot: screenshot || null });
