@@ -64,6 +64,8 @@ var state = {
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer, createdAt, shown, shownVia, escalated, lastWaitingAt, elapsed }
   executing: new Set(),        // proposalIds currently executing (dedupe)
+  gating: new Set(),           // proposalIds whose tab context is resolving pre-verdict
+  tabsCache: [],               // last known tab list (panel Tabs card)
   actResults: new Map(),       // proposalId -> { ok, detail, at } (dedupe store, persisted at K.RESULTS)
   keyEpoch: 1,                 // current key epoch; grants from older epochs are invalid
   badgeFlashTimer: null,       // escalation badge flash interval
@@ -216,7 +218,8 @@ var WHITELIST_SCHEMA = 1;
 // NOT list them, so those actions still ask under old entries until the
 // user re-confirms (manager Keep) or re-grants.
 var WHITELIST_ACTIONS_V1 = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
-                            "hover", "select", "drag", "setValue"];
+                            "hover", "select", "drag", "setValue",
+                            "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab"];
 
 function saveWhitelist() {
   chrome.storage.local.set({ [K.WHITELIST]: state.whitelist });
@@ -1258,6 +1261,12 @@ function decideAction(proposal) {
   if (proposal.actionTier === "T3") {
     return { decision: "ask", reason: "sensitive action always asks" };
   }
+  // 5b. Closing the tab the user is actively looking at ALWAYS confirms
+  // too — resolveTabContext stamps _forceAsk from ground truth, and no
+  // session grant or whitelist entry can cover it.
+  if (proposal._forceAsk) {
+    return { decision: "ask", reason: "closing the tab you're looking at always asks" };
+  }
   // 6. "Always ask" mode: everything asks.
   if (state.mode === "always-ask") {
     return { decision: "ask" };
@@ -1407,7 +1416,8 @@ function handleProposal(proposal, source) {
             detail: "duplicate act id — stored result resent, act NOT re-applied" });
     return;
   }
-  if (state.pending.has(proposal.proposalId) || state.executing.has(proposal.proposalId)) {
+  if (state.pending.has(proposal.proposalId) || state.executing.has(proposal.proposalId) ||
+      state.gating.has(proposal.proposalId)) {
     sendToRelay(JBB.Message.proposalReceived(proposal.proposalId));
     var existing = state.pending.get(proposal.proposalId);
     if (existing && existing.shown) {
@@ -1442,6 +1452,24 @@ function handleProposal(proposal, source) {
     return;
   }
 
+  // Tab actions resolve their ground-truth context (real site, active
+  // flag) before the gate runs. The receipt already went out above; the
+  // gating set keeps a duplicate from double-processing meanwhile.
+  if (TAB_ACTIONS[proposal.type]) {
+    state.gating.add(proposal.proposalId);
+    resolveTabContext(proposal).then(function () {
+      state.gating.delete(proposal.proposalId);
+      proceedWithVerdict(proposal);
+    }, function () {
+      state.gating.delete(proposal.proposalId);
+      proceedWithVerdict(proposal);
+    });
+    return;
+  }
+  proceedWithVerdict(proposal);
+}
+
+function proceedWithVerdict(proposal) {
   var verdict = decideAction(proposal);
 
   // Session grants layer on top of "ask": a live time-boxed grant auto-allows
@@ -1589,9 +1617,138 @@ function resolveConsent(proposal, answer) {
   executeProposal(proposal);
 }
 
+// ------------------------------------------------------------ tab actions
+// Window-level actions (T2). They execute here in the worker via the
+// tabs API — no content script — but pass the SAME consent gate as page
+// actions: handleProposal resolves each proposal's real site first
+// (resolveTabContext), and decideAction sees a normal proposal.
+var TAB_ACTIONS = { listTabs: 1, switchTab: 1, closeTab: 1, closeInactiveTabs: 1, openTab: 1, pinTab: 1 };
+
+function tabSummary(t) {
+  return { id: t.id, title: t.title || "", url: t.url || "",
+           audible: !!t.audible, active: !!t.active, pinned: !!t.pinned, windowId: t.windowId };
+}
+
+// Ground truth before the gate: the whitelist and the audit key off the
+// tab's REAL url, not the driver-supplied site; and closing the tab the
+// user is looking at forces a prompt no matter what grants exist.
+function resolveTabContext(proposal) {
+  if (proposal.type === "openTab") {
+    if (proposal.url) proposal.site = proposal.url;
+    return Promise.resolve();
+  }
+  if (proposal.type === "switchTab" || proposal.type === "closeTab" || proposal.type === "pinTab") {
+    if (typeof proposal.tabId !== "number") return Promise.resolve(); // execution refuses cleanly
+    return chrome.tabs.get(proposal.tabId).then(function (tab) {
+      if (tab) {
+        proposal.site = tab.url || proposal.site || "";
+        proposal._tabActive = !!tab.active;
+        if (proposal.type === "closeTab" && tab.active) proposal._forceAsk = true;
+      }
+    }, function () { /* tab already gone — execution reports it */ });
+  }
+  // listTabs / closeInactiveTabs span sites; their audit site is the
+  // tab the user is on right now.
+  return getActiveTab().then(function (tab) {
+    if (tab && tab.url) proposal.site = tab.url;
+  }, function () {});
+}
+
+function refreshTabsCache() {
+  if (!chrome.tabs || !chrome.tabs.query) return;
+  chrome.tabs.query({}).then(function (tabs) {
+    state.tabsCache = tabs.map(tabSummary);
+    pushToPanel({ kind: "jbb.ui.tabsChanged" });
+  }, function () {});
+}
+if (chrome.tabs) {
+  ["onCreated", "onRemoved", "onUpdated", "onActivated"].forEach(function (ev) {
+    if (chrome.tabs[ev] && chrome.tabs[ev].addListener) {
+      chrome.tabs[ev].addListener(function () { refreshTabsCache(); });
+    }
+  });
+}
+
+function closeInactiveTabsNow() {
+  return chrome.tabs.query({}).then(function (tabs) {
+    var victims = tabs.filter(function (t) { return !t.active && !t.pinned && !t.audible; });
+    if (!victims.length) return { closed: [], kept: tabs.length };
+    return chrome.tabs.remove(victims.map(function (t) { return t.id; })).then(function () {
+      return { closed: victims.map(tabSummary), kept: tabs.length - victims.length };
+    });
+  });
+}
+
+function executeTabAction(proposal) {
+  switch (proposal.type) {
+    case "listTabs":
+      return chrome.tabs.query({}).then(function (tabs) {
+        var list = tabs.map(tabSummary);
+        return { detail: list.length + (list.length === 1 ? " tab open" : " tabs open"),
+                 data: { tabs: list } };
+      });
+    case "switchTab": {
+      if (typeof proposal.tabId !== "number") {
+        return Promise.reject(new Error("switchTab needs a tab id (run listTabs first)"));
+      }
+      return chrome.tabs.get(proposal.tabId).then(function (tab) {
+        return chrome.windows.update(tab.windowId, { focused: true })
+          .then(function () { return chrome.tabs.update(tab.id, { active: true }); })
+          .then(function () { return { detail: "switched to '" + (tab.title || tab.url) + "'" }; });
+      });
+    }
+    case "closeTab": {
+      if (typeof proposal.tabId !== "number") {
+        return Promise.reject(new Error("closeTab needs a tab id (run listTabs first)"));
+      }
+      return chrome.tabs.get(proposal.tabId).then(function (tab) {
+        return chrome.tabs.query({ windowId: tab.windowId }).then(function (inWindow) {
+          if (inWindow.length <= 1) {
+            throw new Error("refusing to close the last tab in its window");
+          }
+          if (tab.active && !proposal._forceAsk) {
+            // It was background when granted (maybe auto-allowed) and the
+            // user has since started looking at it. No prompt covered
+            // THIS state — fail safe and let the caller re-propose,
+            // which will force a prompt.
+            throw new Error("that tab is now the one you're looking at — not closing it without a fresh prompt");
+          }
+          return chrome.tabs.remove(tab.id).then(function () {
+            return { detail: "closed '" + (tab.title || tab.url) + "'" };
+          });
+        });
+      });
+    }
+    case "closeInactiveTabs":
+      return closeInactiveTabsNow().then(function (r) {
+        return { detail: "closed " + r.closed.length + " inactive tab(s); kept " + r.kept +
+                 " (active, pinned, or playing audio)", data: r };
+      });
+    case "openTab": {
+      if (!proposal.url) return Promise.reject(new Error("openTab needs a URL"));
+      return chrome.tabs.create({ url: proposal.url, active: false }).then(function (tab) {
+        return { detail: "opened " + proposal.url + " in a new tab (id " + tab.id + ")",
+                 data: { tab: tabSummary(tab) } };
+      });
+    }
+    case "pinTab": {
+      if (typeof proposal.tabId !== "number") {
+        return Promise.reject(new Error("pinTab needs a tab id (run listTabs first)"));
+      }
+      return chrome.tabs.get(proposal.tabId).then(function (tab) {
+        return chrome.tabs.update(tab.id, { pinned: true }).then(function () {
+          return { detail: "pinned '" + (tab.title || tab.url) + "'" };
+        });
+      });
+    }
+  }
+  return Promise.reject(new Error("unknown tab action: " + proposal.type));
+}
+
 function executeProposal(proposal) {
   state.executing.add(proposal.proposalId);
-  runOnPage(proposal).then(
+  var run = TAB_ACTIONS[proposal.type] ? executeTabAction(proposal) : runOnPage(proposal);
+  run.then(
     function (out) {
       var detail = (out && out.detail) || "";
       state.executing.delete(proposal.proposalId);
@@ -1604,7 +1761,7 @@ function executeProposal(proposal) {
       // target, so the caller can see how its target was found.
       state.snapshotVersion++;
       sendToRelay(JBB.Message.actResult(proposal.proposalId, true, detail,
-        null, state.snapshotVersion, out && out.matchQuality));
+        null, state.snapshotVersion, out && out.matchQuality, out && out.data));
       audit({
         site: proposal.site || "-",
         action: proposal.description || proposal.type,
@@ -1900,6 +2057,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           whitelistSchema: WHITELIST_SCHEMA,
           grantsPaused: state.grantsPaused,
           lastSummary: state.lastSummary,
+          tabs: state.tabsCache || [],
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
           session: sess ? { site: sess.site, label: sess.label,
@@ -1950,6 +2108,18 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       done();
       break;
 
+    case "jbb.ui.closeInactiveTabs":
+      // The user clicking in their own panel IS the consent — this is
+      // their control surface, not an agent action. Same guarded
+      // implementation the agent's proposals use.
+      closeInactiveTabsNow().then(function (r) {
+        audit({ site: "-", action: "close inactive tabs (from the panel)", tier: "T2",
+                result: "executed",
+                detail: "closed " + r.closed.length + " inactive tab(s); kept " + r.kept });
+        refreshTabsCache();
+        done({ ok: true, closed: r.closed.length, kept: r.kept });
+      }, function (err) { done({ ok: false, error: String(err) }); });
+      return true;
     case "jbb.ui.endSession":
       // The user's deliberate end: summarize first, then disconnect.
       // (Unlike the kill switch this does not block reconnection.)

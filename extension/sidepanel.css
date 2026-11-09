@@ -443,3 +443,12 @@ main { padding: 14px 16px 90px; }
 .feed-fix { color: var(--faint); font-size: 12px; }
 #summaryBody .sum-sites, #summaryBody .sum-denied { margin: 6px 0 0; padding-left: 16px; font-size: 12px; }
 #summaryBody .sum-head { font-size: 13px; }
+
+/* tab list (v0.2.25) */
+.tabrow { padding: 5px 0; border-bottom: 1px solid #eee; }
+.tabrow:last-child { border-bottom: none; }
+.tabrow .tt { font-weight: 600; }
+.tabrow .tu { color: #666; font-size: 12px; word-break: break-all; }
+.badge { display: inline-block; background: #eef; color: #335; border-radius: 8px;
+         padding: 0 6px; font-size: 11px; margin-left: 4px; }
+.badge.warn { background: #fdeeda; color: #7a4a12; }

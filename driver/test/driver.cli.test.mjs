@@ -385,6 +385,21 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   const r10 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "drag", "--target", "Card A", "--tier", "T1"], FAST);
   check("drag without a destination is a USAGE error",
     r10.code !== 0 && JSON.parse(r10.out).error === "USAGE", "stdout=" + r10.out);
+  const r11 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "listTabs"], FAST);
+  check("listTabs proposal defaults to tier T2",
+    r11.code === 0 && !!e.lastProposal && e.lastProposal.type === "listTabs" && e.lastProposal.actionTier === "T2",
+    "stdout=" + r11.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r12 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "closeTab", "--tab-id", "42"], FAST);
+  check("closeTab proposal carries the tab id",
+    r12.code === 0 && !!e.lastProposal && e.lastProposal.type === "closeTab" && e.lastProposal.tabId === 42,
+    "stdout=" + r12.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r13 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "closeTab"], FAST);
+  check("closeTab without --tab-id is a USAGE error",
+    r13.code !== 0 && JSON.parse(r13.out).error === "USAGE", "stdout=" + r13.out);
+  const r14 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "openTab", "--url", "https://example.com/x"], FAST);
+  check("openTab proposal carries the URL",
+    r14.code === 0 && !!e.lastProposal && e.lastProposal.type === "openTab" && e.lastProposal.url === "https://example.com/x",
+    "stdout=" + r14.out + " proposal=" + JSON.stringify(e.lastProposal));
   stopExt(e);
 }
 L.httpServer.close();

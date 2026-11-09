@@ -98,7 +98,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
       'commands: observe | act | abort | status',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
-      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n>',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -511,8 +511,12 @@ async function main() {
         throw new DriverError('USAGE', '--press-key <name> is required for --type key (for example --press-key Enter)');
       }
       const targetLabel = normalizeLabel(opt('--target', ''));
+      // Tab actions are T2 by default (they reshape the user's window);
+      // everything else keeps the T1 default. --tier overrides either.
+      const TAB_TYPES = ['listTabs', 'switchTab', 'closeTab', 'closeInactiveTabs', 'openTab', 'pinTab'];
+      const isTabType = TAB_TYPES.includes(type);
       const proposal = {
-        actionTier: opt('--tier', 'T1'),
+        actionTier: opt('--tier', isTabType ? 'T2' : 'T1'),
         type,
         target: { ref: opt('--ref', null), label: targetLabel },
         value: opt('--value', undefined),
@@ -600,6 +604,35 @@ async function main() {
         const fromName = proposal.dragFrom.point ? `(${fx}, ${fy})` : `'${targetLabel}'`;
         const toName = proposal.dragTo.point ? `(${tx}, ${ty})` : `'${toLabel}'`;
         proposal.description = `drag ${fromName} to ${toName}`;
+      } else if (isTabType) {
+        // Tab actions: ids come from a prior listTabs act (its result
+        // carries data.tabs). The extension resolves each tab's real
+        // site before the consent gate — the whitelist keys off truth,
+        // not the driver's claim.
+        const tabIdRaw = opt('--tab-id', undefined);
+        if (tabIdRaw !== undefined) {
+          const n = Number(tabIdRaw);
+          if (!Number.isFinite(n)) {
+            throw new DriverError('USAGE', '--tab-id must be a number (take it from a listTabs result)');
+          }
+          proposal.tabId = n;
+        }
+        if (type === 'listTabs') {
+          proposal.description = 'list open tabs';
+        } else if (type === 'closeInactiveTabs') {
+          proposal.description = 'close inactive tabs (keeps active, pinned, and playing audio)';
+        } else if (type === 'openTab') {
+          if (!proposal.url) {
+            throw new DriverError('USAGE', '--type openTab requires --url <url>');
+          }
+          proposal.description = `open ${proposal.url} in a new tab`;
+        } else {
+          if (proposal.tabId === undefined) {
+            throw new DriverError('USAGE', `--type ${type} requires --tab-id <n> (take it from a listTabs result)`);
+          }
+          const verb = type === 'switchTab' ? 'switch to' : type === 'closeTab' ? 'close' : 'pin';
+          proposal.description = `${verb} tab ${proposal.tabId}`;
+        }
       }
       const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       console.error('[sent] act.propose — following the consent lifecycle…');

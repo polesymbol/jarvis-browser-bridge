@@ -213,7 +213,8 @@ function renderSession(session) {
 // the background sanitizes whatever the manager sends, so drift here can
 // only ever narrow coverage, never widen it.
 var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
-                  "hover", "select", "drag", "setValue"];
+                  "hover", "select", "drag", "setValue",
+                  "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab"];
 var WL_REVIEW_MS = 30 * 86400e3;
 
 function fmtDate(ts) {
@@ -427,6 +428,42 @@ function renderFeed(entries) {
 }
 
 // ------------------------------------------------------------- session summary
+function renderTabs(tabs) {
+  var box = el("tabsList");
+  if (!box) return;
+  tabs = tabs || [];
+  if (!tabs.length) {
+    box.innerHTML = '<p class="muted">No tab information yet.</p>';
+    return;
+  }
+  var counts = {};
+  tabs.forEach(function (t) { if (t.url) counts[t.url] = (counts[t.url] || 0) + 1; });
+  box.innerHTML = "";
+  tabs.forEach(function (t) {
+    var row = document.createElement("div");
+    row.className = "tabrow";
+    var title = document.createElement("span");
+    title.className = "tt";
+    title.textContent = t.title || "(untitled)";
+    row.appendChild(title);
+    function badge(text, warn) {
+      var b = document.createElement("span");
+      b.className = "badge" + (warn ? " warn" : "");
+      b.textContent = text;
+      row.appendChild(b);
+    }
+    if (t.active) badge("active");
+    if (t.pinned) badge("pinned");
+    if (t.audible) badge("playing audio");
+    if (t.url && counts[t.url] > 1) badge("duplicate ×" + counts[t.url], true);
+    var url = document.createElement("div");
+    url.className = "tu";
+    url.textContent = t.url || "";
+    row.appendChild(url);
+    box.appendChild(row);
+  });
+}
+
 function renderSummary(summary) {
   var card = el("summaryCard");
   var body = el("summaryBody");
@@ -470,6 +507,7 @@ function refresh() {
     renderAudit(s.audit);
     renderFeed(s.audit);
     renderSummary(s.lastSummary);
+    renderTabs(s.tabs);
     // Don't clobber the relay URL while the user is typing it: status
     // updates arrive on every (re)connect attempt, and the old code wiped
     // the field back to the stored value mid-edit.
@@ -529,6 +567,9 @@ chrome.runtime.onMessage.addListener(function (msg) {
       });
       break;
     case "jbb.ui.sessionSummary":
+      refresh();
+      break;
+    case "jbb.ui.tabsChanged":
       refresh();
       break;
     case "jbb.ui.toast":
@@ -645,6 +686,16 @@ document.addEventListener("DOMContentLoaded", function () {
   el("endSessionBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.endSession" }).then(function (res) {
       if (res && res.summary) toast("Session ended — summary below");
+      refresh();
+    });
+  });
+  el("closeInactiveBtn").addEventListener("click", function () {
+    api({ kind: "jbb.ui.closeInactiveTabs" }).then(function (res) {
+      if (res && res.ok) {
+        el("tabsMsg").textContent = "Closed " + res.closed + " inactive tab(s); kept " + res.kept + ".";
+      } else {
+        el("tabsMsg").textContent = "Could not close tabs: " + ((res && res.error) || "unknown error");
+      }
       refresh();
     });
   });
