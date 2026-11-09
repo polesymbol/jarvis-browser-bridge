@@ -219,7 +219,8 @@ var WHITELIST_SCHEMA = 1;
 // user re-confirms (manager Keep) or re-grants.
 var WHITELIST_ACTIONS_V1 = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
                             "hover", "select", "drag", "setValue",
-                            "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab"];
+                            "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab",
+                            "waitFor", "fetch"];
 
 function saveWhitelist() {
   chrome.storage.local.set({ [K.WHITELIST]: state.whitelist });
@@ -1845,7 +1846,7 @@ function runOnPage(proposal) {
         : chrome.tabs.sendMessage(tab.id, msg);
       return send.then(function (res) {
         if (!res || !res.ok) throw new Error((res && res.error) || "content script error");
-        return { detail: res.detail, matchQuality: res.matchQuality, appeared: res.appeared };
+        return { detail: res.detail, matchQuality: res.matchQuality, appeared: res.appeared, data: res.data };
       });
     });
   });
@@ -2017,7 +2018,21 @@ function mockPropose() {
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   if (!msg || typeof msg.kind !== "string" ||
       (msg.kind.indexOf("jbb.ui.") !== 0 && msg.kind !== "jbb.banner.decision" &&
-       msg.kind.indexOf("jbb.offscreen.") !== 0 && msg.kind.indexOf("jbb.relay.") !== 0)) {
+       msg.kind.indexOf("jbb.offscreen.") !== 0 && msg.kind.indexOf("jbb.relay.") !== 0 &&
+       msg.kind !== "jbb.media.progress")) {
+    return false;
+  }
+  // Media progress from content scripts: relayed live to the driver,
+  // never stored. Only real tab senders count.
+  if (msg.kind === "jbb.media.progress") {
+    if (!sender || !sender.tab) return false;
+    if (state.connected && !state.sessionKilled) {
+      sendToRelay(JBB.Message.mediaProgress({
+        tabId: sender.tab.id, title: msg.title, url: msg.url, event: msg.event,
+        currentTime: msg.currentTime, duration: msg.duration,
+        paused: msg.paused, ended: msg.ended
+      }));
+    }
     return false;
   }
   // Relay transport signals — accepted ONLY from the offscreen document.

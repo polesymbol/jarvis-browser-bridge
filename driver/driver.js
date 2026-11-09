@@ -96,9 +96,10 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
     ok: true,
     usage: [
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
-      'commands: observe | act | abort | status',
+      'commands: observe | act | abort | status | watch',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
-      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n>',
+      'watch flags: --duration <seconds> (stream media.progress events as JSON lines; 0 = until Ctrl-C)',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -106,7 +107,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
 
 const RELAY = opt('--relay', 'ws://127.0.0.1:8787');
 const KEY = opt('--key', '');
-const CMD = args.find((a) => ['observe', 'act', 'abort', 'status'].includes(a));
+const CMD = args.find((a) => ['observe', 'act', 'abort', 'status', 'watch'].includes(a));
 
 // In-flight act proposals owned by this process. A one-shot CLI holds none at
 // rest, so `status` reports 0; the counter exists so the field is real, not
@@ -421,7 +422,11 @@ async function runAct(ws, proposal, id) {
     // APPLIED_UNCONFIRMED and never, ever resend the act.
     let result;
     try {
-      result = await pump.next(['act.result'], ACT_RESULT_MS);
+      // Long-running acts (waitFor with a declared timeout) get a result
+      // budget that covers the wait plus slack — the phase timeout must
+      // never fire before the act's own bounded timeout does.
+      const resultBudget = Math.max(ACT_RESULT_MS, (proposal.timeoutMs || 0) + 20000);
+      result = await pump.next(['act.result'], resultBudget);
     } catch (e) {
       if (isTimeout(e)) {
         emitAndExit({ ok: false, error: 'APPLIED_UNCONFIRMED', message: 'the action may already have applied — observe before retrying' }, 1);
@@ -487,6 +492,26 @@ async function main() {
 
     await pair(ws);
 
+    if (CMD === 'watch') {
+      // Stream live media progress (the extension pushes media.progress
+      // while media plays) as JSON lines — no polling observes.
+      const durS = Number(opt('--duration', '0'));
+      console.error('[watch] streaming media progress events' + (durS > 0 ? ` for ${durS}s` : ' (Ctrl-C to stop)'));
+      await new Promise((resolve) => {
+        const onMsg = (raw) => {
+          let m;
+          try { m = JSON.parse(String(raw)); } catch { return; }
+          if (m && m.type === 'media.progress') console.log(JSON.stringify(m));
+        };
+        ws.on('message', onMsg);
+        const done = () => { ws.off('message', onMsg); resolve(); };
+        if (durS > 0) setTimeout(done, durS * 1000);
+        process.once('SIGINT', done);
+      });
+      console.log(JSON.stringify({ ok: true, command: 'watch', done: true }, null, 2));
+      return;
+    }
+
     if (CMD === 'observe') {
       const req = { v: 1, type: 'observe.request', id: `obs-${Date.now()}` };
       const offRaw = opt('--text-offset', undefined);
@@ -516,7 +541,7 @@ async function main() {
       const TAB_TYPES = ['listTabs', 'switchTab', 'closeTab', 'closeInactiveTabs', 'openTab', 'pinTab'];
       const isTabType = TAB_TYPES.includes(type);
       const proposal = {
-        actionTier: opt('--tier', isTabType ? 'T2' : 'T1'),
+        actionTier: opt('--tier', isTabType || type === 'fetch' ? 'T2' : 'T1'),
         type,
         target: { ref: opt('--ref', null), label: targetLabel },
         value: opt('--value', undefined),
@@ -633,6 +658,45 @@ async function main() {
           const verb = type === 'switchTab' ? 'switch to' : type === 'closeTab' ? 'close' : 'pin';
           proposal.description = `${verb} tab ${proposal.tabId}`;
         }
+      } else if (type === 'fetch') {
+        // In-page fetch: runs in the page's context (its session). The
+        // extension enforces HTTPS-only and never sends credentials
+        // cross-origin; the description names exactly what will be hit.
+        if (!proposal.url) {
+          throw new DriverError('USAGE', '--type fetch requires --url <https url>');
+        }
+        const method = (opt('--method', 'GET') || 'GET').toUpperCase();
+        proposal.method = method;
+        const body = opt('--body', undefined);
+        if (body !== undefined) proposal.body = body;
+        const ct = opt('--content-type', undefined);
+        if (ct !== undefined) proposal.contentType = ct;
+        proposal.description = `fetch ${method} ${proposal.url} in this page`;
+      } else if (type === 'waitFor') {
+        const kind = opt('--wait', undefined);
+        const KINDS = ['element', 'text', 'navigation', 'networkIdle', 'mediaEnded'];
+        if (!KINDS.includes(kind)) {
+          throw new DriverError('USAGE', '--type waitFor requires --wait element|text|navigation|networkIdle|mediaEnded');
+        }
+        const w = { kind };
+        const sel = opt('--selector', undefined);
+        if (sel !== undefined) w.selector = sel;
+        const wt = opt('--wait-text', undefined);
+        if (wt !== undefined) w.text = wt;
+        if (targetLabel) w.label = targetLabel;
+        if (kind === 'text' && !w.text) {
+          throw new DriverError('USAGE', '--wait text requires --wait-text <text>');
+        }
+        if (kind === 'element' && !w.selector && !w.label && !w.text) {
+          throw new DriverError('USAGE', '--wait element requires --selector, --target, or --wait-text (a label)');
+        }
+        proposal.wait = w;
+        const tmo = Number(opt('--timeout', '30000'));
+        if (!Number.isFinite(tmo) || tmo < 250 || tmo > 120000) {
+          throw new DriverError('USAGE', '--timeout must be between 250 and 120000 ms');
+        }
+        proposal.timeoutMs = tmo;
+        proposal.description = `wait for ${kind}${w.text ? ` '${w.text}'` : w.selector ? ` '${w.selector}'` : w.label ? ` '${w.label}'` : ''} (up to ${Math.round(tmo / 1000)}s)`;
       }
       const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       console.error('[sent] act.propose — following the consent lifecycle…');

@@ -121,6 +121,12 @@
       return m;
     },
 
+    mediaProgress: function (fields) {
+      // Live media progress, extension → driver. Transits the relay;
+      // stored nowhere.
+      return base("media.progress", fields || {});
+    },
+
     sessionAbort: function (reason) {
       return base("session.abort", { reason: reason || "user kill switch" });
     },

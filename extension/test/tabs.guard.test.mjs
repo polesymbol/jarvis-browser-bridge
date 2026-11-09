@@ -52,7 +52,7 @@ check("vocabulary covers tab actions in background + panel mirror",
   bg.includes('"listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab"') &&
   panel.includes('"listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab"'));
 check("driver defaults tab actions to T2 and validates --tab-id",
-  driver.includes("isTabType ? 'T2' : 'T1'") && driver.includes("--tab-id must be a number"));
+  driver.includes("isTabType || type === 'fetch' ? 'T2' : 'T1'") && driver.includes("--tab-id must be a number"));
 check("panel: Tabs card, close-inactive button, duplicate badges",
   panelHtml.includes('id="tabsList"') && panelHtml.includes('id="closeInactiveBtn"') &&
   panel.includes("duplicate ×") && panel.includes("renderTabs(s.tabs)"));

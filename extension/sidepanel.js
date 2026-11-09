@@ -214,7 +214,8 @@ function renderSession(session) {
 // only ever narrow coverage, never widen it.
 var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
                   "hover", "select", "drag", "setValue",
-                  "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab"];
+                  "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab",
+                  "waitFor", "fetch"];
 var WL_REVIEW_MS = 30 * 86400e3;
 
 function fmtDate(ts) {

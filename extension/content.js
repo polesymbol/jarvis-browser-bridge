@@ -624,6 +624,167 @@
     return { detail: "dragged " + a.name + " to " + b.name };
   }
 
+  // ------------------------------------------------------------ wait_for
+  // Bounded waiting inside the page: poll every 200ms until the
+  // condition matches or the budget expires. ALWAYS resolves — matched
+  // or timed out — so the driver never hangs and never blind-sleeps.
+  var WAIT_MAX_MS = 120000;
+  var WAIT_DEFAULT_MS = 30000;
+
+  function waitCheck(wait, start) {
+    if (!wait || !wait.kind) return null;
+    if (wait.kind === "element") {
+      if (wait.selector) {
+        var el = null;
+        try { el = document.querySelector(wait.selector); } catch (e) { el = null; }
+        if (el && isVisible(el)) return { matched: "element", detail: "element appeared: " + wait.selector };
+        return null;
+      }
+      try {
+        var r = findByLabel(wait.label || wait.text || "");
+        if (r && r.el) return { matched: "element", detail: "element appeared: '" + labelFor(r.el) + "'" };
+      } catch (e) { /* not there yet */ }
+      return null;
+    }
+    if (wait.kind === "text") {
+      if (wait.text && (collectVisibleText().text || "").indexOf(wait.text) !== -1) {
+        return { matched: "text", detail: "text appeared: '" + wait.text + "'" };
+      }
+      return null;
+    }
+    if (wait.kind === "navigation") {
+      if (location.href !== start.href) {
+        return { matched: "navigation", detail: "navigated to " + location.href };
+      }
+      if (start.readyState !== "complete" && document.readyState === "complete") {
+        return { matched: "navigation", detail: "page finished loading" };
+      }
+      return null;
+    }
+    if (wait.kind === "networkIdle") {
+      if (document.readyState !== "complete") return null;
+      var lastEnd = 0;
+      try {
+        var entries = performance.getEntriesByType("resource");
+        for (var i = 0; i < entries.length; i++) {
+          lastEnd = Math.max(lastEnd, entries[i].responseEnd || 0);
+        }
+      } catch (e) { /* no timeline: readyState alone is the signal */ }
+      var idleFor = performance.now() - lastEnd;
+      if (idleFor >= 1000) {
+        return { matched: "networkIdle", detail: "network idle for " + Math.round(idleFor) + "ms" };
+      }
+      return null;
+    }
+    if (wait.kind === "mediaEnded") {
+      var nodes = document.querySelectorAll("video, audio");
+      for (var j = 0; j < nodes.length; j++) {
+        if (nodes[j].ended) return { matched: "mediaEnded", detail: "media ended" };
+      }
+      return null;
+    }
+    return null;
+  }
+
+  function doWaitFor(wait, timeoutMs) {
+    var budget = Math.min(Math.max(Number(timeoutMs) || WAIT_DEFAULT_MS, 250), WAIT_MAX_MS);
+    var start = { href: location.href, readyState: document.readyState, at: Date.now() };
+    return new Promise(function (resolve) {
+      function finish(hit, elapsed) {
+        if (hit) {
+          resolve({ detail: hit.detail + " after " + elapsed + "ms",
+                    data: { matched: true, condition: hit.matched, elapsedMs: elapsed } });
+        } else {
+          resolve({ detail: "timed out after " + elapsed + "ms waiting for " + ((wait && wait.kind) || "condition"),
+                    data: { matched: false, condition: (wait && wait.kind) || null, elapsedMs: elapsed } });
+        }
+      }
+      var first = null;
+      try { first = waitCheck(wait, start); } catch (e) { first = null; }
+      if (first) { finish(first, 0); return; }
+      var iv = setInterval(function () {
+        var hit = null;
+        try { hit = waitCheck(wait, start); } catch (e) { hit = null; }
+        var elapsed = Date.now() - start.at;
+        if (hit || elapsed >= budget) {
+          clearInterval(iv);
+          finish(hit, elapsed);
+        }
+      }, 200);
+    });
+  }
+
+  // ------------------------------------------------------------ fetch_in_page
+  // A fetch from the page's own context: same-origin requests carry the
+  // user's session (that's the point — authenticated endpoints the
+  // snapshot cannot see). Cross-origin requests NEVER carry credentials
+  // and no custom headers are ever forwarded. HTTPS only.
+  var FETCH_READ_CAP = 5000000;  // stop reading a body past ~5 MB
+  var FETCH_WIRE_CAP = 512000;   // the relay caps messages at 1 MB — stay well under
+
+  function readBodyCapped(res, cap) {
+    if (!res.body || typeof res.body.getReader !== "function") {
+      return res.text().then(function (t) {
+        return { body: t.slice(0, cap), truncated: t.length > cap, size: t.length };
+      });
+    }
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var out = "", size = 0, truncated = false;
+    function step() {
+      return reader.read().then(function (r) {
+        if (r.done) return { body: out, truncated: truncated, size: size };
+        var chunk = decoder.decode(r.value, { stream: true });
+        size += chunk.length;
+        if (out.length < cap) out += chunk.slice(0, cap - out.length);
+        if (size > cap) {
+          truncated = true;
+          try { reader.cancel(); } catch (e) {}
+          return { body: out, truncated: true, size: size };
+        }
+        return step();
+      });
+    }
+    return step();
+  }
+
+  function doFetch(a) {
+    if (!a.url) throw new Error("fetch needs a URL");
+    var u;
+    try { u = new URL(a.url, location.href); }
+    catch (e) { throw new Error("fetch URL is not valid: " + a.url); }
+    if (u.protocol !== "https:") {
+      throw new Error("refusing to fetch a non-HTTPS URL (" + u.protocol + "//" + u.host + ")");
+    }
+    var sameOrigin = u.origin === location.origin;
+    var method = String(a.method || "GET").toUpperCase();
+    var init = { method: method, credentials: sameOrigin ? "include" : "omit" };
+    if (a.body != null && method !== "GET" && method !== "HEAD") {
+      init.body = String(a.body);
+      init.headers = { "Content-Type": a.contentType || "application/json" };
+    }
+    return fetch(u.href, init).then(function (res) {
+      var headers = {};
+      try {
+        if (res.headers && typeof res.headers.forEach === "function") {
+          res.headers.forEach(function (v, k) { headers[k] = v; });
+        }
+      } catch (e) { /* headers stay partial */ }
+      return readBodyCapped(res, FETCH_READ_CAP).then(function (r) {
+        var wireTruncated = r.body.length > FETCH_WIRE_CAP;
+        return {
+          detail: method + " " + u.href + " → " + res.status + " · " + r.size + " chars" +
+                  ((r.truncated || wireTruncated) ? " (truncated)" : "") +
+                  (sameOrigin ? "" : " · cross-origin, no credentials sent"),
+          data: { status: res.status, headers: headers, url: res.url || u.href,
+                  body: wireTruncated ? r.body.slice(0, FETCH_WIRE_CAP) : r.body,
+                  truncated: !!(r.truncated || wireTruncated), size: r.size,
+                  credentials: sameOrigin ? "include" : "omit" }
+        };
+      });
+    });
+  }
+
   function doScroll(direction, amount) {
     var px = amount || 600;
     if (direction === "up") window.scrollBy({ top: -px, behavior: "smooth" });
@@ -631,6 +792,42 @@
     else if (direction === "top") window.scrollTo({ top: 0, behavior: "smooth" });
     else if (direction === "bottom") window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
     return "scrolled " + direction;
+  }
+
+  // ------------------------------------------------------------ media progress
+  // While media plays in the top frame, report progress to the
+  // background every ~10s and immediately on play/pause/ended/seeked;
+  // the background relays it to the driver live. Nothing is stored.
+  var mediaWatched = typeof WeakSet === "function" ? new WeakSet() : null;
+  function reportMedia(el, eventName) {
+    try {
+      chrome.runtime.sendMessage({
+        kind: "jbb.media.progress", event: eventName || "progress",
+        title: document.title || "", url: location.href,
+        currentTime: Math.round((el.currentTime || 0) * 10) / 10,
+        duration: (typeof el.duration === "number" && isFinite(el.duration))
+          ? Math.round(el.duration * 10) / 10 : null,
+        paused: !!el.paused, ended: !!el.ended
+      });
+    } catch (e) { /* extension context gone — stay silent */ }
+  }
+  function scanMediaProgress() {
+    var nodes = document.querySelectorAll("video, audio");
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (mediaWatched && !mediaWatched.has(el)) {
+        mediaWatched.add(el);
+        ["play", "pause", "ended", "seeked"].forEach(function (ev) {
+          el.addEventListener(ev, function () { reportMedia(el, ev); });
+        });
+        if (!el.paused && !el.ended) reportMedia(el, "play");
+      }
+      if (!el.paused && !el.ended && el.duration > 0) reportMedia(el, "progress");
+    }
+  }
+  if (window === window.top) {
+    setInterval(scanMediaProgress, 10000);
+    window.__jbbMediaScan = scanMediaProgress; // test hook
   }
 
   chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
@@ -643,12 +840,17 @@
       } else if (msg.kind === "jbb.content.act") {
         var a = msg.action || {};
         var t = a.target || {};
-        if (a.type === "hover") {
-          // Async: the response waits for the menu-appear beat.
-          doHover(t.ref, t.label).then(function (out) {
+        if (a.type === "hover" || a.type === "waitFor" || a.type === "fetch") {
+          // Async actions: hover waits for menus, waitFor waits for its
+          // condition, fetch waits on the network.
+          var p = a.type === "hover" ? doHover(t.ref, t.label)
+                : a.type === "waitFor" ? doWaitFor(a.wait, a.timeoutMs)
+                : doFetch(a);
+          p.then(function (out) {
             var resp = { ok: true, detail: out.detail };
             if (out.matchQuality) resp.matchQuality = out.matchQuality;
             if (out.appeared) resp.appeared = out.appeared;
+            if (out.data) resp.data = out.data;
             sendResponse(resp);
           }, function (err) {
             sendResponse({ ok: false, error: String((err && err.message) || err) });
@@ -668,6 +870,7 @@
         else throw new Error("unknown action type: " + a.type);
         var resp = { ok: true, detail: out.detail };
         if (out.matchQuality) resp.matchQuality = out.matchQuality;
+        if (out.data) resp.data = out.data;
         sendResponse(resp);
       } else {
         sendResponse({ ok: false, error: "unknown content message" });

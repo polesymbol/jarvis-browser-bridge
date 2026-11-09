@@ -400,6 +400,28 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   check("openTab proposal carries the URL",
     r14.code === 0 && !!e.lastProposal && e.lastProposal.type === "openTab" && e.lastProposal.url === "https://example.com/x",
     "stdout=" + r14.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r15 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "fetch", "--url", "https://academy.example.com/api/me"], FAST);
+  check("fetch proposal defaults to T2 and carries method + url",
+    r15.code === 0 && !!e.lastProposal && e.lastProposal.type === "fetch" &&
+    e.lastProposal.actionTier === "T2" && e.lastProposal.method === "GET" &&
+    e.lastProposal.url === "https://academy.example.com/api/me",
+    "stdout=" + r15.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r16 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "waitFor", "--wait", "text", "--wait-text", "COURSE COMPLETED", "--timeout", "45000"], FAST);
+  check("waitFor proposal carries the condition + bounded timeout",
+    r16.code === 0 && !!e.lastProposal && e.lastProposal.type === "waitFor" &&
+    e.lastProposal.wait.kind === "text" && e.lastProposal.wait.text === "COURSE COMPLETED" &&
+    e.lastProposal.timeoutMs === 45000,
+    "stdout=" + r16.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r17 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "waitFor"], FAST);
+  check("waitFor without --wait is a USAGE error",
+    r17.code !== 0 && JSON.parse(r17.out).error === "USAGE", "stdout=" + r17.out);
+  // watch: the extension pushes media.progress; the driver streams it.
+  setTimeout(() => { try { e.ws.send(JSON.stringify({ v: 1, type: "media.progress", tabId: 1, currentTime: 42, duration: 2100, paused: false, ended: false, event: "progress" })); } catch {} }, 500);
+  setTimeout(() => { try { e.ws.send(JSON.stringify({ v: 1, type: "media.progress", tabId: 1, currentTime: 52, duration: 2100, paused: false, ended: false, event: "progress" })); } catch {} }, 1100);
+  const r18 = await runDriver(["--relay", lArg, "--key", key, "watch", "--duration", "2"], FAST);
+  check("watch streams media.progress events without polling",
+    r18.code === 0 && r18.out.includes('"media.progress"') && r18.out.includes('"currentTime":42') && r18.out.includes('"duration":2100'),
+    "stdout=" + r18.out.slice(0, 300));
   stopExt(e);
 }
 L.httpServer.close();
