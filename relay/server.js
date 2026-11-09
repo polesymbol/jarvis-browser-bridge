@@ -19,6 +19,16 @@
  *   { v: 1, type: 'pair.confirm', role, peer: true|false }
  * Afterwards every non-relay message is forwarded to the peer in the same room.
  *
+ * Key rotation (the only pairing-flow addition): when the extension rotates
+ * its connector key it sends { v: 1, type: 'key.revoked', key: '<old key>' }
+ * on its paired connection. The relay poisons that key's room for 24h,
+ * notifies the connected driver with { v: 1, type: 'key.rotated' }, and
+ * tears the room down. Later pair attempts with the revoked key are refused
+ * with { v: 1, type: 'pair.error', error: 'KEY_ROTATED',
+ * message: 'key rotated — pair again' } — distinct from a merely wrong key,
+ * which pairs into a lonely room as usual. Revocations are in-memory: a
+ * relay restart forgets them (a revoked key then behaves like a wrong key).
+ *
  * Env: PORT (default 8787), TLS_CERT + TLS_KEY (enables wss), DEBUG_TYPES=1
  * to log message types only (never bodies).
  */
@@ -44,6 +54,9 @@ const MSG_RATE_MAX = 100;                 // max messages per window (flood => c
 
 /** roomId -> { keyHash: Buffer, extension: WebSocket|null, driver: WebSocket|null, createdAt: number, lastActive: number } */
 const rooms = new Map();
+/** roomId -> revocation expiry (ms epoch). See the rotation note above. */
+const revokedRooms = new Map();
+const REVOKED_TTL_MS = 24 * 60 * 60 * 1000;
 /** ip -> connection count */
 const connsByIp = new Map();
 
@@ -88,6 +101,16 @@ function handlePair(ws, msg) {
   }
   // Cap total rooms: refuse new rooms past the limit (memory DoS guard).
   const roomId = roomIdFor(key);
+  // A rotated key is refused explicitly — "key rotated" must never degrade
+  // into a silent lonely room that looks like a wrong key or an outage.
+  const revokedUntil = revokedRooms.get(roomId);
+  if (revokedUntil && Date.now() < revokedUntil) {
+    ws.send(JSON.stringify({ v: 1, type: 'pair.error', error: 'KEY_ROTATED', message: 'key rotated — pair again' }));
+    safeClose(ws, 4403, 'key rotated');
+    log(`pair refused role=${role} room=${roomId.slice(0, 8)}… (key rotated)`);
+    return null;
+  }
+  if (revokedUntil) revokedRooms.delete(roomId); // revocation expired
   if (!rooms.has(roomId) && rooms.size >= MAX_ROOMS) {
     safeClose(ws, 4413, 'server busy');
     return null;
@@ -150,6 +173,23 @@ function handleMessage(ws, raw) {
   }
   if (DEBUG_TYPES) log('type:', msg.type, 'role:', ws._role);
 
+  // Key rotation: only the extension, and only for the key whose room it
+  // is paired into, may revoke. The connected driver is told explicitly
+  // (key.rotated), the room is torn down, and the room stays poisoned for
+  // REVOKED_TTL_MS so late pair attempts get pair.error, not silence.
+  if (msg.type === 'key.revoked') {
+    if (ws._role === 'extension' && typeof msg.key === 'string' && roomIdFor(msg.key) === ws._roomId) {
+      const room = rooms.get(ws._roomId);
+      revokedRooms.set(ws._roomId, Date.now() + REVOKED_TTL_MS);
+      if (room && room.driver && room.driver.readyState === 1) {
+        room.driver.send(JSON.stringify({ v: 1, type: 'key.rotated' }));
+      }
+      log(`key revoked room=${ws._roomId.slice(0, 8)}… (rotated by extension)`);
+      destroyRoom(ws._roomId, 'key rotated');
+    }
+    return; // never forwarded, whatever the sender claimed
+  }
+
   // session.abort tears the room down after forwarding.
   if (msg.type === 'session.abort') {
     const room = rooms.get(ws._roomId);
@@ -211,6 +251,9 @@ export function createRelay(port = PORT) {
   // Sweeper: destroy lonely rooms (one peer never joined) and ancient rooms.
   setInterval(() => {
     const now = Date.now();
+    for (const [rid, until] of revokedRooms) {
+      if (now >= until) revokedRooms.delete(rid);
+    }
     for (const [roomId, room] of rooms) {
       const peers = (room.extension ? 1 : 0) + (room.driver ? 1 : 0);
       if (peers === 0 ||

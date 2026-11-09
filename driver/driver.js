@@ -40,6 +40,10 @@
  *   timeouts default to receipt 30s / shown 20s / consent 120s / result
  *   60s; JBB_ACT_RECEIPT_MS, JBB_ACT_SHOWN_MS, JBB_ACT_CONSENT_MS and
  *   JBB_ACT_RESULT_MS override them (the test suite uses small values).
+ *   KEY_ROTATED is reported when the extension has rotated its connector
+ *   key ("key rotated — pair again") — at pairing time via pair.error, or
+ *   live via a key.rotated notice. It is distinct from a wrong key, which
+ *   simply finds no peer.
  *
  * The connector key is the shared secret the user linked in chat. It is passed
  * via argv/env here for testing only — never logged, never echoed, and never
@@ -144,6 +148,11 @@ function waitFor(ws, types, timeoutMs) {
     function onMsg(raw) {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
+      if (msg.type === 'key.rotated') {
+        cleanup();
+        reject(new DriverError('KEY_ROTATED', 'key rotated — pair again'));
+        return;
+      }
       if (types.includes(msg.type)) {
         cleanup();
         resolve(msg);
@@ -179,7 +188,10 @@ function waitOutcome(ws, resultTypes, timeoutMs) {
     function onMsg(raw) {
       let msg;
       try { msg = JSON.parse(raw.toString()); } catch { return; }
-      if (resultTypes.includes(msg.type)) {
+      if (msg.type === 'key.rotated') {
+        cleanup();
+        resolve({ kind: 'error', error: new DriverError('KEY_ROTATED', 'key rotated — pair again') });
+      } else if (resultTypes.includes(msg.type)) {
         cleanup();
         resolve({ kind: 'result', msg });
       } else if (msg.type === 'peer.unavailable') {
@@ -213,7 +225,12 @@ async function sendResilient(ws, msg, resultTypes, totalTimeoutMs) {
 
 async function pair(ws, timeoutMs) {
   ws.send(JSON.stringify({ v: 1, type: 'pair.request', role: 'driver', key: KEY }));
-  const confirm = await waitFor(ws, ['pair.confirm'], timeoutMs || 10000);
+  const confirm = await waitFor(ws, ['pair.confirm', 'pair.error'], timeoutMs || 10000);
+  if (confirm.type === 'pair.error') {
+    // The relay refuses a rotated key explicitly — never let that degrade
+    // into a timeout or a lonely-room guess.
+    throw new DriverError(confirm.error || 'KEY_ROTATED', confirm.message || 'key rotated — pair again');
+  }
   console.error(`[paired] peer connected: ${confirm.peer}`);
   if (!confirm.peer) console.error('[hint] the extension side is not connected yet — proposals will queue as peer.unavailable');
   return confirm;
@@ -226,7 +243,7 @@ async function pair(ws, timeoutMs) {
 function createPump(ws, actId) {
   const buffer = [];
   const waiters = [];
-  const pump = { peerUnavailable: false };
+  const pump = { peerUnavailable: false, fatal: null };
   function idOk(m) {
     if (m.proposalId) return m.proposalId === actId;
     if (m.id) return m.id === actId;
@@ -235,6 +252,13 @@ function createPump(ws, actId) {
   ws.on('message', (raw) => {
     let m;
     try { m = JSON.parse(raw.toString()); } catch { return; }
+    if (m.type === 'key.rotated') {
+      // Fatal for this act: the key died mid-flight. Fail every phase with
+      // KEY_ROTATED, never a phase timeout.
+      pump.fatal = new DriverError('KEY_ROTATED', 'key rotated — pair again');
+      waiters.splice(0).forEach((w) => { clearTimeout(w.timer); w.reject(pump.fatal); });
+      return;
+    }
     if (m.type === 'peer.unavailable') {
       pump.peerUnavailable = true;
       console.error('[relay] peer.unavailable — the extension is not connected');
@@ -252,10 +276,11 @@ function createPump(ws, actId) {
     }
   });
   pump.next = (types, timeoutMs) => {
+    if (pump.fatal) return Promise.reject(pump.fatal);
     const bi = buffer.findIndex((m) => types.includes(m.type) && (m.type === 'peer.joined' || idOk(m)));
     if (bi !== -1) return Promise.resolve(buffer.splice(bi, 1)[0]);
     return new Promise((resolve, reject) => {
-      const w = { types, resolve };
+      const w = { types, resolve, reject };
       w.timer = setTimeout(() => {
         const j = waiters.indexOf(w);
         if (j !== -1) waiters.splice(j, 1);

@@ -29,7 +29,9 @@ var K = {
   AUDIT: "jbb.audit",          // [ entries ], capped
   PENDING: "jbb.pending",      // { proposalId: { proposal, createdAt } } — survives worker restarts
   RESULTS: "jbb.results",      // { proposalId: { ok, detail, at } } — executed acts, for id dedupe
-  SESSION: "jbb.session",      // { site, grantedAt, expiresAt, label } — time-boxed grant, survives restarts
+  SESSION: "jbb.session",      // { site, grantedAt, expiresAt, label, epoch } — time-boxed grant, survives restarts
+  EPOCH: "jbb.keyEpoch",       // increments on every key rotation; grants carry their epoch
+  KEY_ACKED: "jbb.keyAcked",   // true once the user confirmed they saved the key (panel-owned, mirrored here for rotation)
   SIGNIN_ACK: "jbb.signInAck"  // email the user acknowledged for Chrome sign-in (hard block until acked)
 };
 
@@ -53,6 +55,7 @@ var state = {
   pending: new Map(),          // proposalId -> { proposal, resolve, timer, createdAt, shown, shownVia, escalated, lastWaitingAt, elapsed }
   executing: new Set(),        // proposalIds currently executing (dedupe)
   actResults: new Map(),       // proposalId -> { ok, detail, at } (dedupe store, persisted at K.RESULTS)
+  keyEpoch: 1,                 // current key epoch; grants from older epochs are invalid
   badgeFlashTimer: null,       // escalation badge flash interval
   consentNotifs: {},           // notificationId -> proposalId (universal prompt)
   raiseCount: {},              // proposalId -> number of toast raises (escalation cap)
@@ -68,11 +71,22 @@ function nextProposalId() {
   return "p" + Date.now().toString(36) + "-" + (proposalSeq++);
 }
 
-// Restore the executed-act store so id dedupe survives worker restarts.
-chrome.storage.local.get([K.RESULTS], function (res) {
+// Restore the executed-act store so id dedupe survives worker restarts,
+// and the current key epoch so grant binding survives them too.
+chrome.storage.local.get([K.RESULTS, K.EPOCH], function (res) {
   var all = res[K.RESULTS] || {};
   Object.keys(all).forEach(function (id) { state.actResults.set(id, all[id]); });
+  state.keyEpoch = res[K.EPOCH] || 1;
 });
+
+function generateConnectorKey() {
+  var bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  var hex = Array.prototype.map.call(bytes, function (b) {
+    return ("0" + b.toString(16)).slice(-2);
+  }).join("");
+  return "jbb_" + hex;
+}
 
 // ---------------------------------------------------------------- boot
 chrome.runtime.onInstalled.addListener(function () {
@@ -191,6 +205,11 @@ function saveSession() {
 function sessionAllows(proposal) {
   var s = state.session;
   if (!s) return false;
+  // Grants are bound to the key epoch that created them: a grant made
+  // under a rotated-away key is not a grant anymore. (Legacy grants with
+  // no epoch predate binding and are accepted at epoch 1 only because the
+  // epoch itself did not exist when they were made.)
+  if (s.epoch != null && s.epoch !== state.keyEpoch) { expireSession("key rotated"); return false; }
   if (Date.now() >= s.expiresAt) { expireSession("expired"); return false; }
   return hostOf(proposal.site || "") === s.site;
 }
@@ -220,6 +239,60 @@ function expireSession(reason) {
 function revokeSession() {
   if (!state.session) return;
   expireSession("revoked by user");
+}
+
+// ---------------------------------------------------------------- key rotation
+// Rotating the connector key must actually bite — previously the key lived
+// in storage while grants lived elsewhere, so "rotate after the session"
+// revoked nothing. One rotation now, atomically:
+//   1. bumps the key epoch (session grants carry their epoch; older-epoch
+//      grants fail sessionAllows from this moment),
+//   2. drops the session grant and every per-site "allow" (grants made
+//      under the old key die with it — "deny" blocks are not grants and
+//      stay), so the panel reads 0 active grants,
+//   3. revokes the old key at the relay (key.revoked) and closes the live
+//      socket — the connected driver is told KEY_ROTATED and disconnected,
+//   4. stores the new key (un-acked, so the panel reveals it exactly once)
+//      and re-pairs as the extension under it.
+// The new key is returned to the panel only in this call's response. It is
+// never audited, never logged, never written anywhere but key storage.
+function rotateConnectorKey(done) {
+  chrome.storage.local.get([K.KEY, K.EPOCH], function (res) {
+    var oldKey = res[K.KEY] || null;
+    var newEpoch = (res[K.EPOCH] || 1) + 1;
+    var newKey = generateConnectorKey();
+
+    var grantsCleared = 0;
+    if (state.session) { state.session = null; grantsCleared++; }
+    chrome.storage.local.remove([K.SESSION]);
+    Object.keys(state.sites).forEach(function (h) {
+      if (state.sites[h] === "allow") { delete state.sites[h]; grantsCleared++; }
+    });
+    saveSettings();
+    state.keyEpoch = newEpoch;
+
+    var patch = {};
+    patch[K.KEY] = newKey;
+    patch[K.EPOCH] = newEpoch;
+    patch[K.KEY_ACKED] = false;
+    chrome.storage.local.set(patch, function () {
+      if (oldKey && state.ws && state.ws.readyState === WebSocket.OPEN) {
+        try {
+          state.ws.send(JSON.stringify({ v: JBB.PROTOCOL_VERSION, type: "key.revoked", key: oldKey }));
+        } catch (e) { /* socket already dying — close below still disconnects */ }
+      }
+      if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
+      state.connected = false;
+      audit({ site: "-", action: "connector key", tier: "T0", result: "rotated",
+              detail: "key rotated (epoch " + newEpoch + "); " + grantsCleared +
+                      " grant(s) invalidated; driver session disconnected" });
+      pushToPanel({ kind: "jbb.ui.status", connected: false });
+      pushToPanel({ kind: "jbb.ui.sessionChanged" });
+      refreshBadge();
+      if (state.relayUrl && !state.sessionKilled) connectRelay(state.relayUrl);
+      if (done) done(newKey);
+    });
+  });
 }
 
 function refreshBadge() {
@@ -1200,6 +1273,7 @@ function resolveConsent(proposal, answer) {
       site: shost,
       grantedAt: Date.now(),
       expiresAt: sexp,
+      epoch: state.keyEpoch,
       label: slabels[answer.choice] || ("until " + new Date(sexp).toLocaleString())
     };
     saveSession();
@@ -1563,6 +1637,12 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       markConsentShown(msg.proposalId, "panel");
       done();
       break;
+
+    case "jbb.ui.rotateKey":
+      // One click: new key (returned once, for the reveal), old key revoked
+      // at the relay, driver disconnected, every grant invalidated.
+      rotateConnectorKey(function (newKey) { done({ newKey: newKey }); });
+      return true; // async
 
     case "jbb.ui.consent":
       // The worker may have restarted since the card was shown — recover the

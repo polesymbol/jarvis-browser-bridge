@@ -148,11 +148,13 @@
           <span class="mini-tag tag-ok">active</span>
         </div>
         <div class="row">
-          <button id="regenKeyBtn" class="btn btn-secondary">Regenerate</button>
+          <button id="rotateKeyBtn" class="btn btn-secondary">Rotate key</button>
           <button id="revokeKeyBtn" class="btn btn-danger">Revoke</button>
         </div>
-        <p class="hint">Regenerating replaces the key everywhere — the old one stops working instantly.</p>
+        <p class="hint">Rotating disconnects the connected driver instantly, revokes the old key at the relay, and invalidates every grant made under it — session grants and per-site allows. You re-grant deliberately afterwards.</p>
       </div>
+
+      <p id="grantsLine" class="hint"></p>
 
       <div id="keyNone" class="hidden">
         <p class="hint">No key yet.</p>

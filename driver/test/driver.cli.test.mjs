@@ -107,6 +107,11 @@ function fakeLifecycleExt(port, key, mode) {
       } else if (mode === "noresult") {
         after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
         // act.result never arrives
+      } else if (mode === "revoke") {
+        // The user rotates the key mid-consent: the extension revokes its
+        // key at the relay, which notifies the driver and tears the room
+        // down. The driver must surface KEY_ROTATED, not a phase timeout.
+        after(150, () => { try { ws.send(JSON.stringify({ v: 1, type: "key.revoked", key })); } catch {} });
       }
     });
   });
@@ -281,6 +286,25 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   check("act was NOT resent after grant (exactly one act.propose)",
     e.proposeCount === 1, "proposeCount=" + e.proposeCount);
   stopExt(e);
+}
+{
+  const key = "revoke-key-0123456789abcdef";
+  const e = await fakeLifecycleExt(L.port, key, "revoke");
+  const r = await runDriver(actArgs(key), FAST);
+  const j = parseStdout(r.out);
+  check("key rotated mid-consent -> KEY_ROTATED (not a timeout)",
+    r.code !== 0 && !!j && j.ok === false && j.error === "KEY_ROTATED" &&
+    j.message === "key rotated — pair again",
+    "stdout=" + r.out);
+  stopExt(e);
+  // And pairing with the rotated key afterwards is refused explicitly,
+  // distinct from a wrong key (which would pair into a lonely room).
+  const r2 = await runDriver(["--relay", lArg, "--key", key, "status"], FAST);
+  const j2 = parseStdout(r2.out);
+  check("pairing with a rotated key -> KEY_ROTATED plus status fields",
+    r2.code !== 0 && !!j2 && j2.ok === false && j2.error === "KEY_ROTATED" &&
+    j2.peerConnected === "no" && j2.workerAlive === "no",
+    "stdout=" + r2.out);
 }
 L.httpServer.close();
 

@@ -273,6 +273,13 @@ function refresh() {
     renderModes(s.mode);
     renderSites(s.sites);
     renderSession(s.session);
+    // Grants line: session grant + per-site allows are the active grants.
+    var grantCount = (s.session ? 1 : 0) + Object.keys(s.sites || {}).filter(function (h) {
+      return s.sites[h] === "allow";
+    }).length;
+    el("grantsLine").textContent = grantCount === 0
+      ? "0 active grants — re-grant to continue"
+      : grantCount + " active grant" + (grantCount === 1 ? "" : "s");
     renderAudit(s.audit);
     // Don't clobber the relay URL while the user is typing it: status
     // updates arrive on every (re)connect attempt, and the old code wiped
@@ -410,12 +417,17 @@ document.addEventListener("DOMContentLoaded", function () {
   el("keySavedBtn").addEventListener("click", function () {
     chrome.storage.local.set({ [K.KEY_ACKED]: true }, refreshKeyUI);
   });
-  el("regenKeyBtn").addEventListener("click", function () {
-    if (confirm("Regenerate the connector key? The old key stops working immediately.")) {
-      setKey(generateKey(), true);
-      el("keyReconnectNotice").classList.remove("hidden");
-      toast("Key regenerated — reconnect for it to take effect");
-    }
+  el("rotateKeyBtn").addEventListener("click", function () {
+    if (!confirm("Rotate the connector key? This disconnects the connected driver, revokes the old key at the relay, and invalidates ALL grants made under it (session grants + per-site allows). The new key is shown once.")) return;
+    api({ kind: "jbb.ui.rotateKey" }).then(function (r) {
+      // The background stored the new key un-acked, so refreshKeyUI reveals
+      // it exactly once through the standard shown-once flow. The key is
+      // never written anywhere else.
+      refreshKeyUI();
+      el("grantsLine").textContent = "0 active grants — re-grant to continue";
+      toast("Key rotated — driver disconnected, all grants invalidated");
+      refresh();
+    });
   });
   el("revokeKeyBtn").addEventListener("click", function () {
     if (confirm("Revoke the connector key? This browser will be unlinked immediately.")) {
