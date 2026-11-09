@@ -29,6 +29,12 @@ function check(name, cond) {
   if (!cond) failures++;
 }
 
+const manifest = JSON.parse(fs.readFileSync(path.join(dir, "../manifest.json"), "utf8"));
+check("manifest declares the 'offscreen' permission (without it chrome.offscreen is undefined and NOTHING can connect — the v0.2.30 live failure)",
+  (manifest.permissions || []).includes("offscreen"));
+check("a missing offscreen API surfaces as a connect error, never silence",
+  bg.includes("Cannot connect: this build cannot create its offscreen transport document"));
+
 // ---------------------------------------------------------- worker holds no socket
 check("worker: constructs no WebSocket", !bg.includes("new WebSocket("));
 check("worker: no direct socket handle remains", !bg.includes("state.ws"));

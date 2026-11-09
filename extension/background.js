@@ -735,8 +735,8 @@ function offscreenAvailable() {
   if (offscreenUnsupported) return false;
   if (!chrome.offscreen || !chrome.offscreen.createDocument) {
     offscreenUnsupported = true;
-    audit({ site: "-", action: "consent tone", tier: "T0", result: "unavailable",
-            detail: "chrome.offscreen API not present — audible tone disabled, visual prompts unaffected" });
+    audit({ site: "-", action: "offscreen document", tier: "T0", result: "unavailable",
+            detail: "chrome.offscreen API not present — the tone AND the relay transport are disabled. This means the manifest 'offscreen' permission is missing or this Chrome is too old." });
     return false;
   }
   return true;
@@ -1161,6 +1161,17 @@ function postToOffscreen(msg) {
 // rotation or a fresh document always pairs with the live key.
 function postRelayConnect() {
   if (!state.relayUrl || state.sessionKilled || state.signInBlocked) return;
+  // The transport lives in the offscreen document. If that API is
+  // missing (e.g. the manifest 'offscreen' permission was dropped),
+  // connecting would fail SILENTLY — the exact failure that hid behind
+  // a "tone disabled" footnote before v0.2.31. Say so, loudly.
+  if (!offscreenAvailable()) {
+    pushToPanel({ kind: "jbb.ui.status", connected: false,
+      error: "Cannot connect: this build cannot create its offscreen transport document (chrome.offscreen unavailable — the manifest 'offscreen' permission is missing or Chrome is too old). Reload the extension; if it persists, update the build." });
+    audit({ site: "-", action: "relay connect", tier: "T0", result: "failed",
+            detail: "connect aborted: chrome.offscreen unavailable (transport cannot start)" });
+    return;
+  }
   chrome.storage.local.get([K.KEY], function (res) {
     var key = res[K.KEY];
     if (!key) {
