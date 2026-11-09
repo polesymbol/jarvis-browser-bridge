@@ -168,6 +168,22 @@ check("Keep upgrades the schema and extends actions to the current vocabulary",
   !!r && r.ok === true && e.schemaVersion === 1 && e.actions.includes("click") && e.actions.includes("key"));
 check("Keep restarts the review clock", Date.now() - e.reviewedAt < 5000);
 
+// --- the Keep-upgrade makes the NEW action types flow under the entry
+sandbox.state.whitelist["example.com"].actions =
+  ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key"];
+sandbox.handleProposal({ proposalId: "m-h1", actionTier: "T1", type: "hover",
+  target: { label: "Products" }, site: "https://example.com/page", description: "hover over 'Products'" }, "relay");
+await tick(80);
+check("hover asks while the entry carries only the old vocabulary", sandbox.state.pending.has("m-h1"));
+sandbox.state.pending.get("m-h1").resolve({ choice: "deny" });
+await tick(40);
+await ui({ kind: "jbb.ui.keepWhitelist", domain: "example.com" });
+sandbox.handleProposal({ proposalId: "m-h2", actionTier: "T1", type: "hover",
+  target: { label: "Products" }, site: "https://example.com/page", description: "hover over 'Products'" }, "relay");
+await tick(80);
+check("after Keep, hover is covered by the extended vocabulary",
+  !sandbox.state.pending.has("m-h2") && sandbox.state.whitelist["example.com"].actions.includes("hover"));
+
 // --- revoke all
 await ui({ kind: "jbb.ui.revokeAllWhitelist" });
 check("Revoke all empties the whitelist (state + store)",

@@ -356,6 +356,35 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   check("clickSelector proposal carries the selector",
     r3.code === 0 && !!e.lastProposal && e.lastProposal.type === "clickSelector" && e.lastProposal.selector === "#go",
     "stdout=" + r3.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r4 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "hover", "--target", "Products", "--tier", "T1"], FAST);
+  check("hover proposal flows with its target",
+    r4.code === 0 && !!e.lastProposal && e.lastProposal.type === "hover" &&
+    e.lastProposal.target.label === "Products" && /hover over 'Products'/.test(e.lastProposal.description),
+    "stdout=" + r4.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r5 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "select", "--target", "Country", "--value", "IN", "--tier", "T2"], FAST);
+  check("select proposal carries the option value",
+    r5.code === 0 && !!e.lastProposal && e.lastProposal.type === "select" && e.lastProposal.optionValue === "IN",
+    "stdout=" + r5.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r6 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "select", "--target", "Country", "--tier", "T2"], FAST);
+  check("select without an option is a USAGE error",
+    r6.code !== 0 && JSON.parse(r6.out).error === "USAGE", "stdout=" + r6.out);
+  const r7 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "setValue", "--target", "Coupon code", "--value", "DIWALI10", "--tier", "T2"], FAST);
+  check("setValue proposal carries the value but its description never does",
+    r7.code === 0 && !!e.lastProposal && e.lastProposal.type === "setValue" &&
+    e.lastProposal.value === "DIWALI10" && !/DIWALI10/.test(e.lastProposal.description),
+    "stdout=" + r7.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r8 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "drag", "--target", "Card A", "--to-target", "Drop zone", "--tier", "T1"], FAST);
+  check("drag proposal carries element endpoints",
+    r8.code === 0 && !!e.lastProposal && e.lastProposal.type === "drag" &&
+    e.lastProposal.dragFrom.label === "Card A" && e.lastProposal.dragTo.label === "Drop zone",
+    "stdout=" + r8.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r9 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "drag", "--from-x", "1", "--from-y", "2", "--to-x", "3", "--to-y", "4", "--tier", "T1"], FAST);
+  check("drag proposal carries point endpoints",
+    r9.code === 0 && !!e.lastProposal && e.lastProposal.dragFrom.point.x === 1 && e.lastProposal.dragTo.point.y === 4,
+    "stdout=" + r9.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r10 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "drag", "--target", "Card A", "--tier", "T1"], FAST);
+  check("drag without a destination is a USAGE error",
+    r10.code !== 0 && JSON.parse(r10.out).error === "USAGE", "stdout=" + r10.out);
   stopExt(e);
 }
 L.httpServer.close();

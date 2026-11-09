@@ -98,7 +98,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
       'commands: observe | act | abort | status',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
-      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css>',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -552,6 +552,54 @@ async function main() {
         }
         proposal.selector = selector;
         proposal.description = `click selector '${selector}'`;
+      } else if (type === 'hover') {
+        if (!targetLabel && !proposal.target.ref) {
+          throw new DriverError('USAGE', '--type hover requires --target <label> (or --ref)');
+        }
+        proposal.description = `hover over '${targetLabel}'`;
+      } else if (type === 'select') {
+        // Dropdown selection by option value (--value) or visible text
+        // (--option-text). The consent card names the option, not just
+        // the field.
+        const optionText = opt('--option-text', undefined);
+        if (proposal.value === undefined && optionText === undefined) {
+          throw new DriverError('USAGE', '--type select requires --value <option value> or --option-text <visible text>');
+        }
+        if (proposal.value !== undefined) proposal.optionValue = proposal.value;
+        if (optionText !== undefined) proposal.optionText = optionText;
+        proposal.description = `select '${optionText !== undefined ? optionText : proposal.value}' in '${targetLabel}'`;
+      } else if (type === 'setValue') {
+        if (proposal.value === undefined) {
+          throw new DriverError('USAGE', '--type setValue requires --value <text>');
+        }
+        // The value itself never appears in the consent description (or
+        // the audit trail) — the field and the fact are enough.
+        proposal.description = `set the value of '${targetLabel}'`;
+      } else if (type === 'drag') {
+        // From: --target/--ref (element) or --from-x/--from-y (point).
+        // To: --to-target (element label) or --to-x/--to-y (point).
+        const fx = Number(opt('--from-x', undefined));
+        const fy = Number(opt('--from-y', undefined));
+        const tx = Number(opt('--to-x', undefined));
+        const ty = Number(opt('--to-y', undefined));
+        const toLabel = normalizeLabel(opt('--to-target', ''));
+        if (Number.isFinite(fx) && Number.isFinite(fy)) {
+          proposal.dragFrom = { point: { x: fx, y: fy } };
+        } else if (targetLabel || proposal.target.ref) {
+          proposal.dragFrom = { ref: proposal.target.ref, label: targetLabel };
+        } else {
+          throw new DriverError('USAGE', '--type drag requires a source: --target <label> or --from-x/--from-y');
+        }
+        if (Number.isFinite(tx) && Number.isFinite(ty)) {
+          proposal.dragTo = { point: { x: tx, y: ty } };
+        } else if (toLabel) {
+          proposal.dragTo = { label: toLabel };
+        } else {
+          throw new DriverError('USAGE', '--type drag requires a destination: --to-target <label> or --to-x/--to-y');
+        }
+        const fromName = proposal.dragFrom.point ? `(${fx}, ${fy})` : `'${targetLabel}'`;
+        const toName = proposal.dragTo.point ? `(${tx}, ${ty})` : `'${toLabel}'`;
+        proposal.description = `drag ${fromName} to ${toName}`;
       }
       const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       console.error('[sent] act.propose — following the consent lifecycle…');

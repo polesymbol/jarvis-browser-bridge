@@ -212,7 +212,8 @@ function renderSession(session) {
 // The action vocabulary mirrors WHITELIST_ACTIONS_V1 in background.js;
 // the background sanitizes whatever the manager sends, so drift here can
 // only ever narrow coverage, never widen it.
-var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key"];
+var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
+                  "hover", "select", "drag", "setValue"];
 var WL_REVIEW_MS = 30 * 86400e3;
 
 function fmtDate(ts) {

@@ -425,9 +425,20 @@
     return { detail: "clicked '" + labelFor(el) + "' via selector '" + selector + "'" };
   }
 
+  function isPasswordField(el) {
+    return !!el && el.tagName && el.tagName.toLowerCase() === "input" &&
+      String(el.type || "").toLowerCase() === "password";
+  }
+
   function doType(ref, value, expectedLabel) {
     var r = resolveTarget(ref, expectedLabel);
     var el = r.el;
+    if (isPasswordField(el)) {
+      // Keyboard-style input into a password field is refused outright:
+      // a password the agent holds should never transit snapshot-driven
+      // typing. (Snapshot labels never carry password values either.)
+      throw new Error("refusing to type into a password field");
+    }
     if (!("value" in el) && el.tagName.toLowerCase() !== "textarea") {
       throw new Error("element is not typable: " + labelFor(el));
     }
@@ -444,6 +455,173 @@
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     return { detail: "typed into '" + labelFor(el) + "'", matchQuality: r.matchQuality };
+  }
+
+  // ------------------------------------------------------------ press_key
+  // Key names: "Enter", "Tab", "Escape", "ArrowDown", "a", " " — combos
+  // join with "+": "Ctrl+a", "Ctrl+Shift+k". The code is derived for
+  // letters/digits; named keys pass through as their own code.
+  function keySpec(spec) {
+    var parts = String(spec || "").split("+");
+    var key = parts.pop();
+    var mods = { ctrlKey: false, altKey: false, shiftKey: false, metaKey: false };
+    parts.forEach(function (p) {
+      var m = p.trim().toLowerCase();
+      if (m === "ctrl" || m === "control") mods.ctrlKey = true;
+      else if (m === "alt") mods.altKey = true;
+      else if (m === "shift") mods.shiftKey = true;
+      else if (m === "meta" || m === "cmd" || m === "command") mods.metaKey = true;
+    });
+    var code = key;
+    if (/^[a-zA-Z]$/.test(key)) code = "Key" + key.toUpperCase();
+    else if (/^[0-9]$/.test(key)) code = "Digit" + key;
+    else if (key === " ") code = "Space";
+    return { key: key, code: code, mods: mods };
+  }
+
+  function doPressKey(spec, ref, expectedLabel) {
+    if (!spec) throw new Error("key action needs a key name (--press-key)");
+    var target = null;
+    if (ref || expectedLabel) target = resolveTarget(ref, expectedLabel);
+    var el = target ? target.el : document.activeElement;
+    if (!el) throw new Error("no element to press keys on (focus one first, or pass a target)");
+    if (isPasswordField(el)) throw new Error("refusing to press keys on a password field");
+    if (el.focus) el.focus();
+    var ks = keySpec(spec);
+    var init = { key: ks.key, code: ks.code, bubbles: true, cancelable: true,
+                 ctrlKey: ks.mods.ctrlKey, altKey: ks.mods.altKey,
+                 shiftKey: ks.mods.shiftKey, metaKey: ks.mods.metaKey };
+    var notPrevented = el.dispatchEvent(new KeyboardEvent("keydown", init));
+    if (ks.key.length === 1) el.dispatchEvent(new KeyboardEvent("keypress", init));
+    el.dispatchEvent(new KeyboardEvent("keyup", init));
+    // Enter's default action (form submit) does not fire for synthetic
+    // key events in every engine; when the keydown was not prevented and
+    // the target sits in a form, submit explicitly so Enter means Enter.
+    var submitted = false;
+    if (ks.key === "Enter" && notPrevented && el.form && typeof el.form.requestSubmit === "function") {
+      el.form.requestSubmit();
+      submitted = true;
+    }
+    return { detail: "pressed '" + spec + "' on '" + labelFor(el) + "'" + (submitted ? " (form submitted)" : ""),
+             matchQuality: target ? target.matchQuality : undefined };
+  }
+
+  // ------------------------------------------------------------ hover
+  function interactiveLabelsById() {
+    var snap = buildSnapshot({});
+    var map = {};
+    (snap.interactives || []).forEach(function (i) { map[i.ref] = i.label; });
+    return map;
+  }
+
+  // Hover is asynchronous: menus need a beat to open before we can say
+  // what appeared. The appeared labels ride the result detail (and the
+  // next snapshot shows the new items with stable ids).
+  function doHover(ref, expectedLabel) {
+    var r = resolveTarget(ref, expectedLabel);
+    var el = r.el;
+    var before = interactiveLabelsById();
+    el.scrollIntoView({ block: "center", behavior: "instant" });
+    var rect = el.getBoundingClientRect();
+    var cx = rect.left + rect.width / 2, cy = rect.top + rect.height / 2;
+    ["pointerover", "mouseover", "mouseenter", "pointermove", "mousemove"].forEach(function (t) {
+      var Ev = (t.indexOf("pointer") === 0 && window.PointerEvent) ? window.PointerEvent : window.MouseEvent;
+      el.dispatchEvent(new Ev(t, { bubbles: true, cancelable: true, clientX: cx, clientY: cy }));
+    });
+    return new Promise(function (resolve) {
+      setTimeout(function () {
+        var after = interactiveLabelsById();
+        var appeared = [];
+        Object.keys(after).forEach(function (id) { if (!before[id]) appeared.push(after[id]); });
+        resolve({ detail: "hovered '" + labelFor(el) + "'" +
+                    (appeared.length ? " — appeared: " + appeared.join(", ") : " — nothing new appeared"),
+                  matchQuality: r.matchQuality, appeared: appeared });
+      }, 400);
+    });
+  }
+
+  // ------------------------------------------------------------ select_option
+  function doSelect(ref, expectedLabel, optionValue, optionText) {
+    var r = resolveTarget(ref, expectedLabel);
+    var el = r.el;
+    if (!el || el.tagName.toLowerCase() !== "select") {
+      throw new Error("select target is not a <select>: " + labelFor(el));
+    }
+    var opts = Array.prototype.slice.call(el.options || []);
+    var chosen = null;
+    if (optionValue != null && optionValue !== "") {
+      chosen = opts.filter(function (o) { return String(o.value) === String(optionValue); })[0] || null;
+    }
+    if (!chosen && optionText != null && optionText !== "") {
+      chosen = opts.filter(function (o) {
+        return normalizeLabel(o.textContent || o.text || "") === normalizeLabel(optionText);
+      })[0] || null;
+    }
+    if (!chosen) {
+      throw new Error("no option matching " +
+        (optionValue ? "value '" + optionValue + "'" : "text '" + optionText + "'") + " in '" + labelFor(el) + "'");
+    }
+    el.value = chosen.value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return { detail: "selected '" + (chosen.textContent || chosen.text || chosen.value) + "' in '" + labelFor(el) + "'",
+             matchQuality: r.matchQuality };
+  }
+
+  // ------------------------------------------------------------ set_value
+  // Set an input's value the way React needs it: through the NATIVE
+  // prototype setter (bypassing the instance-level value tracking React
+  // installs), then the input/change events a real edit produces. Plain
+  // assignment (el.value = x) is silently swallowed by controlled
+  // inputs — the app's state never moves.
+  function doSetValue(ref, value, expectedLabel) {
+    var r = resolveTarget(ref, expectedLabel);
+    var el = r.el;
+    if (isPasswordField(el)) throw new Error("refusing to set a value on a password field");
+    if (!("value" in el)) throw new Error("element has no value to set: " + labelFor(el));
+    var proto = el.tagName.toLowerCase() === "textarea"
+      ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+    var desc = Object.getOwnPropertyDescriptor(proto, "value");
+    if (desc && desc.set) desc.set.call(el, value);
+    else el.value = value;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    // The detail names the field and the length — never the value itself
+    // (details land in the on-machine audit log).
+    return { detail: "set '" + labelFor(el) + "' (" + String(value == null ? "" : value).length + " chars)",
+             matchQuality: r.matchQuality };
+  }
+
+  // ------------------------------------------------------------ drag
+  function doDrag(from, to) {
+    function side(s) {
+      if (s && s.point && typeof s.point.x === "number") {
+        return { x: s.point.x, y: s.point.y, el: document.elementFromPoint(s.point.x, s.point.y),
+                 name: "(" + s.point.x + ", " + s.point.y + ")" };
+      }
+      var r = resolveTarget(s && s.ref, s && s.label);
+      var rect = r.el.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, el: r.el,
+               name: "'" + labelFor(r.el) + "'" };
+    }
+    var a = side(from), b = side(to);
+    function fire(el, type, x, y) {
+      if (!el || !el.dispatchEvent) return;
+      var Ev = (type.indexOf("pointer") === 0 && window.PointerEvent) ? window.PointerEvent : window.MouseEvent;
+      el.dispatchEvent(new Ev(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0 }));
+    }
+    fire(a.el, "pointerdown", a.x, a.y);
+    fire(a.el, "mousedown", a.x, a.y);
+    for (var i = 1; i <= 5; i++) {
+      var x = a.x + (b.x - a.x) * i / 5, y = a.y + (b.y - a.y) * i / 5;
+      var mid = document.elementFromPoint(x, y) || b.el;
+      fire(mid, "pointermove", x, y);
+      fire(mid, "mousemove", x, y);
+    }
+    fire(b.el, "pointerup", b.x, b.y);
+    fire(b.el, "mouseup", b.x, b.y);
+    fire(b.el, "click", b.x, b.y);
+    return { detail: "dragged " + a.name + " to " + b.name };
   }
 
   function doScroll(direction, amount) {
@@ -465,11 +643,27 @@
       } else if (msg.kind === "jbb.content.act") {
         var a = msg.action || {};
         var t = a.target || {};
+        if (a.type === "hover") {
+          // Async: the response waits for the menu-appear beat.
+          doHover(t.ref, t.label).then(function (out) {
+            var resp = { ok: true, detail: out.detail };
+            if (out.matchQuality) resp.matchQuality = out.matchQuality;
+            if (out.appeared) resp.appeared = out.appeared;
+            sendResponse(resp);
+          }, function (err) {
+            sendResponse({ ok: false, error: String((err && err.message) || err) });
+          });
+          return true; // keep the response channel open
+        }
         var out;
         if (a.type === "click") out = doClick(t.ref, t.label);
         else if (a.type === "type") out = doType(t.ref, a.value, t.label);
         else if (a.type === "clickAt") out = doClickAt(a.point);
         else if (a.type === "clickSelector") out = doClickSelector(a.selector);
+        else if (a.type === "key") out = doPressKey(a.key, t.ref, t.label);
+        else if (a.type === "select") out = doSelect(t.ref, t.label, a.optionValue != null ? a.optionValue : a.value, a.optionText);
+        else if (a.type === "setValue") out = doSetValue(t.ref, a.value, t.label);
+        else if (a.type === "drag") out = doDrag(a.dragFrom || t, a.dragTo);
         else if (a.type === "scroll") out = { detail: doScroll(a.direction, a.amount) };
         else throw new Error("unknown action type: " + a.type);
         var resp = { ok: true, detail: out.detail };

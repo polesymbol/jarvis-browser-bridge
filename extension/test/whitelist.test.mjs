@@ -175,6 +175,24 @@ sandbox.state.pending.get("w-8").resolve({ choice: "deny" });
 await tick(60);
 sandbox.state.keyEpoch = 1;
 
+// --- new action types are NOT covered by an entry granted under the old
+//     vocabulary (its stored list predates them); a fresh grant covers
+sandbox.state.whitelist["example.com"].actions =
+  ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key"];
+await propose({ proposalId: "w-8", type: "hover", actionTier: "T1", description: "hover over 'Products'" });
+check("hover asks under an old-vocabulary entry (new types default to ask)", sandbox.state.pending.has("w-8"));
+sandbox.state.pending.get("w-8").resolve({ choice: "deny" });
+await tick(30);
+await propose({ proposalId: "w-9", type: "hover", actionTier: "T1", description: "hover over 'Products'" });
+sandbox.state.pending.get("w-9").resolve({ choice: "whitelist" });
+await tick(100);
+await propose({ proposalId: "w-10", type: "hover", actionTier: "T1", description: "hover over 'Products'" });
+check("a card re-grant does NOT silently extend the action list (manager Keep is the upgrade path)",
+  sandbox.state.pending.has("w-10") &&
+  !sandbox.state.whitelist["example.com"].actions.includes("setValue"));
+sandbox.state.pending.get("w-10").resolve({ choice: "deny" });
+await tick(30);
+
 // --- rotation wipes the entries outright
 await new Promise((res) => sandbox.rotateConnectorKey(res));
 await tick(700);

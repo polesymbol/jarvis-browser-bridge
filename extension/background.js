@@ -210,7 +210,13 @@ function saveSettings() {
 // identity for binding purposes, and the key itself is never persisted
 // outside its own storage slot.
 var WHITELIST_SCHEMA = 1;
-var WHITELIST_ACTIONS_V1 = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key"];
+// The CURRENT action vocabulary for NEW grants and manager sanitization.
+// Stored entries carry their own list from grant time — that is the whole
+// point: entries granted before hover/select/drag/setValue existed do
+// NOT list them, so those actions still ask under old entries until the
+// user re-confirms (manager Keep) or re-grants.
+var WHITELIST_ACTIONS_V1 = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
+                            "hover", "select", "drag", "setValue"];
 
 function saveWhitelist() {
   chrome.storage.local.set({ [K.WHITELIST]: state.whitelist });
@@ -1679,7 +1685,7 @@ function runOnPage(proposal) {
         : chrome.tabs.sendMessage(tab.id, msg);
       return send.then(function (res) {
         if (!res || !res.ok) throw new Error((res && res.error) || "content script error");
-        return { detail: res.detail, matchQuality: res.matchQuality };
+        return { detail: res.detail, matchQuality: res.matchQuality, appeared: res.appeared };
       });
     });
   });
