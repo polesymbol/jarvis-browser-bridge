@@ -349,15 +349,18 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   const j = parseStdout(r.out);
   check("key rotated mid-consent -> KEY_ROTATED (not a timeout)",
     r.code !== 0 && !!j && j.ok === false && j.error === "KEY_ROTATED" &&
-    j.message === "key rotated — pair again",
+    j.message === "key rotated or expired — pair again with a fresh key",
     "stdout=" + r.out);
   stopExt(e);
   // And pairing with the rotated key afterwards is refused explicitly,
   // distinct from a wrong key (which would pair into a lonely room).
+  // The presented message covers expiry too: the relay poisons a rotated
+  // and an expired key identically, so the driver cannot distinguish.
   const r2 = await runDriver(["--relay", lArg, "--key", key, "status"], FAST);
   const j2 = parseStdout(r2.out);
   check("pairing with a rotated key -> KEY_ROTATED plus status fields",
     r2.code !== 0 && !!j2 && j2.ok === false && j2.error === "KEY_ROTATED" &&
+    j2.message === "key rotated or expired — pair again with a fresh key" &&
     j2.peerConnected === "no" && j2.workerAlive === "no",
     "stdout=" + r2.out);
 }

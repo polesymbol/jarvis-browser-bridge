@@ -40,10 +40,12 @@
  *   timeouts default to receipt 30s / shown 20s / consent 120s / result
  *   60s; JBB_ACT_RECEIPT_MS, JBB_ACT_SHOWN_MS, JBB_ACT_CONSENT_MS and
  *   JBB_ACT_RESULT_MS override them (the test suite uses small values).
- *   KEY_ROTATED is reported when the extension has rotated its connector
- *   key ("key rotated — pair again") — at pairing time via pair.error, or
- *   live via a key.rotated notice. It is distinct from a wrong key, which
- *   simply finds no peer.
+ *   KEY_ROTATED is reported when the extension has retired its connector
+ *   key — rotated by the user, or expired (lifetime elapsed / big-task
+ *   budget reached; the relay poisons both the same way, so the driver
+ *   cannot and need not tell them apart) — at pairing time via pair.error,
+ *   or live via a key.rotated notice. It is distinct from a wrong key,
+ *   which simply finds no peer.
  *
  * The connector key is the shared secret the user linked in chat. It is passed
  * via argv/env here for testing only — never logged, never echoed, and never
@@ -168,7 +170,7 @@ function waitFor(ws, types, timeoutMs) {
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'key.rotated') {
         cleanup();
-        reject(new DriverError('KEY_ROTATED', 'key rotated — pair again'));
+        reject(new DriverError('KEY_ROTATED', 'key rotated or expired — pair again with a fresh key'));
         return;
       }
       if (types.includes(msg.type)) {
@@ -208,7 +210,7 @@ function waitOutcome(ws, resultTypes, timeoutMs) {
       try { msg = JSON.parse(raw.toString()); } catch { return; }
       if (msg.type === 'key.rotated') {
         cleanup();
-        resolve({ kind: 'error', error: new DriverError('KEY_ROTATED', 'key rotated — pair again') });
+        resolve({ kind: 'error', error: new DriverError('KEY_ROTATED', 'key rotated or expired — pair again with a fresh key') });
       } else if (resultTypes.includes(msg.type)) {
         cleanup();
         resolve({ kind: 'result', msg });
@@ -245,9 +247,13 @@ async function pair(ws, timeoutMs) {
   ws.send(JSON.stringify({ v: 1, type: 'pair.request', role: 'driver', key: KEY }));
   const confirm = await waitFor(ws, ['pair.confirm', 'pair.error'], timeoutMs || 10000);
   if (confirm.type === 'pair.error') {
-    // The relay refuses a rotated key explicitly — never let that degrade
-    // into a timeout or a lonely-room guess.
-    throw new DriverError(confirm.error || 'KEY_ROTATED', confirm.message || 'key rotated — pair again');
+    // The relay refuses a retired key explicitly — never let that degrade
+    // into a timeout or a lonely-room guess. Rotation and expiry poison
+    // the room identically, so the wording covers both.
+    const retired = (confirm.error || 'KEY_ROTATED') === 'KEY_ROTATED';
+    throw new DriverError(confirm.error || 'KEY_ROTATED',
+      retired ? 'key rotated or expired — pair again with a fresh key'
+              : (confirm.message || 'pairing refused'));
   }
   console.error(`[paired] peer connected: ${confirm.peer}`);
   if (!confirm.peer) console.error('[hint] the extension side is not connected yet — proposals will queue as peer.unavailable');
@@ -273,7 +279,7 @@ function createPump(ws, actId) {
     if (m.type === 'key.rotated') {
       // Fatal for this act: the key died mid-flight. Fail every phase with
       // KEY_ROTATED, never a phase timeout.
-      pump.fatal = new DriverError('KEY_ROTATED', 'key rotated — pair again');
+      pump.fatal = new DriverError('KEY_ROTATED', 'key rotated or expired — pair again with a fresh key');
       waiters.splice(0).forEach((w) => { clearTimeout(w.timer); w.reject(pump.fatal); });
       return;
     }

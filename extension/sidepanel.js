@@ -14,7 +14,10 @@
 
 var K = {
   KEY: "jbb.connectorKey",
-  KEY_ACKED: "jbb.keyAcked" // true once the user confirmed they saved the key
+  KEY_ACKED: "jbb.keyAcked", // true once the user confirmed they saved the key
+  KEYMETA: "jbb.keyMeta",    // { createdAt, ttlMs } — written with every new key
+  KEYUSAGE: "jbb.keyUsage",  // { connectedMs, acts } — reset with every new key
+  KEYEXPIRED: "jbb.keyExpired" // { at, reason } — set by the worker when a key expires
 };
 
 var el = function (id) { return document.getElementById(id); };
@@ -56,21 +59,29 @@ function maskKey(key) {
 }
 
 function refreshKeyUI() {
-  chrome.storage.local.get([K.KEY, K.KEY_ACKED], function (res) {
+  chrome.storage.local.get([K.KEY, K.KEY_ACKED, K.KEYEXPIRED], function (res) {
     var key = res[K.KEY];
     var acked = res[K.KEY_ACKED];
     el("keyNone").classList.toggle("hidden", !!key);
     el("keyReveal").classList.toggle("hidden", !(key && !acked));
     el("keyMasked").classList.toggle("hidden", !(key && acked));
+    var expired = !key && res[K.KEYEXPIRED];
+    el("keyExpiredNotice").classList.toggle("hidden", !expired);
+    if (expired) el("keyExpiredReason").textContent = res[K.KEYEXPIRED].reason || "its lifetime elapsed";
     if (key && !acked) el("keyValue").textContent = key;
     if (key && acked) el("keyMaskedValue").textContent = maskKey(key);
   });
 }
 
-function setKey(key, showOnce) {
+function setKey(key, showOnce, ttlMs) {
   var patch = {};
   patch[K.KEY] = key;
   patch[K.KEY_ACKED] = !showOnce;
+  // A new key is born with the lifetime picked in the Key tab and a fresh
+  // usage budget; the worker enforces both (see "key expiry" there).
+  patch[K.KEYMETA] = { createdAt: Date.now(), ttlMs: ttlMs || 0 };
+  patch[K.KEYUSAGE] = { connectedMs: 0, acts: 0 };
+  chrome.storage.local.remove([K.KEYEXPIRED]);
   chrome.storage.local.set(patch, refreshKeyUI);
 }
 
@@ -242,6 +253,15 @@ function fmtRemaining(ms) {
   if (m < 60) return m + "m left";
   var h = Math.floor(m / 60);
   return h + "h " + (m % 60) + "m left";
+}
+
+// Neutral duration (no "left") for the key-life line: used / budget / TTL.
+function fmtDur(ms) {
+  var m = Math.max(0, Math.floor(ms / 60000));
+  if (m < 60) return m + "m";
+  var h = Math.floor(m / 60);
+  if (h < 48) return h + "h " + (m % 60) + "m";
+  return Math.floor(h / 24) + "d " + (h % 24) + "h";
 }
 
 function renderSession(session) {
@@ -608,6 +628,22 @@ function refresh() {
     el("tempGrantLine").textContent = s.tempGrant
       ? "⏳ Temporary grant: " + s.tempGrant.host + " — until you leave the site (" + fmtRemaining(s.tempGrant.remainingMs) + " at most)"
       : "";
+    // Key life: countdown or usage budget, the armed state, or the
+    // pre-expiry-key note. Data comes from the worker's getState mirror.
+    var ke = s.keyExpiry;
+    if (ke) {
+      var usedStr = "Used " + fmtDur(ke.usage.connectedMs) + " connected · " + ke.usage.acts +
+        " actions on this key (it retires at " + fmtDur(ke.budget.ms) + " / " + ke.budget.acts + " actions).";
+      el("keyLifeLine").textContent = ke.armed
+        ? "⏳ This key will expire when the current session disconnects — " + ke.armed + "."
+        : !ke.hasMeta
+          ? "Key expiry isn't set on this key (it predates expiry) — it applies from your next Generate or Rotate."
+          : ke.expiresAt
+            ? (ke.expiresAt - Date.now() > 0
+                ? "Key expires in " + fmtDur(ke.expiresAt - Date.now()) + ". " + usedStr
+                : "This key's lifetime has elapsed — it expires when the current session disconnects. " + usedStr)
+            : "This key has no lifetime expiry. " + usedStr;
+    }
     renderFeed(s.audit);
     renderSummary(s.lastSummary);
     renderTabs(s.tabs);
@@ -757,7 +793,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
   // Key management
   el("genKeyBtn").addEventListener("click", function () {
-    setKey(generateKey(), true);
+    setKey(generateKey(), true, Number(el("keyTtlSelect").value));
     el("keyReconnectNotice").classList.remove("hidden");
   });
   el("copyKeyBtn").addEventListener("click", function () {
@@ -771,7 +807,7 @@ document.addEventListener("DOMContentLoaded", function () {
   });
   el("rotateKeyBtn").addEventListener("click", function () {
     if (!confirm("Rotate the connector key? This disconnects the connected driver, revokes the old key at the relay, and invalidates ALL grants made under it (session grants + per-site allows). The new key is shown once.")) return;
-    api({ kind: "jbb.ui.rotateKey" }).then(function (r) {
+    api({ kind: "jbb.ui.rotateKey", ttlMs: Number(el("keyTtlSelect").value) }).then(function (r) {
       // The background stored the new key un-acked, so refreshKeyUI reveals
       // it exactly once through the standard shown-once flow. The key is
       // never written anywhere else.
@@ -783,7 +819,7 @@ document.addEventListener("DOMContentLoaded", function () {
   });
   el("revokeKeyBtn").addEventListener("click", function () {
     if (confirm("Revoke the connector key? This browser will be unlinked immediately.")) {
-      chrome.storage.local.remove([K.KEY, K.KEY_ACKED], function () {
+      chrome.storage.local.remove([K.KEY, K.KEY_ACKED, K.KEYMETA, K.KEYUSAGE], function () {
         refreshKeyUI();
         toast("Key revoked");
       });

@@ -42,8 +42,8 @@ check("relay: only the extension can revoke its own room's key",
 check("relay: connected driver is notified (key.rotated)",
   relay.includes("type: 'key.rotated'"));
 
-check("driver: KEY_ROTATED with the exact message",
-  driver.includes("KEY_ROTATED") && driver.includes("key rotated — pair again"));
+check("driver: KEY_ROTATED with the exact message (covers expiry since v0.2.33 — the relay poisons both identically)",
+  driver.includes("KEY_ROTATED") && driver.includes("key rotated or expired — pair again with a fresh key"));
 check("driver: pair.error handled at pairing time",
   driver.includes("'pair.error'") && driver.includes("confirm.type === 'pair.error'"));
 

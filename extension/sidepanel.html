@@ -176,6 +176,16 @@
         This key links <em>this browser</em> to your assistant — the same idea as an API key.
         Anyone holding it can drive this browser as you.
       </p>
+      <div class="row">
+        <label class="hint" for="keyTtlSelect">New keys expire after</label>
+        <select id="keyTtlSelect">
+          <option value="86400000" selected>24 hours</option>
+          <option value="604800000">7 days</option>
+          <option value="2592000000">30 days</option>
+          <option value="0">Never</option>
+        </select>
+      </div>
+      <p class="hint">Expiry never interrupts a running task — a deadline that passes mid-session takes effect when that session disconnects. A key also retires on its own after 5 hours of driver-connected time or 200 actions. Expiry keeps your site whitelist (it is hygiene, not distrust); Rotate still wipes everything.</p>
 
       <div id="keyReveal" class="key-reveal hidden">
         <div class="key-warning">
@@ -202,6 +212,12 @@
       </div>
 
       <p id="grantsLine" class="hint"></p>
+      <p id="keyLifeLine" class="hint"></p>
+
+      <div id="keyExpiredNotice" class="key-warning hidden">
+        ⌛ <strong>This key expired</strong> — <span id="keyExpiredReason"></span><br>
+        Generate a new key below to reconnect your assistant.
+      </div>
 
       <div id="keyNone" class="hidden">
         <p class="hint">No key yet.</p>

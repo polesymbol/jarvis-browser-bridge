@@ -38,6 +38,9 @@ var K = {
   HOLD: "jbb.holdQueue",       // proposals held during take-over, so a worker restart can't lose them
   EPOCH: "jbb.keyEpoch",       // increments on every key rotation; grants carry their epoch
   KEY_ACKED: "jbb.keyAcked",   // true once the user confirmed they saved the key (panel-owned, mirrored here for rotation)
+  KEYMETA: "jbb.keyMeta",      // { createdAt, ttlMs } — the key's birth + chosen lifetime (ttlMs null/0 = never expires); absent on pre-expiry keys
+  KEYUSAGE: "jbb.keyUsage",    // { connectedMs, acts } — cumulative driver usage of the current key (the big-task budget)
+  KEYEXPIRED: "jbb.keyExpired", // { at, reason } — set when a key expires, so the panel can say "expired" instead of "no key"; cleared on generate/rotate
   SIGNIN_ACK: "jbb.signInAck"  // email the user acknowledged for Chrome sign-in (hard block until acked)
 };
 
@@ -48,6 +51,14 @@ var CONSENT_TIMEOUT_MS = 120000;
 // audited and the ask stays on badge + banner + panel card until timeout.
 var NOTIF_MAX_RAISES = 3;
 var NOTIF_VERIFY_DELAY_MS = 4000;
+// Key expiry (v0.2.33): a key retires when its chosen lifetime elapses OR
+// when its cumulative usage crosses the big-task budget — 5 hours of
+// driver-connected time or 200 executed acts — whichever comes first.
+// Expiry NEVER fires mid-task: a deadline that passes while a driver is
+// connected only ARMS the expiry, which fires at that driver's disconnect.
+var KEY_BIG_TASK_MS = 5 * 60 * 60 * 1000;
+var KEY_BIG_TASK_ACTS = 200;
+var KEY_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------- state
 var state = {
@@ -70,6 +81,14 @@ var state = {
   tabsCache: [],               // last known tab list (panel Tabs card)
   actResults: new Map(),       // proposalId -> { ok, detail, at } (dedupe store, persisted at K.RESULTS)
   keyEpoch: 1,                 // current key epoch; grants from older epochs are invalid
+  peerPresent: false,          // a driver is currently paired into the room (peer.joined/left + pair.confirm)
+  peerSince: 0,                // when the current driver's presence began (usage accounting)
+  keyMeta: null,               // mirror of K.KEYMETA { createdAt, ttlMs }; null = pre-expiry key (never expires until regenerated)
+  keyUsage: { connectedMs: 0, acts: 0 }, // mirror of K.KEYUSAGE — cumulative usage of the current key
+  keyExpiryArmed: null,        // reason string once a deadline passed mid-task; expiry fires at disconnect
+  keyExpiring: false,          // an expiry is in flight (re-entry guard)
+  pendingRevoke: false,        // paired solely to revoke an expired key (browser was closed at the deadline)
+  expireFinish: null,          // completion callback for the pendingRevoke flow
   badgeFlashTimer: null,       // escalation badge flash interval
   consentNotifs: {},           // notificationId -> proposalId (universal prompt)
   raiseCount: {},              // proposalId -> number of toast raises (escalation cap)
@@ -138,6 +157,10 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
   verifyAllPendingNotifications();
   consentHeartbeatSweep();
   relayWatchdog();
+  // Key expiry: fold the live driver's connected time into the usage
+  // budget, then arm/fire any deadline that has come due.
+  foldPeerTime();
+  checkKeyExpiry();
   // Hard expiry for session grants — no silent extension, ever.
   if (state.session && Date.now() >= state.session.expiresAt) expireSession("expired");
   // Re-check sign-in state: a later sign-in can't slip through unnoticed.
@@ -155,7 +178,10 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
 });
 
 function loadPersisted() {
-  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION, K.WHITELIST, K.EPOCH, K.SUMMARY, K.TEMP, K.HOLD], function (res) {
+  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION, K.WHITELIST, K.EPOCH, K.SUMMARY, K.TEMP, K.HOLD, K.KEYMETA, K.KEYUSAGE], function (res) {
+    state.keyMeta = res[K.KEYMETA] || null;
+    var ku = res[K.KEYUSAGE];
+    if (ku && typeof ku.connectedMs === "number" && typeof ku.acts === "number") state.keyUsage = ku;
     var s = res[K.SETTINGS] || {};
     // Level migration: the old ask-some IS Balanced; always-ask IS Strict.
     state.mode = s.mode === "ask-some" ? "balanced"
@@ -198,6 +224,9 @@ function loadPersisted() {
     if (!state.session && sess) chrome.storage.local.remove([K.SESSION]);
     checkSignInState();
     refreshBadge();
+    // A key whose deadline passed while the browser was closed expires
+    // now, before anything pairs under it.
+    checkKeyExpiry();
   });
 }
 
@@ -464,7 +493,7 @@ function tempAllows(proposal) {
 //      and re-pairs as the extension under it.
 // The new key is returned to the panel only in this call's response. It is
 // never audited, never logged, never written anywhere but key storage.
-function rotateConnectorKey(done) {
+function rotateConnectorKey(done, ttlMs) {
   chrome.storage.local.get([K.KEY, K.EPOCH], function (res) {
     var oldKey = res[K.KEY] || null;
     var newEpoch = (res[K.EPOCH] || 1) + 1;
@@ -491,6 +520,14 @@ function rotateConnectorKey(done) {
     patch[K.KEY] = newKey;
     patch[K.EPOCH] = newEpoch;
     patch[K.KEY_ACKED] = false;
+    // The successor key is born with the lifetime the user picked in the
+    // panel (default 24h) and a fresh usage budget.
+    patch[K.KEYMETA] = { createdAt: Date.now(), ttlMs: (typeof ttlMs === "number" ? ttlMs : KEY_DEFAULT_TTL_MS) };
+    patch[K.KEYUSAGE] = { connectedMs: 0, acts: 0 };
+    state.keyMeta = patch[K.KEYMETA];
+    state.keyUsage = { connectedMs: 0, acts: 0 };
+    state.keyExpiryArmed = null;
+    chrome.storage.local.remove([K.KEYEXPIRED]);
     chrome.storage.local.set(patch, function () {
       if (oldKey) {
         try { sendToRelay({ v: JBB.PROTOCOL_VERSION, type: "key.revoked", key: oldKey }); }
@@ -511,6 +548,148 @@ function rotateConnectorKey(done) {
         if (done) done(newKey);
       }, 350);
     });
+  });
+}
+
+// ---------------------------------------------------------------- key expiry
+// A connector key is a bearer credential: whoever holds it can pair a
+// driver and propose actions to this browser. Rotation handles a key the
+// user DISTRUSTS; expiry handles a key that has simply lived or worked
+// long enough (v0.2.33) — the pasted-into-a-chat key, the forgotten key.
+// Two deadlines, whichever comes first:
+//   - the lifetime chosen at generate/rotate time (K.KEYMETA ttlMs), and
+//   - the big-task budget: KEY_BIG_TASK_MS of cumulative driver-connected
+//     time or KEY_BIG_TASK_ACTS executed acts on this one key. Real
+//     drivers pair per command, so the budget is cumulative across
+//     pairings — a stolen key gets at most ~5 hours of connection or ~200
+//     actions, however they are sliced.
+// Rules that keep expiry from becoming its own outage:
+//   - NEVER mid-task. A deadline that passes while a driver is connected
+//     only ARMS the expiry (audited once, shown in the panel); it fires
+//     when that driver disconnects. Small tasks (1–5h) never notice.
+//   - Ephemeral grants die with the key (session + temporary), like
+//     rotation. The whitelist SURVIVES: it is the user's durable,
+//     reviewed grant layer, and expiry is hygiene, not distrust — wiping
+//     it daily would train users to pick "never expire" instead.
+//   - The relay learns about it through the same key.revoked poisoning
+//     rotation uses, so a late driver gets KEY_ROTATED, never silence.
+//   - Pre-expiry keys (no K.KEYMETA) never expire until regenerated.
+
+function saveKeyUsage() {
+  var o = {}; o[K.KEYUSAGE] = state.keyUsage;
+  chrome.storage.local.set(o);
+}
+
+// Fold the live driver's elapsed connected time into the usage budget.
+function foldPeerTime() {
+  if (!state.peerPresent || !state.peerSince) return;
+  var now = Date.now();
+  state.keyUsage.connectedMs += Math.max(0, now - state.peerSince);
+  state.peerSince = now;
+  saveKeyUsage();
+}
+
+function countKeyAct() {
+  state.keyUsage.acts++;
+  saveKeyUsage();
+  // Crossing the budget mid-session arms at the next check (<=30s, or the
+  // disconnect's own check) — it never interrupts the running task.
+  checkKeyExpiry();
+}
+
+// The reason a key is due to retire, or null. Pure read of meta + usage.
+function keyExpiryDueReason() {
+  var meta = state.keyMeta;
+  if (meta && meta.ttlMs && Date.now() >= meta.createdAt + meta.ttlMs) {
+    return "its chosen lifetime elapsed";
+  }
+  if (state.keyUsage.connectedMs >= KEY_BIG_TASK_MS) {
+    return "it reached the big-task budget (5h of driver-connected time)";
+  }
+  if (state.keyUsage.acts >= KEY_BIG_TASK_ACTS) {
+    return "it reached the big-task budget (200 executed actions)";
+  }
+  return null;
+}
+
+function checkKeyExpiry() {
+  if (state.keyExpiring || state.pendingRevoke || state.sessionKilled) return;
+  chrome.storage.local.get([K.KEY, K.KEYMETA], function (res) {
+    if (!res[K.KEY]) return;
+    // Keep the mirror honest: the panel writes meta on a panel-side
+    // Generate, which the worker only learns about from storage.
+    if (res[K.KEYMETA]) state.keyMeta = res[K.KEYMETA];
+    var reason = keyExpiryDueReason();
+    if (!reason) return;
+    if (state.peerPresent) {
+      if (!state.keyExpiryArmed) {
+        state.keyExpiryArmed = reason;
+        audit({ site: "-", action: "connector key", tier: "T0", result: "expiring",
+                detail: "key will expire when the current session disconnects: " + reason });
+        pushToPanel({ kind: "jbb.ui.sessionChanged" });
+      }
+      return;
+    }
+    expireConnectorKey(reason);
+  });
+}
+
+function expireConnectorKey(reason) {
+  if (state.keyExpiring) return;
+  state.keyExpiring = true;
+  chrome.storage.local.get([K.KEY], function (res) {
+    var oldKey = res[K.KEY];
+    if (!oldKey) { state.keyExpiring = false; return; }
+    state.keyExpiryArmed = null;
+    // Ephemeral grants die with the key; the whitelist survives (see the
+    // section header). Session state resets so nothing stale pairs later.
+    if (state.session) state.session = null;
+    if (state.tempGrant) state.tempGrant = null;
+    state.plans.clear();
+    buildSessionSummary();
+    state.sessionStartedAt = 0;
+    chrome.storage.local.remove([K.SESSION, K.TEMP]);
+
+    var finish = function () {
+      var patch = {};
+      patch[K.KEYEXPIRED] = { at: Date.now(), reason: reason };
+      chrome.storage.local.set(patch);
+      chrome.storage.local.remove([K.KEY, K.KEYMETA, K.KEYUSAGE], function () {
+        state.keyMeta = null;
+        state.keyUsage = { connectedMs: 0, acts: 0 };
+        state.keyExpiring = false;
+        audit({ site: "-", action: "connector key", tier: "T0", result: "expired",
+                detail: "connector key expired: " + reason + ". Generate a new key to reconnect." });
+        pushToPanel({ kind: "jbb.ui.status", connected: false });
+        pushToPanel({ kind: "jbb.ui.sessionChanged" });
+        refreshBadge();
+      });
+    };
+
+    if (state.connected) {
+      // Live socket: revoke on it (the relay poisons the room), give the
+      // revocation a beat to land, then drop the socket and wipe.
+      try { sendToRelay({ v: JBB.PROTOCOL_VERSION, type: "key.revoked", key: oldKey }); }
+      catch (e) { /* the disconnect below still ends the pairing */ }
+      setTimeout(function () { disconnectRelay("key expired"); finish(); }, 350);
+    } else if (state.relayUrl) {
+      // The deadline passed while the browser was closed: pair briefly
+      // for the sole purpose of revoking (handled at pair.confirm), so a
+      // late driver is told KEY_ROTATED instead of finding a lonely room.
+      state.pendingRevoke = true;
+      state.expireFinish = finish;
+      connectRelay(state.relayUrl);
+      setTimeout(function () {
+        if (state.pendingRevoke) {
+          state.pendingRevoke = false;
+          state.expireFinish = null;
+          disconnectRelay("key expired");
+          finish();
+        }
+      }, 10000);
+    } else {
+      finish();
+    }
   });
 }
 
@@ -1472,8 +1651,31 @@ function handleRelayMessage(raw) {
 
   switch (msg.type) {
     case "pair.confirm":
+      if (state.pendingRevoke) {
+        // This pairing exists only to revoke an expired key (its deadline
+        // passed while the browser was closed): poison the room, drop the
+        // socket, and let the expiry flow finish. No session opens.
+        state.pendingRevoke = false;
+        chrome.storage.local.get([K.KEY], function (res) {
+          var deadKey = res[K.KEY];
+          if (deadKey) {
+            try { sendToRelay({ v: JBB.PROTOCOL_VERSION, type: "key.revoked", key: deadKey }); }
+            catch (e) { /* the wipe below still retires the key locally */ }
+          }
+          setTimeout(function () {
+            disconnectRelay("key expired");
+            var f = state.expireFinish; state.expireFinish = null;
+            if (f) f();
+          }, 350);
+        });
+        break;
+      }
       state.connected = true;
       state.relayDownSince = null;
+      if (msg.peer) {
+        state.peerPresent = true;
+        if (!state.peerSince) state.peerSince = Date.now();
+      }
       if (!state.sessionStartedAt) {
         // A fresh pairing opens a new session window for the summary;
         // the previous session's summary card is retired.
@@ -1493,6 +1695,19 @@ function handleRelayMessage(raw) {
         error: "relay refused pairing: " + (msg.message || msg.error || "unknown") });
       audit({ site: "-", action: "session paired", tier: "T0", result: "denied",
               detail: "pair refused (" + (msg.error || "?") + ")" });
+      break;
+    case "peer.joined":
+      state.peerPresent = true;
+      if (!state.peerSince) state.peerSince = Date.now();
+      break;
+    case "peer.left":
+      // The driver hung up: fold its connected time into the key's usage
+      // budget, then let any armed/due expiry fire — this disconnect is
+      // exactly the boundary expiry waits for.
+      foldPeerTime();
+      state.peerPresent = false;
+      state.peerSince = 0;
+      checkKeyExpiry();
       break;
     case "act.propose":
       if (msg.proposal) {
@@ -2258,6 +2473,7 @@ function executeProposal(proposal) {
       var detail = (out && out.detail) || "";
       state.executing.delete(proposal.proposalId);
       recordActResult(proposal.proposalId, true, detail);
+      countKeyAct();
       // An applied act may have changed the page: the snapshot version
       // moves, so further acts built against the old version refuse
       // instead of guessing. The new version rides the result so a
@@ -2279,6 +2495,7 @@ function executeProposal(proposal) {
     function (err) {
       state.executing.delete(proposal.proposalId);
       recordActResult(proposal.proposalId, false, String(err));
+      countKeyAct();
       sendToRelay(JBB.Message.actResult(proposal.proposalId, false, String(err)));
       audit({
         site: proposal.site || "-",
@@ -2621,6 +2838,14 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           queuedCount: state.holdQueue.length,
           tempGrant: state.tempGrant ? { host: state.tempGrant.host,
                             remainingMs: Math.max(0, state.tempGrant.expiresAt - Date.now()) } : null,
+          keyExpiry: {
+            hasMeta: !!state.keyMeta,
+            expiresAt: (state.keyMeta && state.keyMeta.ttlMs) ? state.keyMeta.createdAt + state.keyMeta.ttlMs : null,
+            armed: state.keyExpiryArmed,
+            usage: { connectedMs: state.keyUsage.connectedMs + ((state.peerPresent && state.peerSince) ? Math.max(0, Date.now() - state.peerSince) : 0),
+                     acts: state.keyUsage.acts },
+            budget: { ms: KEY_BIG_TASK_MS, acts: KEY_BIG_TASK_ACTS }
+          },
           planPending: Array.from(state.planPending.values()).map(function (p) {
             return { planId: p.planId, title: p.title, sites: p.sites, steps: p.steps };
           }),
@@ -2750,7 +2975,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     case "jbb.ui.rotateKey":
       // One click: new key (returned once, for the reveal), old key revoked
       // at the relay, driver disconnected, every grant invalidated.
-      rotateConnectorKey(function (newKey) { done({ newKey: newKey }); });
+      rotateConnectorKey(function (newKey) { done({ newKey: newKey }); }, msg.ttlMs);
       return true; // async
 
     case "jbb.ui.consent":
