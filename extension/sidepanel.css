@@ -426,3 +426,20 @@ main { padding: 14px 16px 90px; }
 .wl-entry-head { display: flex; align-items: center; gap: 8px; }
 .wl-entry-head .btn { padding: 4px 10px; font-size: 11px; margin-left: auto; }
 .wl-entry-head .btn + .btn { margin-left: 0; }
+
+/* Live audit feed + session summary */
+.feed-list { display: flex; flex-direction: column; }
+.feed-row { padding: 7px 0; border-bottom: 1px solid var(--line); }
+.feed-row:last-child { border-bottom: none; }
+.feed-top { display: flex; gap: 8px; align-items: baseline; }
+.feed-label { font-size: 11px; font-weight: 600; }
+.feed-label.cat-auto-whitelist, .feed-label.cat-auto-session { color: var(--ok); }
+.feed-label.cat-asked-granted, .feed-label.cat-allowed { color: var(--ok); }
+.feed-label.cat-asked-denied, .feed-label.cat-blocked, .feed-label.cat-failed { color: var(--danger); }
+.feed-time { color: var(--faint); font-size: 11px; margin-left: auto; }
+.feed-action { font-size: 13px; margin-top: 1px; }
+.feed-site { color: var(--faint); font-size: 11px; }
+.feed-why { font-size: 12px; margin-top: 3px; }
+.feed-fix { color: var(--faint); font-size: 12px; }
+#summaryBody .sum-sites, #summaryBody .sum-denied { margin: 6px 0 0; padding-left: 16px; font-size: 12px; }
+#summaryBody .sum-head { font-size: 13px; }

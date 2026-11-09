@@ -29,6 +29,7 @@ var K = {
   SETTINGS: "jbb.settings",    // { mode, relayUrl }
   SITES: "jbb.sites",          // { hostname: "allow" | "deny" } — deny blocks live here; allows migrated to WHITELIST
   WHITELIST: "jbb.whitelist",  // { domain: { domain, tiers, actions, grantedAt, lastUsedAt, keyId, schemaVersion } } — persistent per-site allow
+  SUMMARY: "jbb.lastSummary",  // last session summary (counts by type/site + denials) for the panel
   AUDIT: "jbb.audit",          // [ entries ], capped
   PENDING: "jbb.pending",      // { proposalId: { proposal, createdAt } } — survives worker restarts
   RESULTS: "jbb.results",      // { proposalId: { ok, detail, at } } — executed acts, for id dedupe
@@ -57,6 +58,9 @@ var state = {
   sites: {},
   whitelist: {},               // domain -> entry (see grantWhitelist); exact-domain, tier-scoped, epoch-bound
   grantsPaused: false,         // master switch: while true, NO grant auto-allows (whitelist or session)
+  sessionStartedAt: 0,         // when the current driver session began (pairing); 0 = no live session window
+  summaryBuiltFor: 0,          // sessionStartedAt value the last summary was built for (build at most once per session)
+  lastSummary: null,           // most recent session summary (mirrors K.SUMMARY)
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer, createdAt, shown, shownVia, escalated, lastWaitingAt, elapsed }
   executing: new Set(),        // proposalIds currently executing (dedupe)
@@ -139,7 +143,7 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
 });
 
 function loadPersisted() {
-  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION, K.WHITELIST, K.EPOCH], function (res) {
+  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION, K.WHITELIST, K.EPOCH, K.SUMMARY], function (res) {
     var s = res[K.SETTINGS] || {};
     state.mode = s.mode || "ask-some";
     state.soundOn = (typeof s.soundOn === "boolean") ? s.soundOn : true;
@@ -147,6 +151,7 @@ function loadPersisted() {
     state.sites = res[K.SITES] || {};
     state.grantsPaused = !!s.grantsPaused;
     state.whitelist = res[K.WHITELIST] || {};
+    state.lastSummary = res[K.SUMMARY] || null;
     if (typeof res[K.EPOCH] === "number" && res[K.EPOCH] > 0) state.keyEpoch = res[K.EPOCH];
     // Migrate legacy blanket site-allows (pre-whitelist builds stored
     // sites[host] = "allow", covering every non-T3 tier forever) into
@@ -1157,6 +1162,63 @@ function pushToPanel(msg) {
   chrome.runtime.sendMessage(msg).catch(function () { /* panel closed */ });
 }
 
+// ---------------------------------------------------------------- session summary
+//
+// When a session ends (driver disconnect, session abort, kill switch, or
+// the panel's End session button), the audit log is distilled into one
+// plain-language summary: counts per action type and per site, plus
+// everything that was denied or blocked. Built at most once per session
+// window; stored on-machine (K.SUMMARY) so the panel can show it after
+// the fact. Nothing here ever goes to the relay.
+function summarySentence(s) {
+  var t = s.byType || {};
+  var parts = [];
+  if (t.navigate) parts.push("opened " + t.navigate + " page" + (t.navigate === 1 ? "" : "s"));
+  var clicks = (t.click || 0) + (t.clickAt || 0) + (t.clickSelector || 0);
+  if (clicks) parts.push("clicked " + clicks + " time" + (clicks === 1 ? "" : "s"));
+  if (t.type) parts.push("typed " + t.type + " time" + (t.type === 1 ? "" : "s"));
+  if (t.scroll) parts.push("scrolled " + t.scroll + " time" + (t.scroll === 1 ? "" : "s"));
+  if (t.key) parts.push("pressed keys " + t.key + " time" + (t.key === 1 ? "" : "s"));
+  var head = parts.length
+    ? "This session, Muse " + parts.join(", ") + "."
+    : "This session, Muse took no actions.";
+  if (s.denied.length) {
+    head += " " + s.denied.length + " action" + (s.denied.length === 1 ? " was" : "s were") + " denied or blocked.";
+  } else if (parts.length) {
+    head += " Nothing was denied.";
+  }
+  return head;
+}
+
+function buildSessionSummary(done) {
+  var since = state.sessionStartedAt;
+  if (!since || state.summaryBuiltFor === since) { if (done) done(null); return; }
+  state.summaryBuiltFor = since;
+  chrome.storage.local.get([K.AUDIT], function (res) {
+    var byType = {}, bySite = {}, denied = [], executed = 0;
+    (res[K.AUDIT] || []).forEach(function (e) {
+      if (!e.proposalId || e.ts < since) return;
+      if (e.result === "executed") {
+        executed++;
+        var ty = e.type || "other";
+        byType[ty] = (byType[ty] || 0) + 1;
+        var h = hostOf(e.site || "") || e.site || "-";
+        bySite[h] = (bySite[h] || 0) + 1;
+      } else if (e.result === "denied" || e.result === "failed") {
+        denied.push({ action: e.action || e.type || "action", site: e.site || "-",
+                      via: e.via || null, detail: e.detail || null });
+      }
+    });
+    var summary = { startedAt: since, endedAt: Date.now(), executed: executed,
+                    byType: byType, bySite: bySite, denied: denied };
+    summary.sentence = summarySentence(summary);
+    state.lastSummary = summary;
+    chrome.storage.local.set({ [K.SUMMARY]: summary });
+    pushToPanel({ kind: "jbb.ui.sessionSummary", summary: summary });
+    if (done) done(summary);
+  });
+}
+
 // ---------------------------------------------------------------- permission gate
 function hostOf(url) {
   try { return new URL(url).hostname; } catch (e) { return ""; }
@@ -1258,6 +1320,14 @@ function handleRelayMessage(raw) {
     case "pair.confirm":
       state.connected = true;
       state.relayDownSince = null;
+      if (!state.sessionStartedAt) {
+        // A fresh pairing opens a new session window for the summary;
+        // the previous session's summary card is retired.
+        state.sessionStartedAt = Date.now();
+        state.summaryBuiltFor = 0;
+        state.lastSummary = null;
+        chrome.storage.local.remove([K.SUMMARY]);
+      }
       pushToPanel({ kind: "jbb.ui.status", connected: true });
       audit({ site: "-", action: "session paired", tier: "T0", result: "allowed", detail: "protocol " + msg.v });
       break;
@@ -1303,6 +1373,8 @@ function handleRelayMessage(raw) {
       state.pending.clear();
       audit({ site: "-", action: "session abort", tier: "T0",
               result: "ended", detail: abortReason + " (remote; local kill switch untouched)" });
+      buildSessionSummary();
+      state.sessionStartedAt = 0;
       pushToPanel({ kind: "jbb.ui.status", connected: false, error: abortReason });
       disconnectRelay("peer abort");
       break;
@@ -1359,7 +1431,8 @@ function handleProposal(proposal, source) {
     sendToRelay(JBB.Message.actResult(proposal.proposalId, false, staleDetail,
       "STALE_SNAPSHOT", state.snapshotVersion));
     audit({ site: proposal.site || "-", action: proposal.description || proposal.type,
-            tier: proposal.actionTier, result: "denied", detail: staleDetail });
+            tier: proposal.actionTier, result: "denied", detail: staleDetail,
+            type: proposal.type, proposalId: proposal.proposalId, via: "blocked" });
     return;
   }
 
@@ -1372,13 +1445,21 @@ function handleProposal(proposal, source) {
                    proposal.actionTier !== "T3" &&
                    sessionAllows(proposal);
 
+  // Remember HOW this action was (or will be) authorized — the audit
+  // feed and the session summary speak in these terms.
+  proposal._via = verdict.via === "whitelist" ? "whitelist"
+    : viaSession ? "session"
+    : verdict.decision === "allow" ? "auto"
+    : verdict.decision === "deny" ? "blocked" : "consent";
+
   audit({
     site: proposal.site || "-",
     action: proposal.description || proposal.type,
     tier: proposal.actionTier || "?",
     result: verdict.decision === "deny" ? "denied" :
             (verdict.decision === "allow" || viaSession) ? "allowed" : "awaiting consent",
-    detail: viaSession ? "session grant (" + sessionRemaining() + " left)" : (verdict.reason || null)
+    detail: viaSession ? "session grant (" + sessionRemaining() + " left)" : (verdict.reason || null),
+    type: proposal.type, proposalId: proposal.proposalId, via: proposal._via
   });
 
   if (verdict.decision === "deny") {
@@ -1431,7 +1512,8 @@ function resolveConsent(proposal, answer) {
       action: proposal.description || proposal.type,
       tier: proposal.actionTier,
       result: "denied",
-      detail: "user denied"
+      detail: "user denied",
+      type: proposal.type, proposalId: proposal.proposalId, via: "consent"
     });
     pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: proposal.proposalId, choice: "deny" });
     return;
@@ -1522,7 +1604,8 @@ function executeProposal(proposal) {
         action: proposal.description || proposal.type,
         tier: proposal.actionTier,
         result: "executed",
-        detail: detail + (proposal._whitelistDomain ? " [allowed by whitelist: " + proposal._whitelistDomain + "]" : "")
+        detail: detail + (proposal._whitelistDomain ? " [allowed by whitelist: " + proposal._whitelistDomain + "]" : ""),
+        type: proposal.type, proposalId: proposal.proposalId, via: proposal._via || "consent"
       });
     },
     function (err) {
@@ -1534,7 +1617,8 @@ function executeProposal(proposal) {
         action: proposal.description || proposal.type,
         tier: proposal.actionTier,
         result: "failed",
-        detail: String(err)
+        detail: String(err),
+        type: proposal.type, proposalId: proposal.proposalId, via: proposal._via || "consent"
       });
     }
   );
@@ -1716,6 +1800,8 @@ function getActiveTab() {
 
 // ---------------------------------------------------------------- kill switch
 function killSession(reason) {
+  buildSessionSummary();
+  state.sessionStartedAt = 0;
   state.sessionKilled = true;
   // Deny everything still waiting on the user.
   state.pending.forEach(function (p) {
@@ -1807,6 +1893,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           whitelist: state.whitelist,
           whitelistSchema: WHITELIST_SCHEMA,
           grantsPaused: state.grantsPaused,
+          lastSummary: state.lastSummary,
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
           session: sess ? { site: sess.site, label: sess.label,
@@ -1850,10 +1937,23 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       break;
 
     case "jbb.ui.disconnect":
+      buildSessionSummary();
+      state.sessionStartedAt = 0;
       disconnectRelay("user disconnect");
       pushToPanel({ kind: "jbb.ui.status", connected: false });
       done();
       break;
+
+    case "jbb.ui.endSession":
+      // The user's deliberate end: summarize first, then disconnect.
+      // (Unlike the kill switch this does not block reconnection.)
+      buildSessionSummary(function (summary) {
+        state.sessionStartedAt = 0;
+        disconnectRelay("user ended session");
+        pushToPanel({ kind: "jbb.ui.status", connected: false });
+        done({ ok: true, summary: summary });
+      });
+      return true;
 
     case "jbb.ui.ackSignIn":
       // User explicitly acknowledges the signed-in account, accepting that

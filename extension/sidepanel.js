@@ -368,14 +368,20 @@ function auditRow(e) {
   var time = t.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
   var tierLabel = String(e.tier || "?");
   if (tierLabel.charAt(0) !== "T") tierLabel = "T" + tierLabel;
+  // Finished actions speak plainly (same words as the live feed);
+  // bookkeeping entries keep their raw result.
+  var cat = JBB.feedCategory(e);
+  var resultLabel = cat ? cat.label : (e.result || "");
+  var plain = (cat && (e.result === "denied" || e.result === "failed")) ? JBB.plainReason(e) : null;
   row.innerHTML =
     '<div class="audit-top">' +
       '<span class="tier-badge">' + esc(tierLabel) + "</span>" +
-      '<span class="result result-' + esc(e.result || "allowed") + '">' + esc(e.result || "") + "</span>" +
+      '<span class="result result-' + esc(e.result || "allowed") + '">' + esc(resultLabel) + "</span>" +
       '<span class="audit-time">' + esc(time) + "</span>" +
     "</div>" +
     '<div class="audit-action">' + esc(e.action || "") + "</div>" +
-    '<div class="audit-site">' + esc(e.site || "") + (e.detail ? " · " + esc(e.detail) : "") + "</div>";
+    '<div class="audit-site">' + esc(e.site || "") + (e.detail ? " · " + esc(e.detail) : "") + "</div>" +
+    (plain && plain.why ? '<div class="feed-why">' + esc(plain.why) + (plain.fix ? " " + esc(plain.fix) : "") + "</div>" : "");
   return row;
 }
 
@@ -388,6 +394,60 @@ function renderAudit(entries) {
     return;
   }
   items.slice(0, 200).forEach(function (e) { list.appendChild(auditRow(e)); });
+}
+
+// ------------------------------------------------------------- live feed
+// The last ~10 finished actions, in plain language. One row per action:
+// what happened, where, and — for anything stopped — why, and what would
+// allow it. Updates live via the auditAppended push (no reload).
+function renderFeed(entries) {
+  var list = el("feedList");
+  if (!list) return;
+  list.innerHTML = "";
+  var rows = JBB.feedRows(entries || [], 10);
+  if (!rows.length) {
+    list.innerHTML = '<div class="empty">Nothing yet — actions will appear here as Muse works.</div>';
+    return;
+  }
+  rows.forEach(function (r) {
+    var row = document.createElement("div");
+    row.className = "feed-row";
+    var time = new Date(r.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    var html =
+      '<div class="feed-top"><span class="feed-label cat-' + esc(r.category) + '">' + esc(r.label) + "</span>" +
+      '<span class="feed-time">' + esc(time) + "</span></div>" +
+      '<div class="feed-action">' + esc(r.action) + "</div>" +
+      '<div class="feed-site">' + esc(r.site) + "</div>";
+    if (r.why) html += '<div class="feed-why">' + esc(r.why) + "</div>";
+    if (r.fix) html += '<div class="feed-fix">' + esc(r.fix) + "</div>";
+    row.innerHTML = html;
+    list.appendChild(row);
+  });
+}
+
+// ------------------------------------------------------------- session summary
+function renderSummary(summary) {
+  var card = el("summaryCard");
+  var body = el("summaryBody");
+  if (!card || !body) return;
+  if (!summary) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  var when = new Date(summary.endedAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  var html = '<div class="sum-head">' + esc(summary.sentence || "") + "</div>" +
+    '<div class="wl-meta">Session ended ' + esc(when) + " · " + summary.executed + " action" +
+    (summary.executed === 1 ? "" : "s") + " carried out</div>";
+  var sites = Object.keys(summary.bySite || {});
+  if (sites.length) {
+    html += '<div class="wl-meta">By site:</div><ul class="sum-sites">' + sites.sort().map(function (h) {
+      return "<li>" + esc(h) + " — " + summary.bySite[h] + "</li>";
+    }).join("") + "</ul>";
+  }
+  if ((summary.denied || []).length) {
+    html += '<div class="wl-meta">Denied or blocked:</div><ul class="sum-denied">' + summary.denied.map(function (d) {
+      return "<li>" + esc(d.action) + " (" + esc(d.site) + ")</li>";
+    }).join("") + "</ul>";
+  }
+  body.innerHTML = html;
 }
 
 // ---------------------------------------------------------------- boot & events
@@ -407,6 +467,8 @@ function refresh() {
       ? "0 active grants — re-grant to continue"
       : grantCount + " active grant" + (grantCount === 1 ? "" : "s");
     renderAudit(s.audit);
+    renderFeed(s.audit);
+    renderSummary(s.lastSummary);
     // Don't clobber the relay URL while the user is typing it: status
     // updates arrive on every (re)connect attempt, and the old code wiped
     // the field back to the stored value mid-edit.
@@ -462,8 +524,11 @@ chrome.runtime.onMessage.addListener(function (msg) {
       break;
     case "jbb.ui.auditAppended":
       api({ kind: "jbb.ui.getState" }).then(function (s) {
-        if (s && s.ok) renderAudit(s.audit);
+        if (s && s.ok) { renderAudit(s.audit); renderFeed(s.audit); }
       });
+      break;
+    case "jbb.ui.sessionSummary":
+      refresh();
       break;
     case "jbb.ui.toast":
       toast(msg.text);
@@ -575,6 +640,12 @@ document.addEventListener("DOMContentLoaded", function () {
   });
   el("disconnectBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.disconnect" }).then(refresh);
+  });
+  el("endSessionBtn").addEventListener("click", function () {
+    api({ kind: "jbb.ui.endSession" }).then(function (res) {
+      if (res && res.summary) toast("Session ended — summary below");
+      refresh();
+    });
   });
   el("testNotifBtn").addEventListener("click", function () {
     api({ kind: "jbb.ui.testNotif" });

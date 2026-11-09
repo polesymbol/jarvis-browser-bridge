@@ -149,12 +149,94 @@
       .trim();
   }
 
+  /**
+   * Plain-language explanation for a denied / blocked / failed audit
+   * entry: why it happened and what would allow it. Shown in the panel
+   * feed — the user should never have to decode a reason string.
+   */
+  function plainReason(entry) {
+    var d = String((entry && entry.detail) || "");
+    if (entry && entry.via === "consent" && entry.result === "denied") {
+      return { why: "You denied this action.", fix: "Approve it next time if you want it to happen." };
+    }
+    if (/site is blocked/.test(d)) {
+      return { why: "This site is on your block list.", fix: "Remove the block in the Sites tab to allow actions there." };
+    }
+    if (/readonly mode/.test(d)) {
+      return { why: "The bridge is in read-only mode, so nothing may change the page.", fix: "Switch the permission mode to “Ask for some actions” to allow changes." };
+    }
+    if (/stale snapshot/i.test(d)) {
+      return { why: "The page changed after Muse looked at it, so the action was refused rather than risk the wrong element.", fix: "Nothing needed — Muse can look again and retry against the fresh page." };
+    }
+    if (/session killed|kill switch/.test(d)) {
+      return { why: "The session was stopped with the kill switch.", fix: "Start a new session when you want Muse to act again." };
+    }
+    if (/key rotated/i.test(d)) {
+      return { why: "The connector key was rotated, so the old pairing is no longer valid.", fix: "Pair again with the new key." };
+    }
+    if (/invalid custom grant/.test(d)) {
+      return { why: "That grant length was not valid.", fix: "Pick one of the preset grant durations." };
+    }
+    if (/not yet approved/.test(d)) {
+      return { why: "This site is not approved yet.", fix: "Approve the action (or the site) when asked." };
+    }
+    if (entry && entry.result === "failed") {
+      return { why: "The action did not complete: " + (d || "unknown error"), fix: "Muse can look at the page again and retry." };
+    }
+    return { why: d || "It was not allowed.", fix: "" };
+  }
+
+  /**
+   * Feed category for one audit entry, or null when the entry is not a
+   * finished action outcome (verdict intermediates, pairing events and
+   * other bookkeeping stay in the full audit tab, out of the feed).
+   * Only entries tied to a proposal count — one row per action.
+   */
+  function feedCategory(entry) {
+    if (!entry || !entry.proposalId) return null;
+    if (entry.result === "executed") {
+      if (entry.via === "whitelist") {
+        var m = /allowed by whitelist: ([^\]]+)/.exec(String(entry.detail || ""));
+        return { key: "auto-whitelist", label: "Auto-allowed by whitelist: " + (m ? m[1] : entry.site || "") };
+      }
+      if (entry.via === "session") return { key: "auto-session", label: "Auto-allowed by session grant" };
+      if (entry.via === "consent") return { key: "asked-granted", label: "Asked — you approved" };
+      return { key: "allowed", label: "Allowed" };
+    }
+    if (entry.result === "denied") {
+      if (entry.via === "consent") return { key: "asked-denied", label: "Asked — you denied" };
+      return { key: "blocked", label: "Blocked" };
+    }
+    if (entry.result === "failed") return { key: "failed", label: "Didn't work" };
+    return null;
+  }
+
+  /** The live feed: finished actions only, newest first, capped. */
+  function feedRows(entries, limit) {
+    var rows = [];
+    (entries || []).forEach(function (e) {
+      var cat = feedCategory(e);
+      if (!cat) return;
+      var reason = (e.result === "denied" || e.result === "failed") ? plainReason(e) : { why: "", fix: "" };
+      rows.push({
+        ts: e.ts || 0, site: e.site || "-", action: e.action || e.type || "action",
+        type: e.type || null, category: cat.key, label: cat.label,
+        why: reason.why, fix: reason.fix
+      });
+    });
+    rows.sort(function (a, b) { return b.ts - a.ts; });
+    return rows.slice(0, limit || 10);
+  }
+
   root.JBB = {
     PROTOCOL_VERSION: PROTOCOL_VERSION,
     ACTION_TIERS: ACTION_TIERS,
     MODES: MODES,
     Message: Message,
     isValidActionTier: isValidActionTier,
-    normalizeLabel: normalizeLabel
+    normalizeLabel: normalizeLabel,
+    plainReason: plainReason,
+    feedCategory: feedCategory,
+    feedRows: feedRows
   };
 })(typeof self !== "undefined" ? self : this);
