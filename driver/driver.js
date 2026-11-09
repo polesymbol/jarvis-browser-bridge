@@ -97,7 +97,8 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
     usage: [
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
       'commands: observe | act | abort | status',
-      'act flags: --type click|type|key|scroll|navigate --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n>',
+      'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -487,7 +488,16 @@ async function main() {
     await pair(ws);
 
     if (CMD === 'observe') {
-      const res = await sendResilient(ws, { v: 1, type: 'observe.request', id: `obs-${Date.now()}` }, ['observe.result'], 30000);
+      const req = { v: 1, type: 'observe.request', id: `obs-${Date.now()}` };
+      const offRaw = opt('--text-offset', undefined);
+      if (offRaw !== undefined) {
+        const off = Number(offRaw);
+        if (!Number.isFinite(off) || off < 0) {
+          throw new DriverError('USAGE', '--text-offset must be a non-negative number (take text_next_offset from the previous observe)');
+        }
+        req.textOffset = off;
+      }
+      const res = await sendResilient(ws, req, ['observe.result'], 30000);
       console.log(JSON.stringify(res, null, 2));
     } else if (CMD === 'act') {
       // Proposal shape matches the extension's handleProposal():
@@ -523,6 +533,25 @@ async function main() {
           throw new DriverError('USAGE', '--snapshot-version must be a non-negative number (take it from the observe output)');
         }
         proposal.snapshotVersion = sv;
+      }
+      // Fallback targeting: clickAt (viewport coordinates, e.g. read off
+      // a screenshot) and clickSelector (a CSS selector). Both pass the
+      // same consent gate as every act; the result names what was clicked.
+      if (type === 'clickAt') {
+        const x = Number(opt('--x', undefined));
+        const y = Number(opt('--y', undefined));
+        if (!Number.isFinite(x) || !Number.isFinite(y)) {
+          throw new DriverError('USAGE', '--type clickAt requires numeric --x and --y (viewport coordinates)');
+        }
+        proposal.point = { x, y };
+        proposal.description = `click at (${x}, ${y})`;
+      } else if (type === 'clickSelector') {
+        const selector = opt('--selector', undefined);
+        if (!selector) {
+          throw new DriverError('USAGE', '--type clickSelector requires --selector <css>');
+        }
+        proposal.selector = selector;
+        proposal.description = `click selector '${selector}'`;
       }
       const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       console.error('[sent] act.propose — following the consent lifecycle…');

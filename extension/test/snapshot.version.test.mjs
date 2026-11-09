@@ -33,6 +33,7 @@ const tick = (ms) => new Promise((r) => setTimeout(r, ms || 40));
 
 const store = {};
 const sent = [];
+let actResponse = { ok: true, detail: "clicked 'Lesson 2'" };
 const chrome = {
   storage: { local: {
     get(keys, cb) {
@@ -60,7 +61,7 @@ const chrome = {
   tabs: {
     query: () => Promise.resolve([{ id: 1, windowId: 1, url: "https://example.com/", active: true }]),
     get: () => Promise.resolve({ id: 1, windowId: 1, url: "https://example.com/" }),
-    sendMessage: () => Promise.resolve({ ok: true, detail: "clicked 'Lesson 2'" }),
+    sendMessage: () => Promise.resolve(actResponse),
     update: () => Promise.resolve({}),
     captureVisibleTab: () => Promise.resolve("data:,"),
     onActivated: { addListener: () => {} }, onUpdated: { addListener: () => {} },
@@ -149,6 +150,18 @@ sandbox.handleProposal(proposal({ proposalId: "legacy-1" }), "relay");
 await tick();
 check("version-less act proceeds to consent (stable-id + label checks only)",
   sandbox.state.pending.has("legacy-1"));
+
+// --- matchQuality from the content script rides the act.result
+actResponse = { ok: true, detail: "clicked 'Lesson 2'", matchQuality: "fuzzy" };
+sent.length = 0;
+sandbox.handleProposal(proposal({ proposalId: "fuzzy-1" }), "relay");
+await tick();
+check("fuzzy act proceeds to consent", sandbox.state.pending.has("fuzzy-1"));
+sandbox.state.pending.get("fuzzy-1").resolve({ choice: "once" });
+await tick(80);
+const fuzzyResult = relaySends().find((m) => m.type === "act.result" && m.proposalId === "fuzzy-1");
+check("act.result carries matchQuality: fuzzy",
+  !!fuzzyResult && fuzzyResult.ok === true && fuzzyResult.matchQuality === "fuzzy");
 
 console.log(failures === 0 ? "ALL SNAPSHOT VERSION TESTS PASSED" : failures + " SNAPSHOT VERSION CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

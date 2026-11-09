@@ -112,10 +112,11 @@
     consentDeny: function (proposalId, reason) {
       return base("consent.deny", { proposalId: proposalId, reason: reason || null });
     },
-    actResult: function (proposalId, ok, detail, error, snapshotVersion) {
+    actResult: function (proposalId, ok, detail, error, snapshotVersion, matchQuality) {
       var m = base("act.result", { proposalId: proposalId, ok: !!ok, detail: detail || null });
       if (error) m.error = error;
       if (typeof snapshotVersion === "number") m.snapshotVersion = snapshotVersion;
+      if (matchQuality) m.matchQuality = matchQuality;
       return m;
     },
 

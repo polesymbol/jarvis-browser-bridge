@@ -88,12 +88,19 @@ function fakeLifecycleExt(port, key, mode) {
     ws.on("message", (raw) => {
       let m; try { m = JSON.parse(raw.toString()); } catch { return; }
       if (m.type === "pair.confirm") { resolve(state); return; }
-      if (m.type !== "act.propose") return;
+      if (m.type !== "act.propose" && m.type !== "observe.request") return;
+      const send = (o) => { try { ws.send(JSON.stringify({ v: 1, ...o })); } catch {} };
+      const after = (ms, fn) => { state.timers.push(setTimeout(fn, ms)); };
+      if (m.type === "observe.request") {
+        state.lastObserve = m;
+        send({ type: "observe.result", id: m.id, snapshotVersion: 5,
+          snapshot: { title: "Long page", text_chunk: "tail chunk — COURSE COMPLETED",
+            text_offset: m.textOffset || 0, text_total_chars: 31234, text_next_offset: null } });
+        return;
+      }
       state.proposeCount++;
       state.lastProposal = m.proposal;
       const pid = m.id;
-      const send = (o) => { try { ws.send(JSON.stringify({ v: 1, ...o })); } catch {} };
-      const after = (ms, fn) => { state.timers.push(setTimeout(fn, ms)); };
       send({ type: "proposal.received", proposalId: pid });
       if (mode === "notshown") return; // received, but no prompt ever appears
       after(30, () => send({ type: "consent.shown", proposalId: pid, via: "panel" }));
@@ -329,6 +336,26 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   check("--target is normalized (NBSP + zero-width stripped) before it reaches the proposal",
     !!e.lastProposal && e.lastProposal.target.label === "Buy now",
     "proposal=" + JSON.stringify(e.lastProposal));
+  stopExt(e);
+}
+{
+  const key = "paging-key-0123456789abcdef";
+  const e = await fakeLifecycleExt(L.port, key, "grant");
+  const r = await runDriver(["--relay", lArg, "--key", key, "observe", "--text-offset", "30000"], FAST);
+  check("observe --text-offset pages to the final chunk (completion message readable)",
+    r.code === 0 && r.out.includes("COURSE COMPLETED") && r.out.includes('"text_total_chars": 31234'),
+    "stdout=" + r.out.slice(0, 200));
+  check("the offset reached the extension's observe.request",
+    !!e.lastObserve && e.lastObserve.textOffset === 30000, "req=" + JSON.stringify(e.lastObserve));
+  const r2 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "clickAt", "--x", "10", "--y", "20", "--tier", "T1"], FAST);
+  check("clickAt act succeeds through the lifecycle with its point",
+    r2.code === 0 && !!e.lastProposal && e.lastProposal.type === "clickAt" &&
+    e.lastProposal.point.x === 10 && e.lastProposal.point.y === 20,
+    "stdout=" + r2.out + " proposal=" + JSON.stringify(e.lastProposal));
+  const r3 = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "clickSelector", "--selector", "#go", "--tier", "T1"], FAST);
+  check("clickSelector proposal carries the selector",
+    r3.code === 0 && !!e.lastProposal && e.lastProposal.type === "clickSelector" && e.lastProposal.selector === "#go",
+    "stdout=" + r3.out + " proposal=" + JSON.stringify(e.lastProposal));
   stopExt(e);
 }
 L.httpServer.close();

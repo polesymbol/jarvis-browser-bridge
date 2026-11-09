@@ -1132,7 +1132,7 @@ function handleRelayMessage(raw) {
       break;
     case "observe.request": {
       var obsId = msg.id;
-      observeActiveTab(false).then(
+      observeActiveTab(false, { textOffset: msg.textOffset }).then(
         function (m) {
           m.id = obsId;
           sendToRelay(m);
@@ -1348,16 +1348,19 @@ function resolveConsent(proposal, answer) {
 function executeProposal(proposal) {
   state.executing.add(proposal.proposalId);
   runOnPage(proposal).then(
-    function (detail) {
+    function (out) {
+      var detail = (out && out.detail) || "";
       state.executing.delete(proposal.proposalId);
       recordActResult(proposal.proposalId, true, detail);
       // An applied act may have changed the page: the snapshot version
       // moves, so further acts built against the old version refuse
       // instead of guessing. The new version rides the result so a
       // caller chaining deliberately can declare it on the next act.
+      // matchQuality (exact/fuzzy) rides along when a label resolved the
+      // target, so the caller can see how its target was found.
       state.snapshotVersion++;
       sendToRelay(JBB.Message.actResult(proposal.proposalId, true, detail,
-        null, state.snapshotVersion));
+        null, state.snapshotVersion, out && out.matchQuality));
       audit({
         site: proposal.site || "-",
         action: proposal.description || proposal.type,
@@ -1401,7 +1404,7 @@ function runOnPage(proposal) {
           " but navigate targets " + destHost);
       }
       return chrome.tabs.update(tab.id, { url: proposal.url }).then(function () {
-        return "navigated to " + proposal.url;
+        return { detail: "navigated to " + proposal.url };
       });
     }
     if (isInternal) {
@@ -1423,7 +1426,7 @@ function runOnPage(proposal) {
       // navigate is handled by the background (tabs API), not the page.
       if (proposal.type === "navigate" && proposal.url) {
         return chrome.tabs.update(tab.id, { url: proposal.url }).then(function () {
-          return "navigated to " + proposal.url;
+          return { detail: "navigated to " + proposal.url };
         });
       }
       // A ref of the form "f<frameId>:e<n>" (produced by observe for elements
@@ -1436,7 +1439,7 @@ function runOnPage(proposal) {
         : chrome.tabs.sendMessage(tab.id, msg);
       return send.then(function (res) {
         if (!res || !res.ok) throw new Error((res && res.error) || "content script error");
-        return res.detail;
+        return { detail: res.detail, matchQuality: res.matchQuality };
       });
     });
   });
@@ -1460,9 +1463,9 @@ function routeFrameRef(proposal) {
 // fully self-contained. The content script shares this isolated world and
 // exposes window.__jbbBuildSnapshot; frames where injection is impossible
 // (or an older content script is still resident) return null and are skipped.
-function jbbSnapshotInFrame() {
+function jbbSnapshotInFrame(opts) {
   try {
-    return window.__jbbBuildSnapshot ? window.__jbbBuildSnapshot() : null;
+    return window.__jbbBuildSnapshot ? window.__jbbBuildSnapshot(opts || {}) : null;
   } catch (e) {
     return null;
   }
@@ -1497,7 +1500,8 @@ function finishObserve(tab, snap, withScreenshot) {
     });
 }
 
-function observeActiveTab(withScreenshot) {
+function observeActiveTab(withScreenshot, observeOpts) {
+  observeOpts = observeOpts || {};
   return getActiveTab().then(function (tab) {
     if (!tab || !tab.id) throw new Error("no active tab");
     return chrome.scripting.executeScript({
@@ -1506,7 +1510,8 @@ function observeActiveTab(withScreenshot) {
     }).then(function () {
       return chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: true },
-        func: jbbSnapshotInFrame
+        func: jbbSnapshotInFrame,
+        args: [observeOpts]
       }).catch(function () { return null; });
     }).then(function (results) {
       var frames = [];
@@ -1516,8 +1521,8 @@ function observeActiveTab(withScreenshot) {
       if (!frames.length) {
         // Fallback: a content script from an older build may still be the
         // resident one in this tab (it has no __jbbBuildSnapshot). Its
-        // message-based observe still answers — top frame only, no text.
-        return chrome.tabs.sendMessage(tab.id, { kind: "jbb.content.observe" })
+        // message-based observe still answers — top frame only.
+        return chrome.tabs.sendMessage(tab.id, { kind: "jbb.content.observe", textOffset: observeOpts.textOffset })
           .then(function (res) {
             if (!res || !res.ok) throw new Error("observe failed");
             return finishObserve(tab, res.snapshot, withScreenshot);
