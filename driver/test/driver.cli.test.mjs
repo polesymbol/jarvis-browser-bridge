@@ -87,15 +87,25 @@ function fakeLifecycleExt(port, key, mode) {
     ws.on("error", reject);
     ws.on("message", (raw) => {
       let m; try { m = JSON.parse(raw.toString()); } catch { return; }
+      const send = (o) => { try { ws.send(JSON.stringify({ v: 1, ...o })); } catch {} };
+      const after = (ms, fn) => { state.timers.push(setTimeout(fn, ms)); };
       if (m.type === "pair.confirm") { resolve(state); return; }
+      if (m.type === "plan.propose") {
+        state.lastPlan = m.plan;
+        if (mode === "plandeny") {
+          after(60, () => send({ type: "plan.denied", planId: m.id, reason: "user denied the plan" }));
+        } else {
+          after(60, () => send({ type: "plan.approved", planId: m.id,
+            sites: ["example.com"], stepCount: (m.plan.steps || []).length, expiresAt: Date.now() + 1800000 }));
+        }
+        return;
+      }
       if (m.type === "act.propose" && m.proposal && m.proposal.type === "audioCapture" &&
           m.proposal.capture && m.proposal.capture.action === "stop") {
         state.stopProposals = (state.stopProposals || 0) + 1;
         return;
       }
       if (m.type !== "act.propose" && m.type !== "observe.request") return;
-      const send = (o) => { try { ws.send(JSON.stringify({ v: 1, ...o })); } catch {} };
-      const after = (ms, fn) => { state.timers.push(setTimeout(fn, ms)); };
       if (m.type === "observe.request") {
         state.lastObserve = m;
         send({ type: "observe.result", id: m.id, snapshotVersion: 5,
@@ -121,7 +131,7 @@ function fakeLifecycleExt(port, key, mode) {
       }
       if (mode === "notshown") return; // received, but no prompt ever appears
       after(30, () => send({ type: "consent.shown", proposalId: pid, via: "panel" }));
-      if (mode === "grant") {
+      if (mode === "grant" || mode === "plan") {
         after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
         after(180, () => send({ type: "act.result", proposalId: pid, ok: true, detail: "done" }));
       } else if (mode === "deny") {
@@ -500,6 +510,31 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
     fileBytes === "CHUNK1CHUNK2" && (ce.stopProposals || 0) === 1,
     "stdout=" + lr.out + " file=" + JSON.stringify(fileBytes) + " stops=" + (ce.stopProposals || 0));
   stopExt(ce);
+
+  // ------------------------------------------------------------ plan
+  const planKey = "plan-key-0123456789abcdef01";
+  const planFile = pathx.join(osx.tmpdir(), `jbb-plan-${Date.now()}.json`);
+  fsx.writeFileSync(planFile, JSON.stringify({
+    title: "Two clicks",
+    steps: [
+      { type: "click", label: "One", site: "https://example.com/a", description: "click one" },
+      { type: "click", label: "Two", site: "https://example.com/a", description: "click two" },
+    ],
+  }));
+  const pe = await fakeLifecycleExt(Number(new URL(mArg).port), planKey, "plan");
+  const pr = await runDriver(["--relay", mArg, "--key", planKey, "plan", "--file", planFile], FAST);
+  let prj = null; try { prj = JSON.parse(pr.out); } catch {}
+  check("plan proposes once, then runs its steps under the approval",
+    pr.code === 0 && !!prj && prj.command === "plan" && prj.completed === true &&
+    prj.steps.length === 2 && prj.steps.every((s) => s.ok) && pe.proposeCount === 2,
+    "stdout=" + pr.out + " proposes=" + pe.proposeCount);
+  stopExt(pe);
+  const pd = await fakeLifecycleExt(Number(new URL(mArg).port), planKey, "plandeny");
+  const pdr = await runDriver(["--relay", mArg, "--key", planKey, "plan", "--file", planFile], FAST);
+  check("a denied plan runs nothing and exits PLAN_DENIED",
+    pdr.code === 1 && pdr.out.includes("PLAN_DENIED") && pd.proposeCount === 0,
+    "stdout=" + pdr.out + " proposes=" + pd.proposeCount);
+  stopExt(pd);
 }
 L.httpServer.close();
 

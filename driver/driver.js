@@ -98,7 +98,8 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
     ok: true,
     usage: [
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
-      'commands: observe | act | abort | status | watch | listen',
+      'commands: observe | act | abort | status | watch | listen | plan',
+      'plan: --file <steps.json> (ordered steps, max 20; user approves once; T3 steps still ask)',
       'listen flags: --duration <seconds> --out <file.webm> (proposes audio capture — T2 — then writes the streamed Opus/WebM chunks to the file)',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
       'watch flags: --duration <seconds> (stream media.progress events as JSON lines; 0 = until Ctrl-C)',
@@ -110,7 +111,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
 
 const RELAY = opt('--relay', 'ws://127.0.0.1:8787');
 const KEY = opt('--key', '');
-const CMD = args.find((a) => ['observe', 'act', 'abort', 'status', 'watch', 'listen'].includes(a));
+const CMD = args.find((a) => ['observe', 'act', 'abort', 'status', 'watch', 'listen', 'plan'].includes(a));
 
 // In-flight act proposals owned by this process. A one-shot CLI holds none at
 // rest, so `status` reports 0; the counter exists so the field is real, not
@@ -467,16 +468,24 @@ async function runAct(ws, proposal, id) {
 
     // Phase B — shown: a prompt must actually become visible.
     if (!verdict) {
-      const shownDeadline = Date.now() + ACT_SHOWN_MS;
+      let shownDeadline = Date.now() + ACT_SHOWN_MS;
       for (;;) {
         let got;
         try {
-          got = await pump.next(['consent.shown', 'consent.waiting', 'consent.grant', 'consent.deny', 'act.result'], shownDeadline - Date.now());
+          got = await pump.next(['consent.shown', 'consent.waiting', 'consent.grant', 'consent.deny', 'act.result', 'proposal.queued'], shownDeadline - Date.now());
         } catch (e) {
           if (isTimeout(e)) {
             throw new DriverError('PROMPT_NOT_SHOWN', 'the extension received the proposal but the consent prompt never appeared — no panel card or in-page banner became visible');
           }
           throw e;
+        }
+        if (got.type === 'proposal.queued') {
+          // Take-over: the user is driving. The proposal is HELD, not
+          // refused — queued heartbeats keep this wait alive until
+          // hand-back runs it through the gate.
+          console.error('[queued] user has taken over in the panel — this action is held until they hand back');
+          shownDeadline = Date.now() + 60000;
+          continue;
         }
         if (got.type === 'consent.shown' || got.type === 'consent.waiting') break;
         if (got.type === 'act.result') { finish(got); return; }
@@ -488,16 +497,21 @@ async function runAct(ws, proposal, id) {
     // Phase C — verdict: heartbeats report the waiting state; a timeout
     // here is NO_ANSWER, and the proposal stays queued in the panel.
     if (!verdict) {
-      const consentDeadline = Date.now() + ACT_CONSENT_MS;
+      let consentDeadline = Date.now() + ACT_CONSENT_MS;
       for (;;) {
         let got;
         try {
-          got = await pump.next(['consent.grant', 'consent.deny', 'act.result', 'consent.waiting'], consentDeadline - Date.now());
+          got = await pump.next(['consent.grant', 'consent.deny', 'act.result', 'consent.waiting', 'proposal.queued'], consentDeadline - Date.now());
         } catch (e) {
           if (isTimeout(e)) {
             throw new DriverError('NO_ANSWER', 'the consent prompt was shown but not answered in time — the proposal is still queued in the extension panel, not denied or forgotten');
           }
           throw e;
+        }
+        if (got.type === 'proposal.queued') {
+          console.error('[queued] user has taken over in the panel — this action is held until they hand back');
+          consentDeadline = Date.now() + 60000;
+          continue;
         }
         if (got.type === 'consent.waiting') {
           console.error(`[waiting] consent prompt open, unanswered for ${Math.round((got.waitedMs || 0) / 1000)}s — waiting for the user`);
@@ -585,6 +599,91 @@ async function main() {
     }
 
     await pair(ws);
+
+    if (CMD === 'plan') {
+      // Propose an ordered plan; the user approves it ONCE in the panel;
+      // the steps then run under the plan — no per-step prompts except
+      // T3 steps, which ask individually (the pump handles that as a
+      // normal consent wait). Stops at the first failed step: later
+      // steps were written against a state that no longer holds.
+      const file = opt('--file', undefined);
+      if (!file) throw new DriverError('USAGE', 'plan requires --file <steps.json>');
+      let spec;
+      try { spec = JSON.parse(readFileSync(file, 'utf8')); }
+      catch (e) { throw new DriverError('USAGE', `cannot read plan file: ${e.message}`); }
+      const rawSteps = Array.isArray(spec) ? spec : spec.steps;
+      const title = Array.isArray(spec) ? 'driver plan' : (spec.title || 'driver plan');
+      if (!Array.isArray(rawSteps) || !rawSteps.length) {
+        throw new DriverError('USAGE', 'plan file must contain a non-empty steps array');
+      }
+      if (rawSteps.length > 20) {
+        throw new DriverError('USAGE', `plan has ${rawSteps.length} steps — the maximum is 20`);
+      }
+      const T2_TYPES = ['listTabs', 'switchTab', 'closeTab', 'closeInactiveTabs', 'openTab', 'pinTab', 'fetch', 'media', 'frameGrab', 'audioCapture'];
+      const wireSteps = rawSteps.map((s, i) => {
+        if (!s || !s.type) throw new DriverError('USAGE', `step ${i + 1} has no type`);
+        return {
+          type: s.type,
+          actionTier: s.tier || (T2_TYPES.includes(s.type) ? 'T2' : 'T1'),
+          site: s.site || '',
+          description: s.description || s.type,
+        };
+      });
+      const planId = `plan-${Date.now()}`;
+      const verdict = await new Promise((resolve, reject) => {
+        const to = setTimeout(() => {
+          ws.off('message', onMsg);
+          reject(new DriverError('PLAN_NO_ANSWER', 'the plan was not answered in time — it is still waiting in the extension panel, not denied or forgotten'));
+        }, 120000);
+        const onMsg = (raw) => {
+          let m;
+          try { m = JSON.parse(String(raw)); } catch { return; }
+          if (!m || m.planId !== planId) return;
+          if (m.type === 'plan.approved' || m.type === 'plan.denied') {
+            clearTimeout(to);
+            ws.off('message', onMsg);
+            resolve(m);
+          }
+        };
+        ws.on('message', onMsg);
+        ws.send(JSON.stringify({ v: 1, type: 'plan.propose', id: planId, plan: { title, steps: wireSteps } }));
+      });
+      if (verdict.type === 'plan.denied') {
+        emitAndExit({ ok: false, error: 'PLAN_DENIED', message: verdict.reason || 'the user denied the plan' }, 1);
+      }
+      console.error(`[plan] approved: ${wireSteps.length} steps on ${(verdict.sites || []).join(', ')}`);
+      const results = [];
+      suppressActPrint = true;
+      try {
+        for (let i = 0; i < rawSteps.length; i++) {
+          const s = rawSteps[i];
+          const w = wireSteps[i];
+          const proposal = {
+            actionTier: w.actionTier,
+            type: w.type,
+            target: { ref: s.ref || null, label: s.label || '' },
+            site: w.site,
+            description: w.description,
+            planId,
+          };
+          if (s.value !== undefined) proposal.value = s.value;
+          if (s.url) proposal.url = s.url;
+          if (typeof s.tabId === 'number') proposal.tabId = s.tabId;
+          if (s.selector) proposal.selector = s.selector;
+          await runAct(ws, proposal, `act-${Date.now()}-p${i + 1}`);
+          const r = lastActResult || { ok: false, detail: 'no result' };
+          results.push({ step: i + 1, type: w.type, ok: !!r.ok, detail: r.detail || '' });
+          console.error(`[plan] step ${i + 1}/${rawSteps.length} ${w.type}: ${r.ok ? 'ok' : 'FAILED — ' + (r.detail || '')}`);
+          if (!r.ok) break;
+        }
+      } finally {
+        suppressActPrint = false;
+      }
+      const completed = results.length === rawSteps.length && results.every((r) => r.ok);
+      console.log(JSON.stringify({ ok: completed, command: 'plan', planId, title, steps: results, completed }, null, 2));
+      if (!completed) process.exitCode = 1;
+      return;
+    }
 
     if (CMD === 'watch') {
       // Stream live media progress (the extension pushes media.progress

@@ -141,6 +141,9 @@ function renderConsentCard(proposal) {
       (proposal.actionTier === "T1" || proposal.actionTier === "T2"
         ? '<button class="btn btn-secondary" data-choice="whitelist">Always allow on this site</button>'
         : '') +
+      (proposal.actionTier === "T1" || proposal.actionTier === "T2"
+        ? '<button class="btn btn-secondary" data-choice="untilLeave">Allow until I leave this site</button>'
+        : '') +
       '<button class="btn btn-secondary" data-choice="session1h">For 1 hour</button>' +
       '<button class="btn btn-secondary" data-choice="session24h">For 1 day</button>' +
       '<button class="btn btn-secondary" data-choice="session1w">For 1 week</button>' +
@@ -151,7 +154,7 @@ function renderConsentCard(proposal) {
       '<input type="datetime-local" class="consent-until" id="until-' + proposal.proposalId + '">' +
       '<button class="btn btn-secondary" data-choice="sessionCustom">Allow until then</button>' +
     "</div>" +
-    '<div class="consent-grant-note">Timed grants cover routine (T1–T2) actions on this site until they lapse. “Always allow on this site” writes a whitelist entry for this action’s tier on this exact domain only — subdomains are separate entries, and you can narrow it per action in the Sites tab. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
+    '<div class="consent-grant-note">Timed grants cover routine (T1–T2) actions on this site until they lapse. “Allow until I leave this site” covers this site in this tab until you navigate away, close the tab, or 15 minutes pass — whichever comes first. “Always allow on this site” writes a whitelist entry for this action’s tier on this exact domain only — subdomains are separate entries, and you can narrow it per action in the Sites tab. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
 
   card.querySelectorAll("button").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -173,6 +176,64 @@ function renderConsentCard(proposal) {
   // "consent.shown" once a prompt is actually on screen — this render is
   // one of the two proofs (the in-page banner is the other).
   api({ kind: "jbb.ui.consentShown", proposalId: proposal.proposalId }).catch(function () {});
+}
+
+// ---------------------------------------------------------------- control: take-over + plans
+function renderControl(s) {
+  var status = el("takeoverStatus"), btn = el("takeoverBtn");
+  if (!status || !btn) return;
+  if (s.takeover) {
+    status.textContent = "🙌 You have control — Muse is paused." +
+      (s.queuedCount ? " " + s.queuedCount + " action" + (s.queuedCount === 1 ? "" : "s") + " queued." : "");
+    btn.textContent = "Hand back to Muse";
+  } else {
+    status.textContent = "Muse is driving.";
+    btn.textContent = "Take over";
+  }
+}
+
+el("takeoverBtn").addEventListener("click", function () {
+  api({ kind: "jbb.ui.getState" }).then(function (s) {
+    var on = !(s && s.takeover);
+    api({ kind: "jbb.ui.setTakeover", on: on }).then(function () {
+      toast(on ? "You have control — Muse is paused" : "Handed back — Muse resumes");
+      refresh();
+    });
+  });
+});
+
+function renderPlanCard(plan) {
+  var area = el("planArea");
+  if (!area || document.getElementById("plan-" + plan.planId)) return;
+  var card = document.createElement("div");
+  card.className = "consent-card";
+  card.id = "plan-" + plan.planId;
+  var stepsHtml = (plan.steps || []).map(function (s, i) {
+    var t3 = s.actionTier === "T3";
+    return '<div class="plan-step">' + (i + 1) + ". " + esc(s.description || s.type) +
+      ' <span class="mini-tag' + (t3 ? " tag-warn" : "") + '">' + esc(s.actionTier || "T1") + (t3 ? " — will ask" : "") + "</span>" +
+      ' <span class="hint-inline">' + esc(hostOf(s.site || "")) + "</span></div>";
+  }).join("");
+  card.innerHTML =
+    '<div class="consent-head"><span class="tier-badge">PLAN</span>' +
+      '<span class="consent-site">' + esc(plan.title || "Plan") + "</span></div>" +
+    '<div class="consent-desc">Approve once and these ' + (plan.steps || []).length +
+      ' steps run without per-step prompts — except T3 steps, which still ask individually.</div>' +
+    '<div class="plan-steps">' + stepsHtml + "</div>" +
+    '<div class="consent-tier-desc">Sites covered: ' + esc((plan.sites || []).join(", ")) +
+      '. The plan ends when its steps run out or after 30 minutes.</div>' +
+    '<div class="consent-actions">' +
+      '<button class="btn btn-primary" data-plan="approve">Approve plan</button>' +
+      '<button class="btn btn-danger" data-plan="deny">Deny</button>' +
+    "</div>";
+  card.querySelectorAll("button").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      api({ kind: "jbb.ui.planResolve", planId: plan.planId,
+            approved: btn.getAttribute("data-plan") === "approve" })
+        .then(function () { card.remove(); });
+    });
+  });
+  area.prepend(card);
 }
 
 // ---------------------------------------------------------------- session grant
@@ -542,6 +603,11 @@ function refresh() {
       : grantCount + " active grant" + (grantCount === 1 ? "" : "s");
     renderAudit(s.audit);
     renderCapture(s);
+    renderControl(s);
+    (s.planPending || []).forEach(renderPlanCard);
+    el("tempGrantLine").textContent = s.tempGrant
+      ? "⏳ Temporary grant: " + s.tempGrant.host + " — until you leave the site (" + fmtRemaining(s.tempGrant.remainingMs) + " at most)"
+      : "";
     renderFeed(s.audit);
     renderSummary(s.lastSummary);
     renderTabs(s.tabs);
@@ -612,6 +678,19 @@ chrome.runtime.onMessage.addListener(function (msg) {
     case "jbb.ui.captureChanged":
       refresh();
       break;
+    case "jbb.ui.takeoverChanged":
+    case "jbb.ui.tempChanged":
+      refresh();
+      break;
+    case "jbb.ui.planRequest":
+      renderPlanCard(msg.plan);
+      toast("Plan approval needed — see top of panel");
+      break;
+    case "jbb.ui.planResolved": {
+      var pc = document.getElementById("plan-" + msg.planId);
+      if (pc) pc.remove();
+      break;
+    }
     case "jbb.ui.toast":
       toast(msg.text);
       break;

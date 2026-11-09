@@ -56,6 +56,9 @@
 <!-- Consent requests always surface at the top, whatever tab is open -->
 <div id="consentArea"></div>
 
+<!-- Plan approval requests surface alongside consent -->
+<div id="planArea"></div>
+
 <!-- Active time-boxed session grant, with one-click revoke -->
 <div id="sessionBar" class="session-bar hidden"></div>
 
@@ -81,9 +84,19 @@
     </div>
 
     <div class="card">
-      <h2>Permission mode</h2>
-      <p class="hint">Mirrors your Muse permission settings. This is the language the bridge speaks.</p>
+      <h2>Permission level</h2>
+      <p class="hint">One preset instead of a checkbox matrix — it takes effect the moment you pick it. The per-site matrix in the Sites tab still applies underneath (Balanced and Light honour your grants; Strict ignores them while it's on).</p>
       <div id="modeList" class="mode-list"></div>
+    </div>
+
+    <div class="card">
+      <h2>Control</h2>
+      <p id="takeoverStatus" class="status-line">Muse is driving.</p>
+      <div class="row">
+        <button id="takeoverBtn" class="btn btn-secondary">Take over</button>
+      </div>
+      <p class="hint">Take over to drive the tab yourself: Muse pauses, and anything it proposes meanwhile queues — nothing is lost and nothing runs. Hand back and the queue resumes through the normal consent gate, in order.</p>
+      <p id="tempGrantLine" class="hint"></p>
     </div>
 
     <div class="card">

@@ -34,6 +34,8 @@ var K = {
   PENDING: "jbb.pending",      // { proposalId: { proposal, createdAt } } — survives worker restarts
   RESULTS: "jbb.results",      // { proposalId: { ok, detail, at } } — executed acts, for id dedupe
   SESSION: "jbb.session",      // { site, grantedAt, expiresAt, label, epoch } — time-boxed grant, survives restarts
+  TEMP: "jbb.tempGrant",       // { host, tabId, grantedAt, expiresAt, epoch } — "allow until I leave this site"
+  HOLD: "jbb.holdQueue",       // proposals held during take-over, so a worker restart can't lose them
   EPOCH: "jbb.keyEpoch",       // increments on every key rotation; grants carry their epoch
   KEY_ACKED: "jbb.keyAcked",   // true once the user confirmed they saved the key (panel-owned, mirrored here for rotation)
   SIGNIN_ACK: "jbb.signInAck"  // email the user acknowledged for Chrome sign-in (hard block until acked)
@@ -54,7 +56,7 @@ var state = {
   relayDownSince: null,       // when transport was first seen down (watchdog)
   offscreenSeenAt: 0,         // last sign of life from the offscreen document
   relayUrl: "",
-  mode: "ask-some",            // readonly | ask-some | always-ask
+  mode: "balanced",            // readonly | light | balanced | strict (the permission level)
   sites: {},
   whitelist: {},               // domain -> entry (see grantWhitelist); exact-domain, tier-scoped, epoch-bound
   grantsPaused: false,         // master switch: while true, NO grant auto-allows (whitelist or session)
@@ -73,6 +75,11 @@ var state = {
   raiseCount: {},              // proposalId -> number of toast raises (escalation cap)
   consentBanners: {},          // proposalId -> tabId (in-page banner)
   session: null,               // time-boxed grant: { site, grantedAt, expiresAt, label }
+  tempGrant: null,             // "allow until I leave this site": { host, tabId, grantedAt, expiresAt, epoch }
+  takeover: false,             // user is driving: proposals HOLD instead of prompting/executing
+  holdQueue: [],               // [{ proposal, source, receivedAt }] held during take-over
+  plans: new Map(),            // planId -> approved plan { sites, stepCount, usedSteps, expiresAt, title }
+  planPending: new Map(),      // planId -> proposed plan awaiting the user's verdict
   capture: null,               // live audio capture: { tabId, host, captureId, startedAt }
   captureWaiter: null,         // pending capture-start handshake with the offscreen doc
   capturePermission: false,    // tabCapture optional permission granted by the user?
@@ -148,11 +155,19 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
 });
 
 function loadPersisted() {
-  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION, K.WHITELIST, K.EPOCH, K.SUMMARY], function (res) {
+  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION, K.WHITELIST, K.EPOCH, K.SUMMARY, K.TEMP, K.HOLD], function (res) {
     var s = res[K.SETTINGS] || {};
-    state.mode = s.mode || "ask-some";
+    // Level migration: the old ask-some IS Balanced; always-ask IS Strict.
+    state.mode = s.mode === "ask-some" ? "balanced"
+               : s.mode === "always-ask" ? "strict"
+               : (s.mode || "balanced");
     state.soundOn = (typeof s.soundOn === "boolean") ? s.soundOn : true;
     state.relayUrl = s.relayUrl || "";
+    state.takeover = !!s.takeover;
+    state.holdQueue = Array.isArray(res[K.HOLD]) ? res[K.HOLD] : [];
+    var tmp = res[K.TEMP];
+    state.tempGrant = (tmp && tmp.expiresAt > Date.now()) ? tmp : null;
+    if (tmp && !state.tempGrant) chrome.storage.local.remove([K.TEMP]);
     state.sites = res[K.SITES] || {};
     state.grantsPaused = !!s.grantsPaused;
     state.whitelist = res[K.WHITELIST] || {};
@@ -189,7 +204,8 @@ function loadPersisted() {
 function saveSettings() {
   chrome.storage.local.set({
     [K.SETTINGS]: { mode: state.mode, relayUrl: state.relayUrl, killed: state.sessionKilled,
-                    soundOn: state.soundOn, grantsPaused: state.grantsPaused },
+                    soundOn: state.soundOn, grantsPaused: state.grantsPaused,
+                    takeover: state.takeover },
     [K.SITES]: state.sites
   });
 }
@@ -402,6 +418,37 @@ function revokeSession() {
   expireSession("revoked by user");
 }
 
+// ------------------------------------------------- temporary grant
+// "Allow until I leave this site": the middle ground between asking
+// every time and a permanent grant. Covers T1/T2 on ONE host, from the
+// tab it was granted in, and dies three ways — the tab navigates to a
+// different host, the tab closes, or TEMP_GRANT_MS passes — whichever
+// comes first. It says so when created (consent-card copy + audit).
+var TEMP_GRANT_MS = 15 * 60000;
+
+function saveTemp() {
+  if (state.tempGrant) chrome.storage.local.set({ [K.TEMP]: state.tempGrant });
+  else chrome.storage.local.remove([K.TEMP]);
+}
+
+function expireTemp(reason) {
+  var t = state.tempGrant;
+  if (!t) return;
+  state.tempGrant = null;
+  saveTemp();
+  audit({ site: t.host, action: "temporary grant", tier: "T0",
+          result: "ended", detail: "temporary grant for " + t.host + " ended: " + reason });
+  pushToPanel({ kind: "jbb.ui.tempChanged" });
+}
+
+function tempAllows(proposal) {
+  var t = state.tempGrant;
+  if (!t) return false;
+  if (t.epoch != null && t.epoch !== state.keyEpoch) { expireTemp("key rotated"); return false; }
+  if (Date.now() >= t.expiresAt) { expireTemp("15 minutes passed"); return false; }
+  return hostOf(proposal.site || "") === t.host;
+}
+
 // ---------------------------------------------------------------- key rotation
 // Rotating the connector key must actually bite — previously the key lived
 // in storage while grants lived elsewhere, so "rotate after the session"
@@ -425,7 +472,9 @@ function rotateConnectorKey(done) {
 
     var grantsCleared = 0;
     if (state.session) { state.session = null; grantsCleared++; }
-    chrome.storage.local.remove([K.SESSION]);
+    if (state.tempGrant) { state.tempGrant = null; grantsCleared++; }
+    state.plans.clear();
+    chrome.storage.local.remove([K.SESSION, K.TEMP]);
     Object.keys(state.sites).forEach(function (h) {
       if (state.sites[h] === "allow") { delete state.sites[h]; grantsCleared++; }
     });
@@ -601,6 +650,13 @@ function markConsentShown(proposalId, via) {
 
 function consentHeartbeatSweep() {
   var now = Date.now();
+  // Held proposals get a queued heartbeat so the driver keeps waiting
+  // instead of timing out while the user drives.
+  state.holdQueue.forEach(function (h) {
+    sendToRelay(JBB.Message.proposalQueued(h.proposal.proposalId));
+  });
+  // A lapsed temporary grant announces itself instead of vanishing silently.
+  if (state.tempGrant && now >= state.tempGrant.expiresAt) expireTemp("15 minutes passed");
   state.pending.forEach(function (entry, proposalId) {
     if (!entry.shown) return;
     var waited = now - entry.createdAt;
@@ -1123,6 +1179,7 @@ function onRelayState(connected) {
   if (was !== connected) pushToPanel({ kind: "jbb.ui.status", connected: connected });
   // A capture whose driver went away has no listener left — stop it.
   if (!connected && state.capture) stopCapture("driver disconnected");
+  if (!connected) dropHold("the driver disconnected");
 }
 
 // Watchdog (keepalive alarm): if the transport reports down — or goes
@@ -1290,9 +1347,20 @@ function decideAction(proposal) {
   if (proposal._forceAsk) {
     return { decision: "ask", reason: "closing the tab you're looking at always asks" };
   }
-  // 6. "Always ask" mode: everything asks.
-  if (state.mode === "always-ask") {
-    return { decision: "ask" };
+  // 6. Permission LEVEL (the preset that replaced the old ask-some /
+  // always-ask pair; ask-some is read as Balanced, always-ask as Strict):
+  //  - Strict: everything asks. decideAction returns here, so the
+  //    whitelist below is never consulted, and proceedWithVerdict skips
+  //    the session/temporary layers too. Approved plans still run —
+  //    the plan approval WAS the ask.
+  //  - Light: routine (T1) and standard (T2) actions auto-allow on any
+  //    site. T3 already asked at step 5; blocked sites denied at step 3.
+  //    The grants master-pause still forces asks — pause means pause.
+  if (state.mode === "strict" || state.mode === "always-ask") {
+    return { decision: "ask", reason: "Strict level: every action asks" };
+  }
+  if (state.mode === "light" && !state.grantsPaused) {
+    return { decision: "allow", via: "level", reason: "Light level: T1/T2 auto-allowed (T3 still asks)" };
   }
   // 7. "Ask for some actions": a whitelist entry for this EXACT domain
   // covering this tier + action type acts freely. T3 already asked at
@@ -1385,6 +1453,9 @@ function handleRelayMessage(raw) {
         handleProposal(msg.proposal, "relay");
       }
       break;
+    case "plan.propose":
+      handlePlanPropose(msg);
+      break;
     case "observe.request": {
       var obsId = msg.id;
       observeActiveTab(false, { textOffset: msg.textOffset }).then(
@@ -1409,6 +1480,8 @@ function handleRelayMessage(raw) {
         p.resolve({ choice: "deny", reason: abortReason });
       });
       state.pending.clear();
+      flushHold("session ended while this action was queued during take-over");
+      endPlans("session aborted by peer");
       audit({ site: "-", action: "session abort", tier: "T0",
               result: "ended", detail: abortReason + " (remote; local kill switch untouched)" });
       buildSessionSummary();
@@ -1448,12 +1521,34 @@ function handleProposal(proposal, source) {
     }
     return;
   }
+  // A duplicate of a proposal HELD by take-over: still held, still one copy.
+  if (state.holdQueue.some(function (h) { return h.proposal.proposalId === proposal.proposalId; })) {
+    sendToRelay(JBB.Message.proposalReceived(proposal.proposalId));
+    sendToRelay(JBB.Message.proposalQueued(proposal.proposalId));
+    return;
+  }
 
   // Lifecycle ack: the proposal is in the gate now. Sent before the verdict
   // so the driver can distinguish "never arrived" (PEER_DOWN) from what
   // happens next.
   sendToRelay(JBB.Message.proposalReceived(proposal.proposalId));
   proposal.source = source;
+
+  // TAKE-OVER: while the user is driving, proposals HOLD — they do not
+  // prompt, do not execute, and do not die. They queue (persisted, so a
+  // worker restart can't lose them) and the driver gets queued
+  // heartbeats; hand-back runs them through the normal gate in order.
+  if (state.takeover) {
+    state.holdQueue.push({ proposal: proposal, source: source, receivedAt: Date.now() });
+    saveHold();
+    sendToRelay(JBB.Message.proposalQueued(proposal.proposalId));
+    pushToPanel({ kind: "jbb.ui.takeoverChanged" });
+    audit({ site: proposal.site || "-", action: proposal.description || proposal.type,
+            tier: proposal.actionTier, result: "queued",
+            detail: "queued during take-over — runs when you hand back",
+            type: proposal.type, proposalId: proposal.proposalId, via: "takeover" });
+    return;
+  }
 
   // LOCAL ENFORCEMENT: the gate runs before anything else.
   // Snapshot versioning: an act built against a snapshot whose version
@@ -1495,19 +1590,31 @@ function handleProposal(proposal, source) {
 function proceedWithVerdict(proposal) {
   var verdict = decideAction(proposal);
 
-  // Session grants layer on top of "ask": a live time-boxed grant auto-allows
-  // T1/T2 on its site. T3 is NEVER covered — sensitive actions always ask.
-  // Neither is a _forceAsk action (closing the tab the user is looking
-  // at): decideAction asks, and no grant layer may turn that into allow.
-  var viaSession = verdict.decision === "ask" &&
-                   !proposal._forceAsk &&
-                   !state.grantsPaused &&
-                   proposal.actionTier !== "T3" &&
-                   sessionAllows(proposal);
+  // Grant layers on top of "ask". None of them EVER covers T3 or a
+  // _forceAsk action, all of them respect the master pause, and Strict
+  // level switches the grant layers (session/temporary) off entirely.
+  // An APPROVED PLAN is the one layer Strict keeps: the user approved
+  // those exact steps, which is a stronger consent than a grant.
+  var strictMode = state.mode === "strict" || state.mode === "always-ask";
+  var layerBase = verdict.decision === "ask" &&
+                  !proposal._forceAsk &&
+                  !state.grantsPaused &&
+                  proposal.actionTier !== "T3";
+  var plan = proposal.planId ? state.plans.get(proposal.planId) : null;
+  if (plan && Date.now() >= plan.expiresAt) { state.plans.delete(proposal.planId); plan = null; }
+  var viaPlan = layerBase && !!plan &&
+                plan.usedSteps < plan.stepCount &&
+                plan.sites.indexOf(hostOf(proposal.site || "")) >= 0;
+  var viaTemp = layerBase && !strictMode && tempAllows(proposal);
+  var viaSession = layerBase && !strictMode && sessionAllows(proposal);
+  var viaGrant = viaPlan || viaTemp || viaSession;
 
   // Remember HOW this action was (or will be) authorized — the audit
   // feed and the session summary speak in these terms.
   proposal._via = verdict.via === "whitelist" ? "whitelist"
+    : verdict.via === "level" ? "level"
+    : viaPlan ? "plan"
+    : viaTemp ? "temp"
     : viaSession ? "session"
     : verdict.decision === "allow" ? "auto"
     : verdict.decision === "deny" ? "blocked" : "consent";
@@ -1517,8 +1624,10 @@ function proceedWithVerdict(proposal) {
     action: proposal.description || proposal.type,
     tier: proposal.actionTier || "?",
     result: verdict.decision === "deny" ? "denied" :
-            (verdict.decision === "allow" || viaSession) ? "allowed" : "awaiting consent",
-    detail: viaSession ? "session grant (" + sessionRemaining() + " left)" : (verdict.reason || null),
+            (verdict.decision === "allow" || viaGrant) ? "allowed" : "awaiting consent",
+    detail: viaPlan ? "approved plan “" + plan.title + "” (step " + (plan.usedSteps + 1) + " of " + plan.stepCount + ")"
+      : viaTemp ? "temporary grant for " + state.tempGrant.host + " (until you leave the site)"
+      : viaSession ? "session grant (" + sessionRemaining() + " left)" : (verdict.reason || null),
     type: proposal.type, proposalId: proposal.proposalId, via: proposal._via
   });
 
@@ -1527,7 +1636,7 @@ function proceedWithVerdict(proposal) {
     sendToRelay(JBB.Message.actResult(proposal.proposalId, false, verdict.reason));
     return;
   }
-  if (verdict.decision === "allow" || viaSession) {
+  if (verdict.decision === "allow" || viaGrant) {
     // Auto-allowed (whitelist or session grant): the driver still needs
     // the verdict — otherwise it waits for a consent message that never
     // comes. Whitelist hits stamp lastUsedAt so stale entries are visible.
@@ -1539,7 +1648,16 @@ function proceedWithVerdict(proposal) {
         saveWhitelist();
       }
     }
-    var autoScope = viaSession ? "session" : (verdict.via === "whitelist" ? "site" : "once");
+    if (viaPlan) {
+      plan.usedSteps++;
+      proposal._planStep = plan.usedSteps;
+      if (plan.usedSteps >= plan.stepCount) {
+        state.plans.delete(proposal.planId);
+        audit({ site: proposal.site || "-", action: "plan completed", tier: "T0",
+                result: "ended", detail: "plan “" + plan.title + "” ran all " + plan.stepCount + " approved steps" });
+      }
+    }
+    var autoScope = viaPlan ? "plan" : viaTemp ? "temp" : viaSession ? "session" : (verdict.via === "whitelist" ? "site" : "once");
     sendToRelay(JBB.Message.consentGrant(proposal.proposalId, autoScope));
     executeProposal(proposal);
     return;
@@ -1560,7 +1678,7 @@ function resolveConsent(proposal, answer) {
   // SECURITY (enemy audit round 2): fail closed on unknown choice values.
   // Anything that isn't an explicit approval becomes a denial — never execute
   // on garbage input.
-  var VALID_CHOICES = { "once": 1, "site": 1, "whitelist": 1, "session1h": 1, "session24h": 1, "session1w": 1, "sessionCustom": 1, "deny": 1 };
+  var VALID_CHOICES = { "once": 1, "site": 1, "whitelist": 1, "session1h": 1, "session24h": 1, "session1w": 1, "sessionCustom": 1, "untilLeave": 1, "deny": 1 };
   if (!answer || !VALID_CHOICES[answer.choice]) {
     answer = { choice: "deny", reason: "invalid consent choice" };
   }
@@ -1592,6 +1710,37 @@ function resolveConsent(proposal, answer) {
       // Request host permission on demand — the trust story in action.
       chrome.permissions.request({ origins: ["https://" + host + "/*", "http://" + host + "/*"] })
         .catch(function () {});
+    }
+  }
+
+  // "Allow until I leave this site": a temporary grant for this host,
+  // in this tab. It expires on navigation away, tab close, or 15
+  // minutes — and the audit + panel say exactly that when it's created.
+  if (answer.choice === "untilLeave") {
+    var thost = hostOf(proposal.site || "");
+    if (thost) {
+      state.tempGrant = {
+        host: thost, tabId: null,
+        grantedAt: Date.now(),
+        expiresAt: Date.now() + TEMP_GRANT_MS,
+        epoch: state.keyEpoch
+      };
+      saveTemp();
+      // Learn which tab the grant lives in so leaving THAT tab's site
+      // is what expires it.
+      try {
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(function (tabs) {
+          if (state.tempGrant && tabs && tabs[0]) state.tempGrant.tabId = tabs[0].id;
+        }, function () {});
+      } catch (e) { /* tab binding is best-effort; the time cap still applies */ }
+      audit({
+        site: proposal.site || "-",
+        action: "temporary grant",
+        tier: proposal.actionTier,
+        result: "allowed",
+        detail: "granted for " + thost + " until you leave this site or 15 minutes pass, whichever comes first (T3 still asks)"
+      });
+      pushToPanel({ kind: "jbb.ui.tempChanged" });
     }
   }
 
@@ -1643,6 +1792,140 @@ function resolveConsent(proposal, answer) {
   pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: proposal.proposalId, choice: answer.choice });
   playVerdictTone(true);
   executeProposal(proposal);
+}
+
+// ------------------------------------------------------------ take-over
+// The user drives; the agent waits. Proposals arriving during take-over
+// are held in a persisted queue — never prompted, never executed, never
+// dropped — and hand-back replays them through the normal gate in the
+// order they arrived. If the session ends while proposals are held,
+// the driver is told plainly instead of hanging.
+function saveHold() {
+  chrome.storage.local.set({ [K.HOLD]: state.holdQueue });
+}
+
+function setTakeover(on) {
+  state.takeover = !!on;
+  saveSettings();
+  audit({ site: "-", action: on ? "take-over" : "hand back", tier: "T0",
+          result: "allowed",
+          detail: on ? "user took over — agent paused, proposals will queue"
+                     : "user handed back — resuming the agent" });
+  pushToPanel({ kind: "jbb.ui.takeoverChanged" });
+  if (!on && state.holdQueue.length) {
+    var q = state.holdQueue;
+    state.holdQueue = [];
+    saveHold();
+    q.forEach(function (h) { handleProposal(h.proposal, h.source || "relay"); });
+  }
+}
+
+// Session over: held proposals get a plain failure, not silence.
+function flushHold(reason) {
+  if (!state.holdQueue.length) return;
+  var q = state.holdQueue;
+  state.holdQueue = [];
+  saveHold();
+  q.forEach(function (h) {
+    sendToRelay(JBB.Message.actResult(h.proposal.proposalId, false, reason));
+  });
+  pushToPanel({ kind: "jbb.ui.takeoverChanged" });
+}
+
+// Driver gone: its proposals are meaningless to a future session —
+// drop them (audited), send nothing into a dead room.
+function dropHold(reason) {
+  if (!state.holdQueue.length) return;
+  var n = state.holdQueue.length;
+  state.holdQueue = [];
+  saveHold();
+  audit({ site: "-", action: "take-over queue", tier: "T0", result: "ended",
+          detail: n + " queued proposal(s) dropped: " + reason });
+  pushToPanel({ kind: "jbb.ui.takeoverChanged" });
+}
+
+// ------------------------------------------------------------ plans
+// The driver proposes an ordered plan; the user approves it ONCE in the
+// panel; its steps then run under the plan (no per-step prompts) —
+// except T3 steps, which still ask individually, always. A plan is
+// bounded: at most PLAN_MAX_STEPS steps, only the sites listed on the
+// approval card, at most PLAN_TTL_MS of validity, and it ends when its
+// steps run out. Every step names its site — a step that wanders to an
+// unlisted site asks like any ungranted action.
+var PLAN_MAX_STEPS = 20;
+var PLAN_TTL_MS = 30 * 60000;
+
+function denyPlan(planId, reason) {
+  sendToRelay(JBB.Message.planDenied(planId, reason));
+  audit({ site: "-", action: "plan proposed", tier: "T0", result: "denied", detail: reason });
+}
+
+function handlePlanPropose(msg) {
+  var planId = msg.id || nextProposalId();
+  var plan = msg.plan || {};
+  var steps = Array.isArray(plan.steps) ? plan.steps : [];
+  if (state.sessionKilled) return denyPlan(planId, "session was killed");
+  if (!steps.length) return denyPlan(planId, "plan has no steps");
+  if (steps.length > PLAN_MAX_STEPS) {
+    return denyPlan(planId, "plan has " + steps.length + " steps — the maximum is " + PLAN_MAX_STEPS);
+  }
+  var sites = {};
+  for (var i = 0; i < steps.length; i++) {
+    var s = steps[i];
+    if (!s || !s.type) return denyPlan(planId, "step " + (i + 1) + " has no action type");
+    if (s.actionTier && !JBB.isValidActionTier(s.actionTier)) {
+      return denyPlan(planId, "step " + (i + 1) + " has an invalid action tier");
+    }
+    var h = hostOf(s.site || "");
+    if (!h) return denyPlan(planId, "step " + (i + 1) + " doesn't name its site — plan steps must name the site they act on");
+    sites[h] = 1;
+  }
+  var record = {
+    planId: planId,
+    title: String(plan.title || "Untitled plan").slice(0, 120),
+    steps: steps,
+    sites: Object.keys(sites),
+    receivedAt: Date.now()
+  };
+  state.planPending.set(planId, record);
+  sendToRelay(JBB.Message.planReceived(planId));
+  pushToPanel({ kind: "jbb.ui.planRequest", plan: record });
+  sendPlayTone("waiting");
+  audit({ site: "-", action: "plan proposed", tier: "T0", result: "awaiting consent",
+          detail: "“" + record.title + "” — " + steps.length + " steps on " + record.sites.join(", ") });
+}
+
+function resolvePlan(planId, approved) {
+  var record = state.planPending.get(planId);
+  if (!record) return;
+  state.planPending.delete(planId);
+  pushToPanel({ kind: "jbb.ui.planResolved", planId: planId, approved: !!approved });
+  if (!approved) {
+    sendToRelay(JBB.Message.planDenied(planId, "user denied the plan"));
+    audit({ site: "-", action: "plan denied", tier: "T0", result: "denied",
+            detail: "“" + record.title + "” denied by user — no step ran" });
+    playVerdictTone(false);
+    return;
+  }
+  var plan = {
+    planId: planId, title: record.title, sites: record.sites,
+    stepCount: record.steps.length, usedSteps: 0,
+    approvedAt: Date.now(), expiresAt: Date.now() + PLAN_TTL_MS
+  };
+  state.plans.set(planId, plan);
+  sendToRelay(JBB.Message.planApproved(planId, { sites: plan.sites, stepCount: plan.stepCount, expiresAt: plan.expiresAt }));
+  audit({ site: "-", action: "plan approved", tier: "T0", result: "allowed",
+          detail: "“" + plan.title + "” — " + plan.stepCount + " steps on " + plan.sites.join(", ") +
+                  "; steps run without prompts except T3, which still asks" });
+  playVerdictTone(true);
+}
+
+function endPlans(reason) {
+  state.planPending.forEach(function (record, planId) {
+    sendToRelay(JBB.Message.planDenied(planId, reason));
+  });
+  state.planPending.clear();
+  state.plans.clear();
 }
 
 // ------------------------------------------------------------ tab actions
@@ -1711,6 +1994,21 @@ if (chrome.tabs) {
   if (chrome.tabs.onRemoved && chrome.tabs.onRemoved.addListener) {
     chrome.tabs.onRemoved.addListener(function (tabId) {
       if (state.capture && tabId === state.capture.tabId) stopCapture("the captured tab was closed");
+    });
+  }
+  // A temporary grant lives in ONE tab: leaving that tab's site (or
+  // closing the tab) ends it — that is the whole point of the grant.
+  if (chrome.tabs.onUpdated && chrome.tabs.onUpdated.addListener) {
+    chrome.tabs.onUpdated.addListener(function (tabId, changeInfo) {
+      if (!state.tempGrant || tabId !== state.tempGrant.tabId) return;
+      if (changeInfo.url && hostOf(changeInfo.url) !== state.tempGrant.host) {
+        expireTemp("you left " + state.tempGrant.host);
+      }
+    });
+  }
+  if (chrome.tabs.onRemoved && chrome.tabs.onRemoved.addListener) {
+    chrome.tabs.onRemoved.addListener(function (tabId) {
+      if (state.tempGrant && tabId === state.tempGrant.tabId) expireTemp("the tab was closed");
     });
   }
 }
@@ -2131,6 +2429,8 @@ function killSession(reason) {
     p.resolve({ choice: "deny", reason: "session killed" });
   });
   state.pending.clear();
+  flushHold("session killed while this action was queued during take-over");
+  endPlans("session killed");
   sendToRelay(JBB.Message.sessionAbort(reason || "user kill switch"));
   disconnectRelay("killed");
   state.relayUrl = ""; // require explicit reconnect
@@ -2269,6 +2569,13 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           capture: state.capture ? { active: true, host: state.capture.host, tabId: state.capture.tabId,
                                      startedAt: state.capture.startedAt } : { active: false },
           capturePermission: !!state.capturePermission,
+          takeover: !!state.takeover,
+          queuedCount: state.holdQueue.length,
+          tempGrant: state.tempGrant ? { host: state.tempGrant.host,
+                            remainingMs: Math.max(0, state.tempGrant.expiresAt - Date.now()) } : null,
+          planPending: Array.from(state.planPending.values()).map(function (p) {
+            return { planId: p.planId, title: p.title, sites: p.sites, steps: p.steps };
+          }),
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
           session: sess ? { site: sess.site, label: sess.label,
@@ -2343,6 +2650,16 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         done({ ok: true, granted: granted });
       });
       return true;
+
+    case "jbb.ui.setTakeover":
+      setTakeover(!!msg.on);
+      done({ takeover: state.takeover, queuedCount: state.holdQueue.length });
+      break;
+
+    case "jbb.ui.planResolve":
+      resolvePlan(msg.planId, !!msg.approved);
+      done({ ok: true });
+      break;
 
     case "jbb.ui.endSession":
       // The user's deliberate end: summarize first, then disconnect.

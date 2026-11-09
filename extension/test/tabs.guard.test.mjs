@@ -33,7 +33,7 @@ function check(name, cond) {
 check("tab context resolves before the verdict, duplicates gated meanwhile",
   bg.includes("resolveTabContext(proposal)") && bg.includes("state.gating.add(proposal.proposalId)") &&
   bg.includes("proceedWithVerdict(proposal)"));
-const decideBody = bg.slice(bg.indexOf("function decideAction"), bg.indexOf("function decideAction") + 2600);
+const decideBody = bg.slice(bg.indexOf("function decideAction"), bg.indexOf("function decideAction") + 3600);
 check("closing the viewed tab force-asks ahead of the whitelist step (inside decideAction)",
   decideBody.includes("if (proposal._forceAsk)") &&
   decideBody.indexOf('proposal.actionTier === "T3"') < decideBody.indexOf("if (proposal._forceAsk)") &&

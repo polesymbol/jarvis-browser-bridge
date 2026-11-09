@@ -41,8 +41,9 @@
   // Settings > Permissions language ("Ask for some actions" / "Always ask").
   var MODES = {
     "readonly":  { label: "Readonly", desc: "Observe only. The assistant cannot act." },
-    "ask-some":  { label: "Ask for some actions", desc: "Acts within your grants. Sensitive actions always ask." },
-    "always-ask":{ label: "Always ask", desc: "Every action asks for approval first." }
+    "light":     { label: "Light", desc: "Muse acts freely on routine (T1) and standard (T2) actions on any site. Critical T3 actions still ask every time. Best for a task you're watching closely." },
+    "balanced":  { label: "Balanced (recommended)", desc: "Muse asks before standard (T2) actions unless you've granted the site — whitelist, session, temporary, or an approved plan. Critical T3 actions always ask." },
+    "strict":    { label: "Strict", desc: "Muse asks before every action. Saved grants (whitelist, session, temporary) are ignored while Strict is on; approved plans still run their steps, and T3 always asks." }
   };
 
   function base(type, fields) {
@@ -126,6 +127,16 @@
       // extension → driver. Transits the relay; stored nowhere.
       return base("audio.chunk", fields || {});
     },
+
+    proposalQueued: function (proposalId) {
+      // The user has taken over: this proposal is HELD, not refused.
+      // The driver waits on queued heartbeats until hand-back.
+      return base("proposal.queued", { proposalId: proposalId });
+    },
+
+    planReceived: function (planId) { return base("plan.received", { planId: planId }); },
+    planApproved: function (planId, fields) { return base("plan.approved", Object.assign({ planId: planId }, fields || {})); },
+    planDenied: function (planId, reason) { return base("plan.denied", { planId: planId, reason: reason || "plan denied" }); },
 
     mediaProgress: function (fields) {
       // Live media progress, extension → driver. Transits the relay;
@@ -213,6 +224,9 @@
         return { key: "auto-whitelist", label: "Auto-allowed by whitelist: " + (m ? m[1] : entry.site || "") };
       }
       if (entry.via === "session") return { key: "auto-session", label: "Auto-allowed by session grant" };
+      if (entry.via === "plan") return { key: "auto-plan", label: "Auto-allowed by approved plan" };
+      if (entry.via === "temp") return { key: "auto-temp", label: "Auto-allowed by temporary grant" };
+      if (entry.via === "level") return { key: "auto-level", label: "Auto-allowed by Light level" };
       if (entry.via === "consent") return { key: "asked-granted", label: "Asked — you approved" };
       return { key: "allowed", label: "Allowed" };
     }
