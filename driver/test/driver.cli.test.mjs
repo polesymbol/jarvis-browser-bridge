@@ -90,6 +90,7 @@ function fakeLifecycleExt(port, key, mode) {
       if (m.type === "pair.confirm") { resolve(state); return; }
       if (m.type !== "act.propose") return;
       state.proposeCount++;
+      state.lastProposal = m.proposal;
       const pid = m.id;
       const send = (o) => { try { ws.send(JSON.stringify({ v: 1, ...o })); } catch {} };
       const after = (ms, fn) => { state.timers.push(setTimeout(fn, ms)); };
@@ -107,6 +108,12 @@ function fakeLifecycleExt(port, key, mode) {
       } else if (mode === "noresult") {
         after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
         // act.result never arrives
+      } else if (mode === "stale") {
+        // The background refuses BEFORE consent: received, then an
+        // act.result carrying STALE_SNAPSHOT + the current version.
+        after(40, () => send({ type: "act.result", proposalId: pid, ok: false,
+          error: "STALE_SNAPSHOT", snapshotVersion: 9,
+          detail: "stale snapshot: act built against v3, current snapshot is v9 — re-observe and rebuild the act" }));
       } else if (mode === "revoke") {
         // The user rotates the key mid-consent: the extension revokes its
         // key at the relay, which notifies the driver and tears the room
@@ -305,6 +312,24 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
     r2.code !== 0 && !!j2 && j2.ok === false && j2.error === "KEY_ROTATED" &&
     j2.peerConnected === "no" && j2.workerAlive === "no",
     "stdout=" + r2.out);
+}
+{
+  const key = "stale-key-0123456789abcdef";
+  const e = await fakeLifecycleExt(L.port, key, "stale");
+  const r = await runDriver(["--relay", lArg, "--key", key, "act", "--type", "click",
+    "--target", "Buy\u00A0now\u200B", "--tier", "T1", "--snapshot-version", "3"], FAST);
+  const j = parseStdout(r.out);
+  check("stale act -> STALE_SNAPSHOT on stdout with the current version, non-zero exit",
+    r.code !== 0 && !!j && j.ok === false && j.error === "STALE_SNAPSHOT" &&
+    j.snapshotVersion === 9 && /stale snapshot/.test(j.message || ""),
+    "stdout=" + r.out);
+  check("--snapshot-version reaches the proposal",
+    !!e.lastProposal && e.lastProposal.snapshotVersion === 3,
+    "proposal=" + JSON.stringify(e.lastProposal));
+  check("--target is normalized (NBSP + zero-width stripped) before it reaches the proposal",
+    !!e.lastProposal && e.lastProposal.target.label === "Buy now",
+    "proposal=" + JSON.stringify(e.lastProposal));
+  stopExt(e);
 }
 L.httpServer.close();
 

@@ -112,8 +112,11 @@
     consentDeny: function (proposalId, reason) {
       return base("consent.deny", { proposalId: proposalId, reason: reason || null });
     },
-    actResult: function (proposalId, ok, detail) {
-      return base("act.result", { proposalId: proposalId, ok: !!ok, detail: detail || null });
+    actResult: function (proposalId, ok, detail, error, snapshotVersion) {
+      var m = base("act.result", { proposalId: proposalId, ok: !!ok, detail: detail || null });
+      if (error) m.error = error;
+      if (typeof snapshotVersion === "number") m.snapshotVersion = snapshotVersion;
+      return m;
     },
 
     sessionAbort: function (reason) {
@@ -130,11 +133,27 @@
     return t === "T0" || t === "T1" || t === "T2" || t === "T3";
   }
 
+  /**
+   * Canonical label normalization: label matching is exact AFTER this
+   * runs on both sides. Zero-width characters (ZWSP/ZWNJ/ZWJ/BOM) are
+   * stripped, non-breaking spaces (NBSP, narrow NBSP) become plain
+   * spaces, whitespace runs collapse, ends trim. content.js and driver.js
+   * carry byte-equivalent local copies — keep all three in sync.
+   */
+  function normalizeLabel(s) {
+    return String(s == null ? "" : s)
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/[\u00A0\u202F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   root.JBB = {
     PROTOCOL_VERSION: PROTOCOL_VERSION,
     ACTION_TIERS: ACTION_TIERS,
     MODES: MODES,
     Message: Message,
-    isValidActionTier: isValidActionTier
+    isValidActionTier: isValidActionTier,
+    normalizeLabel: normalizeLabel
   };
 })(typeof self !== "undefined" ? self : this);

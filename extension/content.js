@@ -19,7 +19,7 @@
 (function () {
   "use strict";
 
-  var REF_ATTR = "data-jbb-ref";
+  var ID_ATTR = "data-jbb-id";
   var MAX_ELEMENTS = 200;
   // Per-frame readable-text budget. The background merges frames under a
   // total cap so a text-heavy LMS page stays well below the relay's 1 MB
@@ -58,21 +58,72 @@
     return style.visibility !== "hidden" && style.display !== "none";
   }
 
+  /**
+   * Label normalization — matching is exact AFTER this runs, on both
+   * sides. Zero-width characters are stripped and non-breaking spaces
+   * become plain spaces, so a label read from a snapshot matches the same
+   * text however it was typed or copied. Canonical copy: protocol.js
+   * (JBB.normalizeLabel); this local copy keeps the content script
+   * self-contained — keep them in sync.
+   */
+  function normalizeLabel(s) {
+    return String(s == null ? "" : s)
+      .replace(/[\u200B-\u200D\uFEFF]/g, "")
+      .replace(/[\u00A0\u202F]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
   function labelFor(el) {
     // SECURITY (enemy audit 2026-10-11): never include the value of a password
     // field. Autofilled/typed passwords would otherwise ship in plaintext
     // inside observe snapshots to the relay and driver.
     var tag = el.tagName.toLowerCase();
     var isPassword = tag === "input" && (el.type || "text").toLowerCase() === "password";
-    return (
+    var raw =
       el.getAttribute("aria-label") ||
       el.innerText ||
       (!isPassword && el.value) ||
       el.getAttribute("placeholder") ||
       el.getAttribute("name") ||
       el.getAttribute("title") ||
-      tag
-    ).trim().replace(/\s+/g, " ").slice(0, 80);
+      tag;
+    return normalizeLabel(raw).slice(0, 80);
+  }
+
+  // ------------------------------------------------------------ stable ids
+  // A positional ref remaps whenever the DOM shifts — a click built from
+  // an old snapshot could land on a different element (this class of bug
+  // navigated a tab away from the page being read). Instead, each
+  // interactive element gets a STABLE id stamped on the element itself
+  // (data-jbb-id): it survives re-renders and re-observation for exactly
+  // as long as the element itself survives, and is never reused for a
+  // different element within this frame's lifetime — the counter only
+  // moves forward, and ids already stamped by an earlier injection of
+  // this script are adopted, never reissued.
+  var nextIdNum = 0;
+  var idRegistry = {}; // id -> element (this frame, this script lifetime)
+
+  function stableIdFor(el) {
+    var id = el.getAttribute(ID_ATTR);
+    if (id) {
+      var owner = idRegistry[id];
+      if (!owner) { idRegistry[id] = el; return id; }        // adopt
+      if (owner === el) return id;                            // already ours
+      id = null; // the page moved/cloned the attribute onto another node:
+                 // do not trust it — fall through and stamp a fresh id.
+    }
+    do { id = "e" + (nextIdNum++); } while (idRegistry[id]);
+    try { el.setAttribute(ID_ATTR, id); } catch (e) { /* read-only node */ }
+    idRegistry[id] = el;
+    return id;
+  }
+
+  function pruneIdRegistry() {
+    Object.keys(idRegistry).forEach(function (id) {
+      var el = idRegistry[id];
+      if (!el || el.isConnected === false) delete idRegistry[id];
+    });
   }
 
   function typeFor(el) {
@@ -193,16 +244,15 @@
 
   /** Build the observation snapshot sent to the agent. */
   function buildSnapshot() {
+    pruneIdRegistry();
     var els = document.querySelectorAll(INTERACTIVE_SELECTOR);
     var interactives = [];
     var n = 0;
     for (var i = 0; i < els.length && n < MAX_ELEMENTS; i++) {
       var el = els[i];
       if (!isVisible(el)) continue;
-      var ref = "e" + n;
-      el.setAttribute(REF_ATTR, ref);
       interactives.push({
-        ref: ref,
+        ref: stableIdFor(el),
         label: labelFor(el),
         type: typeFor(el),
         name: el.getAttribute("name") || null
@@ -226,16 +276,20 @@
   window.__jbbBuildSnapshot = buildSnapshot;
 
   function findByRef(ref) {
-    return document.querySelector("[" + REF_ATTR + "='" + ref + "']");
+    var known = idRegistry[ref];
+    if (known && known.isConnected !== false) return known;
+    return document.querySelector("[" + ID_ATTR + "='" + ref + "']");
   }
 
   // SECURITY (enemy audit round 2): the page owns its DOM and can move
-  // data-jbb-ref attributes between observe and act, rebinding an approved
-  // ref to a different element. Verify the element still matches what the
-  // user approved; fail closed on mismatch (the driver re-observes).
+  // data-jbb-id attributes between observe and act, rebinding an approved
+  // id to a different element. Verify the element still matches what the
+  // user approved — compared after normalization on BOTH sides, so
+  // invisible characters can neither fake a match nor break a real one.
+  // Fail closed on mismatch (the driver re-observes).
   function verifyTarget(el, ref, expectedLabel) {
     if (!el) throw new Error("no element for ref " + ref);
-    if (expectedLabel && labelFor(el) !== expectedLabel) {
+    if (expectedLabel && normalizeLabel(labelFor(el)) !== normalizeLabel(expectedLabel)) {
       throw new Error("element changed since observation (expected '" +
         expectedLabel + "')");
     }

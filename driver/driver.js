@@ -67,6 +67,18 @@ class DriverError extends Error {
   }
 }
 
+// Label normalization — byte-equivalent to JBB.normalizeLabel in
+// extension/protocol.js (and the content script's copy): zero-width
+// characters stripped, non-breaking spaces become plain spaces. Applied
+// to --target so matching is exact-after-normalization on both sides.
+function normalizeLabel(s) {
+  return String(s == null ? '' : s)
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[\u00A0\u202F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 // Write one JSON line to stdout synchronously (so it is flushed even when
 // stdout is redirected to a file) and exit with the given code.
 function emitAndExit(obj, code) {
@@ -85,7 +97,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
     usage: [
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
       'commands: observe | act | abort | status',
-      'act flags: --type click|type|key|scroll|navigate --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3',
+      'act flags: --type click|type|key|scroll|navigate --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -298,6 +310,21 @@ function denyError(msg) {
   return new DriverError('DENIED', msg && msg.reason ? `the action was denied — ${msg.reason}` : 'the user denied this action');
 }
 
+// An act.result ends the act. A STALE_SNAPSHOT refusal gets the crisp
+// machine-readable surface (non-zero exit, current version included) —
+// every other result prints verbatim, as before.
+function finishResult(msg) {
+  if (msg && msg.error === 'STALE_SNAPSHOT') {
+    emitAndExit({
+      ok: false,
+      error: 'STALE_SNAPSHOT',
+      message: msg.detail || 'the snapshot moved since this act was built — re-observe and rebuild the act',
+      snapshotVersion: typeof msg.snapshotVersion === 'number' ? msg.snapshotVersion : null,
+    }, 1);
+  }
+  console.log(JSON.stringify(msg, null, 2));
+}
+
 // Run one act through its lifecycle phases. The proposal is (re)sent ONLY
 // in the receipt phase, when the extension has not yet acknowledged it —
 // peer.unavailable means the relay never forwarded it, and a rejoin resend
@@ -337,7 +364,7 @@ async function runAct(ws, proposal, id) {
 
     let verdict = null;
     if (early) {
-      if (early.type === 'act.result') { console.log(JSON.stringify(early, null, 2)); return; }
+      if (early.type === 'act.result') { finishResult(early); return; }
       if (early.type === 'consent.deny') throw denyError(early);
       verdict = early; // consent.grant
     }
@@ -356,7 +383,7 @@ async function runAct(ws, proposal, id) {
           throw e;
         }
         if (got.type === 'consent.shown' || got.type === 'consent.waiting') break;
-        if (got.type === 'act.result') { console.log(JSON.stringify(got, null, 2)); return; }
+        if (got.type === 'act.result') { finishResult(got); return; }
         if (got.type === 'consent.deny') throw denyError(got);
         verdict = got; break; // consent.grant (auto-allow: no prompt needed)
       }
@@ -380,7 +407,7 @@ async function runAct(ws, proposal, id) {
           console.error(`[waiting] consent prompt open, unanswered for ${Math.round((got.waitedMs || 0) / 1000)}s — waiting for the user`);
           continue;
         }
-        if (got.type === 'act.result') { console.log(JSON.stringify(got, null, 2)); return; }
+        if (got.type === 'act.result') { finishResult(got); return; }
         if (got.type === 'consent.deny') throw denyError(got);
         verdict = got; break; // consent.grant
       }
@@ -400,7 +427,7 @@ async function runAct(ws, proposal, id) {
       }
       throw e;
     }
-    console.log(JSON.stringify(result, null, 2));
+    finishResult(result);
   } finally {
     pendingProposals--;
   }
@@ -473,16 +500,30 @@ async function main() {
       if (type === 'key' && !pressKey) {
         throw new DriverError('USAGE', '--press-key <name> is required for --type key (for example --press-key Enter)');
       }
+      const targetLabel = normalizeLabel(opt('--target', ''));
       const proposal = {
         actionTier: opt('--tier', 'T1'),
         type,
-        target: { ref: opt('--ref', null), label: opt('--target', '') },
+        target: { ref: opt('--ref', null), label: targetLabel },
         value: opt('--value', undefined),
         key: pressKey,
         url: opt('--url', undefined),
         site: opt('--site', ''),
-        description: type === 'key' ? `press '${pressKey}'` : `${type} '${opt('--target', '')}'`,
+        description: type === 'key' ? `press '${pressKey}'` : `${type} '${targetLabel}'`,
       };
+      // Snapshot versioning: declare the observe version this act was
+      // built against (printed by `observe`). The extension refuses with
+      // STALE_SNAPSHOT if the version has moved — never a wrong-element
+      // click. Omit the flag and the act proceeds on stable-id + label
+      // verification alone (older flow).
+      const svRaw = opt('--snapshot-version', undefined);
+      if (svRaw !== undefined) {
+        const sv = Number(svRaw);
+        if (!Number.isFinite(sv) || sv < 0) {
+          throw new DriverError('USAGE', '--snapshot-version must be a non-negative number (take it from the observe output)');
+        }
+        proposal.snapshotVersion = sv;
+      }
       const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       console.error('[sent] act.propose — following the consent lifecycle…');
       await runAct(ws, proposal, id);

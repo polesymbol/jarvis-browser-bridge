@@ -48,6 +48,7 @@ var NOTIF_VERIFY_DELAY_MS = 4000;
 // ---------------------------------------------------------------- state
 var state = {
   connected: false,           // relay paired (reported by the offscreen transport)
+  snapshotVersion: 0,         // bumps on every observe + every applied act; acts built against an older version are refused STALE_SNAPSHOT
   relayDownSince: null,       // when transport was first seen down (watchdog)
   offscreenSeenAt: 0,         // last sign of life from the offscreen document
   relayUrl: "",
@@ -1197,6 +1198,24 @@ function handleProposal(proposal, source) {
   proposal.source = source;
 
   // LOCAL ENFORCEMENT: the gate runs before anything else.
+  // Snapshot versioning: an act built against a snapshot whose version
+  // has moved must never land on the wrong element. Stable ids make most
+  // older acts safe, but when the caller declares a version and it no
+  // longer matches, refuse BEFORE consent is even asked — the caller
+  // re-observes and rebuilds. Acts without a version (older drivers)
+  // proceed on stable-id + label verification alone.
+  if (typeof proposal.snapshotVersion === "number" &&
+      proposal.snapshotVersion !== state.snapshotVersion) {
+    var staleDetail = "stale snapshot: act built against v" + proposal.snapshotVersion +
+      ", current snapshot is v" + state.snapshotVersion + " — re-observe and rebuild the act";
+    recordActResult(proposal.proposalId, false, staleDetail);
+    sendToRelay(JBB.Message.actResult(proposal.proposalId, false, staleDetail,
+      "STALE_SNAPSHOT", state.snapshotVersion));
+    audit({ site: proposal.site || "-", action: proposal.description || proposal.type,
+            tier: proposal.actionTier, result: "denied", detail: staleDetail });
+    return;
+  }
+
   var verdict = decideAction(proposal);
 
   // Session grants layer on top of "ask": a live time-boxed grant auto-allows
@@ -1332,7 +1351,13 @@ function executeProposal(proposal) {
     function (detail) {
       state.executing.delete(proposal.proposalId);
       recordActResult(proposal.proposalId, true, detail);
-      sendToRelay(JBB.Message.actResult(proposal.proposalId, true, detail));
+      // An applied act may have changed the page: the snapshot version
+      // moves, so further acts built against the old version refuse
+      // instead of guessing. The new version rides the result so a
+      // caller chaining deliberately can declare it on the next act.
+      state.snapshotVersion++;
+      sendToRelay(JBB.Message.actResult(proposal.proposalId, true, detail,
+        null, state.snapshotVersion));
       audit({
         site: proposal.site || "-",
         action: proposal.description || proposal.type,
@@ -1456,11 +1481,19 @@ function prefixFrameRefs(snap, frameId) {
 }
 
 function finishObserve(tab, snap, withScreenshot) {
-  if (!withScreenshot) return JBB.Message.observeResult(snap, null);
+  // Snapshot versioning: every observe response carries a fresh,
+  // monotonically increasing version (on the message AND inside the
+  // snapshot). Acts declare the version they were built against; a moved
+  // version means the caller's view is outdated and the act is refused.
+  state.snapshotVersion++;
+  var v = state.snapshotVersion;
+  if (snap) snap.snapshotVersion = v;
+  var wrap = function (msg) { msg.snapshotVersion = v; return msg; };
+  if (!withScreenshot) return wrap(JBB.Message.observeResult(snap, null));
   return chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" })
     .catch(function () { return null; })
     .then(function (dataUrl) {
-      return JBB.Message.observeResult(snap, dataUrl);
+      return wrap(JBB.Message.observeResult(snap, dataUrl));
     });
 }
 
