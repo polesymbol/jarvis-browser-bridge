@@ -1474,7 +1474,10 @@ function proceedWithVerdict(proposal) {
 
   // Session grants layer on top of "ask": a live time-boxed grant auto-allows
   // T1/T2 on its site. T3 is NEVER covered — sensitive actions always ask.
+  // Neither is a _forceAsk action (closing the tab the user is looking
+  // at): decideAction asks, and no grant layer may turn that into allow.
   var viaSession = verdict.decision === "ask" &&
+                   !proposal._forceAsk &&
                    !state.grantsPaused &&
                    proposal.actionTier !== "T3" &&
                    sessionAllows(proposal);

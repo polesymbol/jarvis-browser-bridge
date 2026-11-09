@@ -38,6 +38,8 @@ check("closing the viewed tab force-asks ahead of the whitelist step (inside dec
   decideBody.includes("if (proposal._forceAsk)") &&
   decideBody.indexOf('proposal.actionTier === "T3"') < decideBody.indexOf("if (proposal._forceAsk)") &&
   decideBody.indexOf("if (proposal._forceAsk)") < decideBody.indexOf("whitelistCovers(proposal, host)"));
+check("session grants cannot cover the forced ask either",
+  bg.includes("!proposal._forceAsk &&"));
 check("executor guards: last tab + became-active",
   bg.includes("refusing to close the last tab in its window") &&
   bg.includes("now the one you're looking at"));

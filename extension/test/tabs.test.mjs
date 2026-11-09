@@ -191,6 +191,23 @@ const auditLog = store["jbb.audit"] || [];
 check("the auto close is audited as whitelist-authorized",
   auditLog.some((e) => e.proposalId === "t-3" && e.result === "executed" && e.via === "whitelist"));
 
+// A session grant must not cover the forced ask either: clear the
+// whitelist, grant a 1h session on example.com via a click, then try
+// closing its active tab.
+resetTabs();
+await ui({ kind: "jbb.ui.revokeAllWhitelist" });
+await propose({ proposalId: "t-4", type: "click", actionTier: "T1",
+  site: "https://example.com/a", target: { label: "A" }, description: "click 'A'" });
+sandbox.state.pending.get("t-4").resolve({ choice: "session1h" });
+await tick(90);
+check("setup: session grant is live", !!sandbox.state.session);
+await propose({ proposalId: "t-5", tabId: 1, description: "close tab 1" });
+check("closing the ACTIVE tab prompts even under a live session grant",
+  sandbox.state.pending.has("t-5") && !removedTabs.includes(1));
+sandbox.state.pending.get("t-5").resolve({ choice: "deny" });
+await tick(40);
+sandbox.state.session = null;
+
 // ---------------------------------------------------------- execution guards (direct)
 tabsDb = [{ id: 9, windowId: 2, url: "https://solo.example.com/", title: "Solo", active: true, pinned: false, audible: false }];
 let err = await sandbox.executeTabAction({ type: "closeTab", tabId: 9, _forceAsk: true }).then(() => "", (e) => e.message);
