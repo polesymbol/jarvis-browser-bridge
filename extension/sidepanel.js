@@ -166,6 +166,11 @@ function renderConsentCard(proposal) {
   });
 
   area.prepend(card);
+
+  // Acknowledge visibility: the background may only tell the driver
+  // "consent.shown" once a prompt is actually on screen — this render is
+  // one of the two proofs (the in-page banner is the other).
+  api({ kind: "jbb.ui.consentShown", proposalId: proposal.proposalId }).catch(function () {});
 }
 
 // ---------------------------------------------------------------- session grant

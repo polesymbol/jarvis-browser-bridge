@@ -4,8 +4,11 @@
 //     on stdout with a non-zero exit code.
 //   * --key is always the connector key; a keypress travels in --press-key.
 //   * `status` prints peerConnected / workerAlive / pendingProposals /
-//     sessionTimeRemaining as JSON.
-// No external services: a real relay on an ephemeral port + a fake extension.
+//     sessionTimeRemaining as JSON, including on its error paths.
+//   * The act consent lifecycle is reported distinctly: PEER_DOWN,
+//     PROMPT_NOT_SHOWN, NO_ANSWER, DENIED, APPLIED_UNCONFIRMED — never one
+//     opaque timeout, and an act is never resent after a grant.
+// No external services: real relays on ephemeral ports + fake extensions.
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import WebSocket from "ws";
@@ -24,7 +27,7 @@ function parseStdout(out) {
   try { return JSON.parse(out); } catch { return null; }
 }
 
-function runDriver(args, envOverrides = {}, timeoutMs = 20000) {
+function runDriver(args, envOverrides = {}, timeoutMs = 30000) {
   return new Promise((resolve) => {
     const env = { ...process.env };
     delete env.KEY;
@@ -45,10 +48,15 @@ function closedPort() {
   });
 }
 
-// Fake extension: pairs, then (in active mode) grants act proposals and
-// reports a result echoing the pressed key. Proposals are captured so the
-// test can prove the keypress name arrived as proposal.key and pairing used
-// the real connector key (same room = same key hash at the relay).
+async function startRelay() {
+  const { httpServer } = createRelay(0);
+  await new Promise((r) => httpServer.on("listening", r));
+  return { httpServer, port: httpServer.address().port };
+}
+
+// Legacy fake extension (pre-ack protocol): pairs, grants act proposals and
+// reports a result echoing the pressed key — no lifecycle acks at all. The
+// driver must stay compatible with it.
 function fakeExtension(port, key) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${port}`);
@@ -70,20 +78,54 @@ function fakeExtension(port, key) {
   });
 }
 
-const { httpServer } = createRelay(0);
-await new Promise((r) => httpServer.on("listening", r));
-const port = httpServer.address().port;
+// Lifecycle fake extension: speaks the ack protocol in scripted modes.
+function fakeLifecycleExt(port, key, mode) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    const state = { ws, proposeCount: 0, timers: [] };
+    ws.on("open", () => ws.send(JSON.stringify({ v: 1, type: "pair.request", role: "extension", key })));
+    ws.on("error", reject);
+    ws.on("message", (raw) => {
+      let m; try { m = JSON.parse(raw.toString()); } catch { return; }
+      if (m.type === "pair.confirm") { resolve(state); return; }
+      if (m.type !== "act.propose") return;
+      state.proposeCount++;
+      const pid = m.id;
+      const send = (o) => { try { ws.send(JSON.stringify({ v: 1, ...o })); } catch {} };
+      const after = (ms, fn) => { state.timers.push(setTimeout(fn, ms)); };
+      send({ type: "proposal.received", proposalId: pid });
+      if (mode === "notshown") return; // received, but no prompt ever appears
+      after(30, () => send({ type: "consent.shown", proposalId: pid, via: "panel" }));
+      if (mode === "grant") {
+        after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
+        after(180, () => send({ type: "act.result", proposalId: pid, ok: true, detail: "done" }));
+      } else if (mode === "deny") {
+        after(80, () => send({ type: "consent.deny", proposalId: pid, reason: "user denied" }));
+      } else if (mode === "waiting") {
+        let n = 0;
+        state.timers.push(setInterval(() => { n++; send({ type: "consent.waiting", proposalId: pid, waitedMs: n * 400 }); }, 400));
+      } else if (mode === "noresult") {
+        after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
+        // act.result never arrives
+      }
+    });
+  });
+}
+function stopExt(state) {
+  (state.timers || []).forEach((t) => { clearTimeout(t); clearInterval(t); });
+  try { state.ws.close(); } catch {}
+}
+
+// ==================================================================== part 1
+const { httpServer, port } = await startRelay();
 const relayArg = `ws://127.0.0.1:${port}`;
 
-// --- help: valid JSON, no key required, documents --press-key -------------
 {
   const r = await runDriver(["--help"]);
   const j = parseStdout(r.out);
   check("help exits 0 with JSON usage mentioning --press-key",
     r.code === 0 && !!j && j.ok === true && JSON.stringify(j).includes("--press-key"));
 }
-
-// --- missing / empty KEY ---------------------------------------------------
 {
   const r = await runDriver(["--relay", relayArg, "observe"], { KEY: "" });
   const j = parseStdout(r.out);
@@ -92,24 +134,18 @@ const relayArg = `ws://127.0.0.1:${port}`;
     r.out.trim().length > 0 && !!j && j.ok === false && j.error === "KEY_MISSING" && typeof j.message === "string",
     "stdout=" + JSON.stringify(r.out));
 }
-
-// --- short KEY -------------------------------------------------------------
 {
   const r = await runDriver(["--relay", relayArg, "--key", "short", "observe"]);
   const j = parseStdout(r.out);
   check("short --key exits non-zero with KEY_INVALID JSON",
     r.code !== 0 && !!j && j.ok === false && j.error === "KEY_INVALID" && r.out.trim().length > 0);
 }
-
-// --- missing command --------------------------------------------------------
 {
   const r = await runDriver(["--relay", relayArg, "--key", KEY]);
   const j = parseStdout(r.out);
   check("no command exits non-zero with USAGE JSON",
     r.code !== 0 && !!j && j.ok === false && j.error === "USAGE" && r.out.trim().length > 0);
 }
-
-// --- unreachable relay -------------------------------------------------------
 {
   const dead = await closedPort();
   const r = await runDriver(["--relay", `ws://127.0.0.1:${dead}`, "--key", KEY, "observe"]);
@@ -117,8 +153,6 @@ const relayArg = `ws://127.0.0.1:${port}`;
   check("unreachable relay exits non-zero with RELAY_UNREACHABLE JSON",
     r.code !== 0 && !!j && j.ok === false && j.error === "RELAY_UNREACHABLE" && r.out.trim().length > 0);
 }
-
-// --- status with no peer -----------------------------------------------------
 {
   const r = await runDriver(["--relay", relayArg, "--key", STATUS_KEY, "status"]);
   const j = parseStdout(r.out);
@@ -127,8 +161,6 @@ const relayArg = `ws://127.0.0.1:${port}`;
     j.pendingProposals === 0 && j.sessionTimeRemaining === null,
     "stdout=" + r.out);
 }
-
-// --- status error paths still carry the four fields -------------------------
 {
   const r = await runDriver(["--relay", relayArg, "status"], { KEY: "" });
   const j = parseStdout(r.out);
@@ -147,7 +179,6 @@ const relayArg = `ws://127.0.0.1:${port}`;
     "stdout=" + r.out);
 }
 
-// --- peer-backed checks ------------------------------------------------------
 const ext = await fakeExtension(port, KEY);
 {
   const r = await runDriver(["--relay", relayArg, "--key", KEY, "status"]);
@@ -160,7 +191,7 @@ const ext = await fakeExtension(port, KEY);
   const r = await runDriver(["--relay", relayArg, "--key", KEY, "act", "--type", "key", "--press-key", "Enter", "--tier", "T1"]);
   const j = parseStdout(r.out);
   const prop = ext.captured[ext.captured.length - 1] || {};
-  check("act --type key --press-key Enter exits 0 with act.result JSON",
+  check("legacy extension (no acks): act --type key still completes",
     r.code === 0 && !!j && j.type === "act.result" && j.ok === true, "code=" + r.code + " stdout=" + r.out);
   check("keypress proposal carries key=Enter (connector --key untouched)",
     prop.type === "key" && prop.key === "Enter", "proposal=" + JSON.stringify(prop));
@@ -172,15 +203,86 @@ const ext = await fakeExtension(port, KEY);
     r.code !== 0 && !!j && j.ok === false && j.error === "USAGE" && r.out.trim().length > 0);
 }
 {
-  // abort must also honour the never-empty-stdout contract. Runs last: the
-  // relay tears the room down on session.abort.
   const r = await runDriver(["--relay", relayArg, "--key", KEY, "abort"]);
   const j = parseStdout(r.out);
   check("abort exits 0 with non-empty JSON on stdout",
     r.code === 0 && !!j && j.ok === true && r.out.trim().length > 0, "stdout=" + JSON.stringify(r.out));
 }
-
 try { ext.ws.close(); } catch {}
 httpServer.close();
+
+// ==================================================================== part 2
+// Consent lifecycle: distinct codes per state, heartbeats surfaced, and no
+// act resend after a grant. Small phase timeouts via env keep this fast.
+const L = await startRelay();
+const lArg = `ws://127.0.0.1:${L.port}`;
+const FAST = {
+  JBB_ACT_RECEIPT_MS: "4000",
+  JBB_ACT_SHOWN_MS: "2000",
+  JBB_ACT_CONSENT_MS: "3500",
+  JBB_ACT_RESULT_MS: "2000",
+};
+const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click", "--target", "Buy", "--tier", "T1"];
+
+{
+  // No extension at all for this key: suspended/offline -> PEER_DOWN.
+  const r = await runDriver(actArgs("down-key-0123456789abcdef"), FAST);
+  const j = parseStdout(r.out);
+  check("extension offline -> PEER_DOWN",
+    r.code !== 0 && !!j && j.ok === false && j.error === "PEER_DOWN", "stdout=" + r.out + " err=" + r.err);
+}
+{
+  const key = "grant-key-0123456789abcdef";
+  const e = await fakeLifecycleExt(L.port, key, "grant");
+  const r = await runDriver(actArgs(key), FAST);
+  const j = parseStdout(r.out);
+  check("full lifecycle (received->shown->grant->result) exits 0",
+    r.code === 0 && !!j && j.type === "act.result" && j.ok === true, "stdout=" + r.out);
+  stopExt(e);
+}
+{
+  const key = "deny-key-0123456789abcdef0";
+  const e = await fakeLifecycleExt(L.port, key, "deny");
+  const r = await runDriver(actArgs(key), FAST);
+  const j = parseStdout(r.out);
+  check("user verdict deny -> DENIED",
+    r.code !== 0 && !!j && j.ok === false && j.error === "DENIED", "stdout=" + r.out);
+  stopExt(e);
+}
+{
+  const key = "notshown-key-0123456789abc";
+  const e = await fakeLifecycleExt(L.port, key, "notshown");
+  const r = await runDriver(actArgs(key), FAST);
+  const j = parseStdout(r.out);
+  check("received but prompt never shown -> PROMPT_NOT_SHOWN",
+    r.code !== 0 && !!j && j.ok === false && j.error === "PROMPT_NOT_SHOWN", "stdout=" + r.out);
+  stopExt(e);
+}
+{
+  const key = "waiting-key-0123456789abcd";
+  const e = await fakeLifecycleExt(L.port, key, "waiting");
+  const r = await runDriver(actArgs(key), FAST);
+  const j = parseStdout(r.out);
+  check("shown, heartbeats, unanswered -> NO_ANSWER (never 'did not rejoin')",
+    r.code !== 0 && !!j && j.ok === false && j.error === "NO_ANSWER" &&
+    r.err.includes("[waiting]") && !r.out.includes("did not rejoin"),
+    "stdout=" + r.out + " stderr=" + r.err.slice(-200));
+  stopExt(e);
+}
+{
+  const key = "noresult-key-0123456789ab";
+  const e = await fakeLifecycleExt(L.port, key, "noresult");
+  const r = await runDriver(actArgs(key), FAST);
+  const j = parseStdout(r.out);
+  check("granted but result lost -> APPLIED_UNCONFIRMED with the exact message",
+    r.code !== 0 && !!j && j.ok === false && j.error === "APPLIED_UNCONFIRMED" &&
+    j.message === "the action may already have applied — observe before retrying",
+    "stdout=" + r.out);
+  check("act was NOT resent after grant (exactly one act.propose)",
+    e.proposeCount === 1, "proposeCount=" + e.proposeCount);
+  stopExt(e);
+}
+L.httpServer.close();
+
 console.log(failures === 0 ? "ALL DRIVER TESTS PASSED" : failures + " DRIVER TEST(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

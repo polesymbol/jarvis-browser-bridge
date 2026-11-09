@@ -27,6 +27,20 @@
  *   stdout used to be misread downstream as an extension outage. Human
  *   diagnostics go to stderr only.
  *
+ * Consent lifecycle for act (protocol acknowledgements):
+ *   act.propose -> proposal.received -> consent.shown -> consent.waiting*
+ *   -> consent.grant | consent.deny -> act.result.
+ *   Each state is reported distinctly instead of one opaque timeout:
+ *   PEER_DOWN (extension never acknowledged the proposal),
+ *   PROMPT_NOT_SHOWN (received, but no prompt became visible),
+ *   NO_ANSWER (shown but unanswered — the proposal stays queued in the
+ *   panel, never deny-and-forget), DENIED (the verdict was deny), and
+ *   APPLIED_UNCONFIRMED (granted, but the result never arrived — the act
+ *   is NEVER resent from that point; observe before retrying). Phase
+ *   timeouts default to receipt 30s / shown 20s / consent 120s / result
+ *   60s; JBB_ACT_RECEIPT_MS, JBB_ACT_SHOWN_MS, JBB_ACT_CONSENT_MS and
+ *   JBB_ACT_RESULT_MS override them (the test suite uses small values).
+ *
  * The connector key is the shared secret the user linked in chat. It is passed
  * via argv/env here for testing only — never logged, never echoed, and never
  * included in any output, including error messages.
@@ -81,6 +95,11 @@ const CMD = args.find((a) => ['observe', 'act', 'abort', 'status'].includes(a));
 // rest, so `status` reports 0; the counter exists so the field is real, not
 // decorative, if this process is ever embedded.
 let pendingProposals = 0;
+
+const ACT_RECEIPT_MS = parseInt(process.env.JBB_ACT_RECEIPT_MS || '30000', 10);
+const ACT_SHOWN_MS = parseInt(process.env.JBB_ACT_SHOWN_MS || '20000', 10);
+const ACT_CONSENT_MS = parseInt(process.env.JBB_ACT_CONSENT_MS || '120000', 10);
+const ACT_RESULT_MS = parseInt(process.env.JBB_ACT_RESULT_MS || '60000', 10);
 
 // The four status fields, always present in `status` output — including its
 // error paths, so a failed status check still reports peer/worker as "no"
@@ -200,6 +219,168 @@ async function pair(ws, timeoutMs) {
   return confirm;
 }
 
+// ---------------------------------------------------------------- act lifecycle
+// A small message pump: every relay message for this act is buffered or
+// handed to the phase waiting for it, correlated by the act's unique id
+// (carried as proposalId by the extension, as id by older peers).
+function createPump(ws, actId) {
+  const buffer = [];
+  const waiters = [];
+  const pump = { peerUnavailable: false };
+  function idOk(m) {
+    if (m.proposalId) return m.proposalId === actId;
+    if (m.id) return m.id === actId;
+    return true;
+  }
+  ws.on('message', (raw) => {
+    let m;
+    try { m = JSON.parse(raw.toString()); } catch { return; }
+    if (m.type === 'peer.unavailable') {
+      pump.peerUnavailable = true;
+      console.error('[relay] peer.unavailable — the extension is not connected');
+    } else if (m.type === 'peer.left') {
+      console.error('[relay] peer.left — the extension disconnected');
+    }
+    if (!idOk(m) && m.type !== 'peer.joined') { buffer.push(m); return; }
+    const i = waiters.findIndex((w) => w.types.includes(m.type));
+    if (i !== -1) {
+      const [w] = waiters.splice(i, 1);
+      clearTimeout(w.timer);
+      w.resolve(m);
+    } else {
+      buffer.push(m);
+    }
+  });
+  pump.next = (types, timeoutMs) => {
+    const bi = buffer.findIndex((m) => types.includes(m.type) && (m.type === 'peer.joined' || idOk(m)));
+    if (bi !== -1) return Promise.resolve(buffer.splice(bi, 1)[0]);
+    return new Promise((resolve, reject) => {
+      const w = { types, resolve };
+      w.timer = setTimeout(() => {
+        const j = waiters.indexOf(w);
+        if (j !== -1) waiters.splice(j, 1);
+        const e = new Error('pump timeout');
+        e.pumpTimeout = true;
+        reject(e);
+      }, Math.max(1, timeoutMs));
+      waiters.push(w);
+    });
+  };
+  return pump;
+}
+
+function denyError(msg) {
+  return new DriverError('DENIED', msg && msg.reason ? `the action was denied — ${msg.reason}` : 'the user denied this action');
+}
+
+// Run one act through its lifecycle phases. The proposal is (re)sent ONLY
+// in the receipt phase, when the extension has not yet acknowledged it —
+// peer.unavailable means the relay never forwarded it, and a rejoin resend
+// carries the same id, which the extension dedupes. After a grant the act
+// is never resent under any circumstances.
+async function runAct(ws, proposal, id) {
+  const pump = createPump(ws, id);
+  const sendPropose = () => ws.send(JSON.stringify({ v: 1, type: 'act.propose', id, proposal }));
+  const isTimeout = (e) => e && e.pumpTimeout;
+  pendingProposals++;
+  try {
+    sendPropose();
+
+    // Phase A — receipt: did the extension take the proposal in at all?
+    let early = null;
+    const receiptDeadline = Date.now() + ACT_RECEIPT_MS;
+    for (;;) {
+      let got;
+      try {
+        got = await pump.next(['proposal.received', 'consent.grant', 'consent.deny', 'act.result', 'peer.joined'], receiptDeadline - Date.now());
+      } catch (e) {
+        if (isTimeout(e)) {
+          throw new DriverError('PEER_DOWN', pump.peerUnavailable
+            ? 'the extension is offline — it never acknowledged the proposal'
+            : 'the extension did not acknowledge the proposal in time — it appears to be offline');
+        }
+        throw e;
+      }
+      if (got.type === 'peer.joined') {
+        console.error('[relay] extension rejoined — resending the proposal (same id; the extension dedupes by id)');
+        sendPropose();
+        continue;
+      }
+      if (got.type === 'proposal.received') break;
+      early = got; break; // an older extension that answers without acks
+    }
+
+    let verdict = null;
+    if (early) {
+      if (early.type === 'act.result') { console.log(JSON.stringify(early, null, 2)); return; }
+      if (early.type === 'consent.deny') throw denyError(early);
+      verdict = early; // consent.grant
+    }
+
+    // Phase B — shown: a prompt must actually become visible.
+    if (!verdict) {
+      const shownDeadline = Date.now() + ACT_SHOWN_MS;
+      for (;;) {
+        let got;
+        try {
+          got = await pump.next(['consent.shown', 'consent.waiting', 'consent.grant', 'consent.deny', 'act.result'], shownDeadline - Date.now());
+        } catch (e) {
+          if (isTimeout(e)) {
+            throw new DriverError('PROMPT_NOT_SHOWN', 'the extension received the proposal but the consent prompt never appeared — no panel card or in-page banner became visible');
+          }
+          throw e;
+        }
+        if (got.type === 'consent.shown' || got.type === 'consent.waiting') break;
+        if (got.type === 'act.result') { console.log(JSON.stringify(got, null, 2)); return; }
+        if (got.type === 'consent.deny') throw denyError(got);
+        verdict = got; break; // consent.grant (auto-allow: no prompt needed)
+      }
+    }
+
+    // Phase C — verdict: heartbeats report the waiting state; a timeout
+    // here is NO_ANSWER, and the proposal stays queued in the panel.
+    if (!verdict) {
+      const consentDeadline = Date.now() + ACT_CONSENT_MS;
+      for (;;) {
+        let got;
+        try {
+          got = await pump.next(['consent.grant', 'consent.deny', 'act.result', 'consent.waiting'], consentDeadline - Date.now());
+        } catch (e) {
+          if (isTimeout(e)) {
+            throw new DriverError('NO_ANSWER', 'the consent prompt was shown but not answered in time — the proposal is still queued in the extension panel, not denied or forgotten');
+          }
+          throw e;
+        }
+        if (got.type === 'consent.waiting') {
+          console.error(`[waiting] consent prompt open, unanswered for ${Math.round((got.waitedMs || 0) / 1000)}s — waiting for the user`);
+          continue;
+        }
+        if (got.type === 'act.result') { console.log(JSON.stringify(got, null, 2)); return; }
+        if (got.type === 'consent.deny') throw denyError(got);
+        verdict = got; break; // consent.grant
+      }
+    }
+
+    console.error(`[consent] consent.grant${verdict.scope ? ` scope=${verdict.scope}` : ''}`);
+
+    // Phase D — applied/failed: the act.result. A timeout here means the
+    // result was lost, NOT that the action failed — report
+    // APPLIED_UNCONFIRMED and never, ever resend the act.
+    let result;
+    try {
+      result = await pump.next(['act.result'], ACT_RESULT_MS);
+    } catch (e) {
+      if (isTimeout(e)) {
+        emitAndExit({ ok: false, error: 'APPLIED_UNCONFIRMED', message: 'the action may already have applied — observe before retrying' }, 1);
+      }
+      throw e;
+    }
+    console.log(JSON.stringify(result, null, 2));
+  } finally {
+    pendingProposals--;
+  }
+}
+
 async function connect(timeoutMs) {
   let parsed;
   try { parsed = new URL(RELAY); } catch {
@@ -277,28 +458,9 @@ async function main() {
         site: opt('--site', ''),
         description: type === 'key' ? `press '${pressKey}'` : `${type} '${opt('--target', '')}'`,
       };
-      const id = `act-${Date.now()}`;
-      console.error('[sent] act.propose — waiting for user consent…');
-      pendingProposals++;
-      try {
-        // Accept act.result during the consent wait too: a verdict may arrive
-        // implicitly (auto-allow executes without a separate grant on old builds).
-        const first = await sendResilient(ws, { v: 1, type: 'act.propose', id, proposal }, ['consent.grant', 'consent.deny', 'act.result'], 120000);
-        if (first.type === 'act.result') {
-          console.log(JSON.stringify(first, null, 2));
-        } else {
-          const consent = first;
-          console.error(`[consent] ${consent.type}${consent.scope ? ` scope=${consent.scope}` : ''}`);
-          if (consent.type === 'consent.grant') {
-            const result = await waitFor(ws, ['act.result'], 60000);
-            console.log(JSON.stringify(result, null, 2));
-          } else {
-            console.log(JSON.stringify({ denied: true, consent }, null, 2));
-          }
-        }
-      } finally {
-        pendingProposals--;
-      }
+      const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      console.error('[sent] act.propose — following the consent lifecycle…');
+      await runAct(ws, proposal, id);
     } else if (CMD === 'abort') {
       ws.send(JSON.stringify({ v: 1, type: 'session.abort', reason: 'driver CLI abort' }));
       console.error('[sent] session.abort');

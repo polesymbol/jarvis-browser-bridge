@@ -87,6 +87,24 @@
     actPropose: function (proposal) {
       return base("act.propose", { proposal: proposal });
     },
+    // Consent lifecycle acknowledgements (additive; the relay forwards any
+    // type and older drivers ignore what they don't know):
+    //   act.propose -> proposal.received -> consent.shown -> consent.waiting*
+    //   -> consent.grant | consent.deny (verdict) -> act.result (applied/failed)
+    // proposal.received proves the extension took the proposal in — without
+    // it, "extension offline" and "prompt never shown" are indistinguishable.
+    proposalReceived: function (proposalId) {
+      return base("proposal.received", { proposalId: proposalId });
+    },
+    // Sent ONLY when a prompt is actually visible: the side-panel card has
+    // rendered (panel ack) or the in-page banner is in the tab's DOM.
+    consentShown: function (proposalId, via) {
+      return base("consent.shown", { proposalId: proposalId, via: via || null });
+    },
+    // Heartbeat while a shown prompt sits unanswered (~every 10s).
+    consentWaiting: function (proposalId, waitedMs) {
+      return base("consent.waiting", { proposalId: proposalId, waitedMs: waitedMs || 0 });
+    },
     consentGrant: function (proposalId, scope) {
       // scope: "once" | "site"
       return base("consent.grant", { proposalId: proposalId, scope: scope });

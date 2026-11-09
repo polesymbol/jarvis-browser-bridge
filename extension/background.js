@@ -28,6 +28,7 @@ var K = {
   SITES: "jbb.sites",          // { hostname: "allow" | "deny" }
   AUDIT: "jbb.audit",          // [ entries ], capped
   PENDING: "jbb.pending",      // { proposalId: { proposal, createdAt } } — survives worker restarts
+  RESULTS: "jbb.results",      // { proposalId: { ok, detail, at } } — executed acts, for id dedupe
   SESSION: "jbb.session",      // { site, grantedAt, expiresAt, label } — time-boxed grant, survives restarts
   SIGNIN_ACK: "jbb.signInAck"  // email the user acknowledged for Chrome sign-in (hard block until acked)
 };
@@ -49,7 +50,10 @@ var state = {
   mode: "ask-some",            // readonly | ask-some | always-ask
   sites: {},
   sessionKilled: false,
-  pending: new Map(),          // proposalId -> { proposal, resolve, timer }
+  pending: new Map(),          // proposalId -> { proposal, resolve, timer, createdAt, shown, shownVia, escalated, lastWaitingAt, elapsed }
+  executing: new Set(),        // proposalIds currently executing (dedupe)
+  actResults: new Map(),       // proposalId -> { ok, detail, at } (dedupe store, persisted at K.RESULTS)
+  badgeFlashTimer: null,       // escalation badge flash interval
   consentNotifs: {},           // notificationId -> proposalId (universal prompt)
   raiseCount: {},              // proposalId -> number of toast raises (escalation cap)
   consentBanners: {},          // proposalId -> tabId (in-page banner)
@@ -63,6 +67,12 @@ var proposalSeq = 0;
 function nextProposalId() {
   return "p" + Date.now().toString(36) + "-" + (proposalSeq++);
 }
+
+// Restore the executed-act store so id dedupe survives worker restarts.
+chrome.storage.local.get([K.RESULTS], function (res) {
+  var all = res[K.RESULTS] || {};
+  Object.keys(all).forEach(function (id) { state.actResults.set(id, all[id]); });
+});
 
 // ---------------------------------------------------------------- boot
 chrome.runtime.onInstalled.addListener(function () {
@@ -90,6 +100,7 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
   if (!alarm || alarm.name !== "jbb-keepalive") return;
   hydratePendings();
   verifyAllPendingNotifications();
+  consentHeartbeatSweep();
   // Hard expiry for session grants — no silent extension, ever.
   if (state.session && Date.now() >= state.session.expiresAt) expireSession("expired");
   // Re-check sign-in state: a later sign-in can't slip through unnoticed.
@@ -251,19 +262,33 @@ function unpersistPending(proposalId) {
 }
 
 // (Re)create the in-memory entry for a proposal with the given remaining
-// consent window. Returns the entry, or null if the window already elapsed.
-function trackPending(proposal, remainingMs) {
-  if (remainingMs <= 0) {
-    unpersistPending(proposal.proposalId);
-    return null;
+// consent window. A window that elapses does NOT resolve the proposal:
+// a consent timeout must never silently become deny-and-forget. The entry
+// is marked elapsed, stays tracked + persisted, and remains visible and
+// answerable in the panel until the user decides, the session is killed,
+// or the peer explicitly aborts.
+function trackPending(proposal, remainingMs, createdAt) {
+  var elapsed = remainingMs != null && remainingMs <= 0;
+  var timer = null;
+  if (remainingMs != null && remainingMs > 0) {
+    timer = setTimeout(function () {
+      var p = state.pending.get(proposal.proposalId);
+      if (!p) return;
+      p.elapsed = true;
+      audit({ site: proposal.site || "-", action: proposal.description || proposal.type,
+              tier: proposal.actionTier, result: "awaiting consent",
+              detail: "consent window elapsed with no answer — proposal remains queued in the panel (no auto-deny)" });
+    }, remainingMs);
   }
-  var timer = setTimeout(function () {
-    var p = state.pending.get(proposal.proposalId);
-    if (p) p.resolve({ choice: "deny", reason: "consent timed out" });
-  }, remainingMs);
   var entry = {
     proposal: proposal,
     timer: timer,
+    createdAt: createdAt || Date.now(),
+    shown: false,
+    shownVia: null,
+    escalated: false,
+    lastWaitingAt: 0,
+    elapsed: elapsed,
     resolve: function (answer) {
       // Idempotent: card, notification and banner are three paths to one
       // decision — the first one wins, the rest are no-ops.
@@ -277,6 +302,7 @@ function trackPending(proposal, remainingMs) {
     }
   };
   state.pending.set(proposal.proposalId, entry);
+  ensureHeartbeat();
   return entry;
 }
 
@@ -290,18 +316,100 @@ function hydratePendings(done) {
     Object.keys(all).forEach(function (id) {
       var rec = all[id];
       var remaining = CONSENT_TIMEOUT_MS - (now - rec.createdAt);
-      if (remaining > 0 && !state.pending.has(id)) {
-        trackPending(rec.proposal, remaining);
-        // The worker restarted mid-consent: the visible notification's click
-        // mapping died with the old worker, so re-raise it (same ID updates
-        // it in place; runs once — next tick sees it in state.pending).
-        notifyConsent(rec.proposal);
-      } else if (remaining <= 0) {
-        unpersistPending(id);
+      if (!state.pending.has(id)) {
+        // Elapsed proposals are re-tracked too (no auto-deny, ever) — just
+        // without re-raising a stale toast on every wake.
+        trackPending(rec.proposal, remaining, rec.createdAt);
+        if (remaining > 0) {
+          // The worker restarted mid-consent: the visible notification's click
+          // mapping died with the old worker, so re-raise it (same ID updates
+          // it in place; runs once — next tick sees it in state.pending).
+          notifyConsent(rec.proposal);
+        }
       }
     });
     if (done) done();
   });
+}
+
+// ---------------------------------------------------------------- consent lifecycle acks
+// The driver used to get one opaque timeout for three different states
+// (extension offline / prompt never shown / prompt shown but unanswered).
+// Now the lifecycle is explicit: proposal.received -> consent.shown ->
+// consent.waiting (heartbeat) -> consent.grant|consent.deny -> act.result.
+// consent.shown is sent ONLY when a prompt is actually visible: the panel
+// card has rendered (the panel acks it) or the in-page banner is confirmed
+// in the tab's DOM. The OS toast and badge are attention channels, not
+// "shown" proof — a swallowed toast must not fake a shown prompt.
+
+var heartbeatTimer = null;
+function ensureHeartbeat() {
+  if (heartbeatTimer) return;
+  heartbeatTimer = setInterval(consentHeartbeatSweep, 10000);
+}
+
+function markConsentShown(proposalId, via) {
+  var entry = state.pending.get(proposalId);
+  if (!entry || entry.shown) return;
+  entry.shown = true;
+  entry.shownVia = via;
+  sendToRelay(JBB.Message.consentShown(proposalId, via));
+}
+
+function consentHeartbeatSweep() {
+  var now = Date.now();
+  state.pending.forEach(function (entry, proposalId) {
+    if (!entry.shown) return;
+    var waited = now - entry.createdAt;
+    if (now - (entry.lastWaitingAt || 0) >= 10000) {
+      entry.lastWaitingAt = now;
+      sendToRelay(JBB.Message.consentWaiting(proposalId, waited));
+    }
+    // One escalation at ~60s unanswered: re-chime + re-raise the toast
+    // once (notifyConsent does both, same notification ID in place) and
+    // flash the badge. Once per proposal — this is a nudge, not a loop.
+    if (waited >= 60000 && !entry.escalated) {
+      entry.escalated = true;
+      audit({ site: entry.proposal.site || "-", action: entry.proposal.description || entry.proposal.type,
+              tier: entry.proposal.actionTier, result: "escalated",
+              detail: "consent prompt unanswered for 60s — re-chimed, toast re-raised once, badge flashing" });
+      notifyConsent(entry.proposal);
+      flashBadge();
+    }
+  });
+}
+
+function flashBadge() {
+  if (state.badgeFlashTimer) return;
+  var n = 0;
+  state.badgeFlashTimer = setInterval(function () {
+    n++;
+    if (n % 2 === 1) {
+      chrome.action.setBadgeText({ text: "!" });
+      chrome.action.setBadgeBackgroundColor({ color: "#d92d20" });
+    } else {
+      chrome.action.setBadgeText({ text: "?" });
+      chrome.action.setBadgeBackgroundColor({ color: "#E8710A" });
+    }
+    if (n >= 8) {
+      clearInterval(state.badgeFlashTimer);
+      state.badgeFlashTimer = null;
+      refreshBadge();
+    }
+  }, 400);
+}
+
+// Record an executed act under its id (memory + storage). This is the
+// idempotency store: a re-sent act.propose with the same id gets the stored
+// result resent instead of a second execution.
+function recordActResult(proposalId, ok, detail) {
+  state.actResults.set(proposalId, { ok: !!ok, detail: detail || null, at: Date.now() });
+  if (state.actResults.size > 100) {
+    state.actResults.delete(state.actResults.keys().next().value);
+  }
+  var obj = {};
+  state.actResults.forEach(function (v, k) { obj[k] = v; });
+  chrome.storage.local.set({ [K.RESULTS]: obj });
 }
 
 // ---------------------------------------------------------------- universal consent prompt
@@ -662,6 +770,9 @@ function jbbConsentBanner(summary) {
   bar.appendChild(btn("1 week", false, "session1w"));
   bar.appendChild(btn("Deny", false, "deny"));
   (document.documentElement || document.body).appendChild(bar);
+  // executeScript reports this back: the banner is in the DOM, i.e. the
+  // prompt is actually visible — the only honest basis for consent.shown.
+  return true;
 }
 
 function showBannerConsent(proposal) {
@@ -686,9 +797,16 @@ function showBannerConsent(proposal) {
     try {
       chrome.scripting.executeScript(
         { target: { tabId: tab.id }, func: jbbConsentBanner, args: [summary] }
-      ).then(function () {
-        base.result = "shown"; base.detail = "banner injected into active tab";
-        audit(base);
+      ).then(function (results) {
+        if (results && results[0] && results[0].result === true) {
+          base.result = "shown"; base.detail = "banner visible in active tab";
+          audit(base);
+          markConsentShown(proposal.proposalId, "banner");
+        } else {
+          delete state.consentBanners[proposal.proposalId];
+          base.result = "failed"; base.detail = "banner injection did not confirm visibility";
+          audit(base);
+        }
       }, function (err) {
         delete state.consentBanners[proposal.proposalId];
         base.result = "failed";
@@ -942,6 +1060,34 @@ function handleRelayMessage(raw) {
 // ---------------------------------------------------------------- proposal -> consent -> execute
 function handleProposal(proposal, source) {
   proposal.proposalId = proposal.proposalId || nextProposalId();
+
+  // Idempotency: the driver gives every act a unique id (adopted above as
+  // proposalId). A re-sent act.propose with an id we already executed gets
+  // the stored result resent — never a second execution, never a second
+  // prompt. One still awaiting consent or mid-execution gets a fresh
+  // receipt (and shown, if already shown) and is otherwise ignored.
+  var priorResult = state.actResults.get(proposal.proposalId);
+  if (priorResult) {
+    sendToRelay(JBB.Message.proposalReceived(proposal.proposalId));
+    sendToRelay(JBB.Message.actResult(proposal.proposalId, priorResult.ok, priorResult.detail));
+    audit({ site: proposal.site || "-", action: proposal.description || proposal.type,
+            tier: proposal.actionTier, result: "duplicate",
+            detail: "duplicate act id — stored result resent, act NOT re-applied" });
+    return;
+  }
+  if (state.pending.has(proposal.proposalId) || state.executing.has(proposal.proposalId)) {
+    sendToRelay(JBB.Message.proposalReceived(proposal.proposalId));
+    var existing = state.pending.get(proposal.proposalId);
+    if (existing && existing.shown) {
+      sendToRelay(JBB.Message.consentShown(proposal.proposalId, existing.shownVia));
+    }
+    return;
+  }
+
+  // Lifecycle ack: the proposal is in the gate now. Sent before the verdict
+  // so the driver can distinguish "never arrived" (PEER_DOWN) from what
+  // happens next.
+  sendToRelay(JBB.Message.proposalReceived(proposal.proposalId));
   proposal.source = source;
 
   // LOCAL ENFORCEMENT: the gate runs before anything else.
@@ -1074,8 +1220,11 @@ function resolveConsent(proposal, answer) {
 }
 
 function executeProposal(proposal) {
+  state.executing.add(proposal.proposalId);
   runOnPage(proposal).then(
     function (detail) {
+      state.executing.delete(proposal.proposalId);
+      recordActResult(proposal.proposalId, true, detail);
       sendToRelay(JBB.Message.actResult(proposal.proposalId, true, detail));
       audit({
         site: proposal.site || "-",
@@ -1086,6 +1235,8 @@ function executeProposal(proposal) {
       });
     },
     function (err) {
+      state.executing.delete(proposal.proposalId);
+      recordActResult(proposal.proposalId, false, String(err));
       sendToRelay(JBB.Message.actResult(proposal.proposalId, false, String(err)));
       audit({
         site: proposal.site || "-",
@@ -1404,6 +1555,13 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         return true; // async
       }
       done({ error: "not signed in" });
+      break;
+
+    case "jbb.ui.consentShown":
+      // The panel rendered the consent card — the prompt is actually
+      // visible. This is one of only two paths allowed to mark it shown.
+      markConsentShown(msg.proposalId, "panel");
+      done();
       break;
 
     case "jbb.ui.consent":
