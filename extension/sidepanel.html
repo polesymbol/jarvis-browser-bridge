@@ -12,25 +12,36 @@
 <body>
 
 <header class="app-header">
-  <div class="brand">
-    <div class="brand-mark" aria-hidden="true">
-      <svg width="20" height="20" viewBox="0 0 32 32" fill="none">
-        <path d="M4 21 Q16 7 28 21" stroke="#e8710a" stroke-width="2.6" stroke-linecap="round"/>
-        <path d="M9.5 21 v7 M16 21 v7 M22.5 21 v7" stroke="#e8710a" stroke-width="2" stroke-linecap="round"/>
-        <path d="M4 28 h24" stroke="#8f8875" stroke-width="2" stroke-linecap="round"/>
-      </svg>
+  <div class="header-row">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 32 32" fill="none">
+          <path d="M4 21 Q16 7 28 21" stroke="#84cc16" stroke-width="2.6" stroke-linecap="round"/>
+          <path d="M9.5 21 v7 M16 21 v7 M22.5 21 v7" stroke="#84cc16" stroke-width="2" stroke-linecap="round"/>
+          <path d="M4 28 h24" stroke="#8b9c8e" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <div>
+        <div class="brand-name">Jarvis Bridge</div>
+        <div class="brand-sub" id="brandSub">v0.2.0 · protocol 1.0</div>
+      </div>
     </div>
-    <div>
-      <div class="brand-name">Jarvis Bridge</div>
-      <div class="brand-sub" id="brandSub">v0.2.0 · protocol 1.0</div>
+    <div class="header-right">
+      <button id="statusPill" class="signal" title="Connection detail" aria-label="Connection status — tap for detail"><span class="dot"></span><span class="signal-text">Idle</span></button>
+      <button id="soundBtn" class="theme-btn" title="Approval sound on/off" aria-label="Toggle approval sound">
+        <svg id="iconSoundOn" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.5 5.5a9.4 9.4 0 0 1 0 13"/></svg>
+        <svg id="iconSoundOff" class="hidden" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H2v6h4l5 4V5z"/><line x1="23" y1="9" x2="17" y2="15"/><line x1="17" y1="9" x2="23" y2="15"/></svg>
+      </button>
+      <button id="themeBtn" class="theme-btn" title="Toggle day / night mode" aria-label="Toggle day / night mode">
+        <svg id="iconMoon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        <svg id="iconSun" class="hidden" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+      </button>
     </div>
   </div>
-  <div class="header-right">
-    <div id="statusPill" class="signal"><span class="dot"></span><span class="signal-text">Idle</span></div>
-    <button id="themeBtn" class="theme-btn" title="Toggle day / night mode" aria-label="Toggle day / night mode">
-      <svg id="iconMoon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
-      <svg id="iconSun" class="hidden" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
-    </button>
+  <div id="statusDetail" class="status-detail hidden" role="status"></div>
+  <div class="mode-row">
+    <div id="modeSeg" class="mode-seg" role="group" aria-label="Permission level"></div>
+    <div id="modeCaption" class="mode-caption"></div>
   </div>
 </header>
 
@@ -56,8 +67,9 @@
 <!-- Consent requests always surface at the top, whatever tab is open -->
 <div id="consentArea"></div>
 
-<!-- Plan approval requests surface alongside consent -->
+<!-- Plan approval requests + approved-plan progress, alongside consent -->
 <div id="planArea"></div>
+<div id="planProgress"></div>
 
 <!-- Active time-boxed session grant, with one-click revoke -->
 <div id="sessionBar" class="session-bar hidden"></div>
@@ -66,16 +78,30 @@
   Session killed. Nothing can act until you start a new session.
 </div>
 
-<nav class="tabs">
-  <button class="tab active" data-tab="session">Session</button>
-  <button class="tab" data-tab="key">Key</button>
-  <button class="tab" data-tab="sites">Sites</button>
-  <button class="tab" data-tab="audit">Audit</button>
+<!-- Now strip: what Muse is doing right now, and the two controls that
+     must never be buried — take over and stop. -->
+<div id="nowStrip" class="now-strip hidden">
+  <div class="now-lines">
+    <div id="nowLine1" class="now-line1"></div>
+    <div id="nowLine2" class="now-line2"></div>
+  </div>
+  <div class="now-btns">
+    <button id="nowTakeoverBtn" class="btn btn-secondary">Take over</button>
+    <button id="nowHandbackBtn" class="btn btn-primary hidden">Hand back</button>
+    <button id="nowStopBtn" class="btn btn-danger">Stop</button>
+  </div>
+</div>
+
+<nav class="tabs" role="tablist">
+  <button class="tab active" data-tab="now" role="tab">Now</button>
+  <button class="tab" data-tab="sites" role="tab">Sites</button>
+  <button class="tab" data-tab="audit" role="tab">Audit</button>
+  <button class="tab" data-tab="setup" role="tab">Setup</button>
 </nav>
 
 <main>
-  <!-- ================= SESSION ================= -->
-  <section id="tab-session" class="tab-panel active">
+  <!-- ================= NOW ================= -->
+  <section id="tab-now" class="tab-panel active">
     <div id="mockBanner" class="mock-banner hidden">
       <strong>Mock mode</strong> — no relay configured. The bridge runs
       standalone; nothing leaves this machine.
@@ -84,58 +110,13 @@
     </div>
 
     <div class="card">
-      <h2>Permission level</h2>
-      <p class="hint">One preset instead of a checkbox matrix — it takes effect the moment you pick it. The per-site matrix in the Sites tab still applies underneath (Balanced and Light honour your grants; Strict ignores them while it's on).</p>
-      <div id="modeList" class="mode-list"></div>
-    </div>
-
-    <div class="card">
       <h2>Control</h2>
       <p id="takeoverStatus" class="status-line">Muse is driving.</p>
       <div class="row">
         <button id="takeoverBtn" class="btn btn-secondary">Take over</button>
       </div>
-      <p class="hint">Take over to drive the tab yourself: Muse pauses, and anything it proposes meanwhile queues — nothing is lost and nothing runs. Hand back and the queue resumes through the normal consent gate, in order.</p>
+      <p class="hint">Take over to drive the tab yourself: Muse pauses, and anything it proposes meanwhile queues — nothing is lost and nothing runs. Hand back and the queue resumes through the normal consent gate, in order. While you drive, nothing is recorded or screenshotted.</p>
       <p id="tempGrantLine" class="hint"></p>
-    </div>
-
-    <div class="card">
-      <h2>Relay</h2>
-      <label class="field">
-        <span>Relay URL (wss)</span>
-        <input id="relayUrl" type="text" placeholder="wss://relay.example.com/bridge" spellcheck="false">
-      </label>
-      <div class="row">
-        <button id="saveRelayBtn" class="btn btn-secondary">Save</button>
-        <button id="connectBtn" class="btn btn-primary">Connect</button>
-        <button id="disconnectBtn" class="btn btn-secondary">Disconnect</button>
-        <button id="endSessionBtn" class="btn btn-secondary">End session</button>
-      </div>
-      <p class="hint">Leave empty to stay in mock mode. The relay only passes messages through — it never stores page content.</p>
-      <div class="row">
-        <button id="testNotifBtn" class="btn btn-secondary">Test approval notification</button>
-      </div>
-      <label class="check-row">
-        <input id="soundToggle" type="checkbox" checked>
-        <span>Play a tone with approval prompts <span class="hint-inline">(so you hear it while working elsewhere)</span></span>
-      </label>
-      <div id="notifWarn" class="key-warning hidden">
-        ⚠️ <strong>Approval notifications are blocked</strong> (<span id="notifWarnErr"></span>).
-        Without them you can miss consent requests when this panel is closed.
-        Check Windows notification settings for Chrome, then test again.
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Audio capture</h2>
-      <p class="hint">Lets Muse hear what a tab is playing (for example, a lesson video) and transcribe it. Audio streams to Muse only — it is never stored. Capture always asks first, works per site, and shows a red “listening” pill on the tab itself.</p>
-      <p id="captureStatus" class="status-line">Checking…</p>
-      <div class="row">
-        <button id="capEnableBtn" class="btn btn-secondary hidden">Enable audio capture</button>
-        <button id="capRevokeBtn" class="btn btn-secondary hidden">Revoke permission</button>
-        <button id="capStopBtn" class="btn btn-danger hidden">Stop capture</button>
-      </div>
-      <p class="hint">Enabling asks Chrome for the “capture tab audio” permission — that request only ever happens here, when you click, never automatically.</p>
     </div>
 
     <div class="card">
@@ -146,9 +127,33 @@
       <pre id="snapshotOut" class="snapshot hidden"></pre>
     </div>
 
+    <div id="mediaCard" class="card hidden">
+      <h2>Media</h2>
+      <div id="mediaTitle" class="media-title"></div>
+      <div class="media-controls">
+        <button id="mediaPlayBtn" class="btn btn-primary">Play</button>
+        <button id="mediaPauseBtn" class="btn btn-secondary">Pause</button>
+        <span id="mediaTime" class="media-time">0:00 / 0:00</span>
+      </div>
+      <input id="mediaSeek" type="range" min="0" max="100" value="0" step="0.1" aria-label="Seek">
+      <div class="row">
+        <button id="mediaCapBtn" class="btn btn-secondary">Captions</button>
+        <button id="mediaGrabBtn" class="btn btn-secondary">Grab frame</button>
+      </div>
+      <p id="mediaMsg" class="hint"></p>
+      <img id="mediaFrame" class="media-frame hidden" alt="Frame grabbed from the video">
+      <pre id="mediaCues" class="snapshot hidden"></pre>
+    </div>
+
     <div class="card">
-      <h2>Recent activity</h2>
-      <p class="hint">The last actions Muse took — or tried to. Kept only on this machine; nothing here is sent anywhere.</p>
+      <h2>Activity</h2>
+      <div id="feedChips" class="chips">
+        <button class="chip active" data-feed="all">All</button>
+        <button class="chip" data-feed="asked">Asked</button>
+        <button class="chip" data-feed="auto">Auto-allowed</button>
+        <button class="chip" data-feed="denied">Denied</button>
+        <button class="chip" data-feed="failed">Failed</button>
+      </div>
       <div id="feedList" class="feed-list"></div>
     </div>
 
@@ -168,8 +173,76 @@
     </div>
   </section>
 
-  <!-- ================= KEY ================= -->
-  <section id="tab-key" class="tab-panel">
+  <!-- ================= SITES ================= -->
+  <section id="tab-sites" class="tab-panel">
+    <div class="card">
+      <h2>Site whitelist</h2>
+      <p class="hint">Sites Muse may act on without asking, per tier and per action. Revoke takes effect immediately — even mid-session. This manager works whether or not the driver is connected. Subdomains are separate entries — a grant for a domain never covers its subdomains.</p>
+      <p id="sitesCount" class="hint"></p>
+      <div class="row between">
+        <label class="pause-label" for="grantsPauseToggle"><strong>Pause all grants</strong> — nothing auto-allows while on</label>
+        <input type="checkbox" id="grantsPauseToggle">
+      </div>
+      <div class="row">
+        <input type="text" id="wlDomainInput" placeholder="example.com" autocomplete="off" spellcheck="false">
+        <button id="wlAddBtn" class="btn btn-primary">Add</button>
+        <button id="wlAddCurrentBtn" class="btn btn-secondary">Add this site</button>
+      </div>
+      <div id="wlWarn" class="wl-warn hidden"></div>
+      <div id="sitesList" class="sites-list"></div>
+      <div class="row">
+        <button id="blockCurrentBtn" class="btn btn-secondary">Block current site</button>
+        <button id="wlRevokeAllBtn" class="btn btn-danger">Revoke all</button>
+      </div>
+      <p class="hint">Grants are bound to the current connector key. Rotating the key wipes them — you re-grant deliberately afterwards. Blocked sites can never be auto-allowed, even by an approved plan.</p>
+    </div>
+  </section>
+
+  <!-- ================= AUDIT ================= -->
+  <section id="tab-audit" class="tab-panel">
+    <div class="card">
+      <div class="row between">
+        <h2>Audit log</h2>
+        <button id="exportAuditBtn" class="btn btn-secondary">Export JSON</button>
+      </div>
+      <p class="hint">Every proposed and executed action. Kept only on this machine — no cloud, no sync; nothing leaves unless you export it.</p>
+      <div id="auditChips" class="chips">
+        <button class="chip active" data-audit="all">All</button>
+        <button class="chip" data-audit="allowed">Allowed</button>
+        <button class="chip" data-audit="denied">Denied</button>
+        <button class="chip" data-audit="failed">Failed</button>
+        <button class="chip" data-audit="asked">Asked</button>
+        <button class="chip" data-audit="auto">Auto</button>
+      </div>
+      <div class="row">
+        <input type="text" id="auditSiteFilter" placeholder="Filter by site — e.g. example.com" autocomplete="off" spellcheck="false">
+        <select id="auditSessionSel" aria-label="Session filter">
+          <option value="all">All sessions</option>
+          <option value="this">This session</option>
+          <option value="last">Last session</option>
+        </select>
+      </div>
+      <div id="auditList" class="audit-list"></div>
+    </div>
+  </section>
+
+  <!-- ================= SETUP ================= -->
+  <section id="tab-setup" class="tab-panel">
+    <div class="card">
+      <h2>Relay</h2>
+      <label class="field">
+        <span>Relay URL (wss)</span>
+        <input id="relayUrl" type="text" placeholder="wss://relay.example.com/bridge" spellcheck="false">
+      </label>
+      <div class="row">
+        <button id="saveRelayBtn" class="btn btn-secondary">Save</button>
+        <button id="connectBtn" class="btn btn-primary">Connect</button>
+        <button id="disconnectBtn" class="btn btn-secondary">Disconnect</button>
+        <button id="endSessionBtn" class="btn btn-secondary">End session</button>
+      </div>
+      <p class="hint">Leave empty to stay in mock mode. The relay only passes messages through — it never stores page content. Tap the connection status in the header for the relay / peer / worker breakdown.</p>
+    </div>
+
     <div class="card">
       <h2>Connector key</h2>
       <p class="hint">
@@ -232,40 +305,35 @@
         </div>
       </div>
     </div>
-  </section>
 
-  <!-- ================= SITES ================= -->
-  <section id="tab-sites" class="tab-panel">
     <div class="card">
-      <h2>Site whitelist</h2>
-      <p class="hint">Sites Muse may act on without asking, per tier and per action. Revoke takes effect immediately — even mid-session. This manager works whether or not the driver is connected.</p>
-      <div class="row between">
-        <label class="pause-label" for="grantsPauseToggle"><strong>Pause all grants</strong> — nothing auto-allows while on</label>
-        <input type="checkbox" id="grantsPauseToggle">
-      </div>
+      <h2>Audio capture</h2>
+      <p class="hint">Lets Muse hear what a tab is playing (for example, a lesson video) and transcribe it. Audio streams to Muse only — it is never stored. Capture always asks first, works per site, and shows a red “listening” pill on the tab itself.</p>
+      <p id="captureStatus" class="status-line">Checking…</p>
       <div class="row">
-        <input type="text" id="wlDomainInput" placeholder="example.com" autocomplete="off" spellcheck="false">
-        <button id="wlAddBtn" class="btn btn-primary">Add</button>
-        <button id="wlAddCurrentBtn" class="btn btn-secondary">Add this site</button>
+        <button id="capEnableBtn" class="btn btn-secondary hidden">Enable audio capture</button>
+        <button id="capRevokeBtn" class="btn btn-secondary hidden">Revoke permission</button>
+        <button id="capStopBtn" class="btn btn-danger hidden">Stop capture</button>
       </div>
-      <div id="wlWarn" class="wl-warn hidden"></div>
-      <div id="sitesList" class="sites-list"></div>
-      <div class="row">
-        <button id="blockCurrentBtn" class="btn btn-secondary">Block current site</button>
-        <button id="wlRevokeAllBtn" class="btn btn-danger">Revoke all</button>
-      </div>
+      <p class="hint">Enabling asks Chrome for the “capture tab audio” permission — that request only ever happens here, when you click, never automatically.</p>
     </div>
-  </section>
 
-  <!-- ================= AUDIT ================= -->
-  <section id="tab-audit" class="tab-panel">
     <div class="card">
-      <div class="row between">
-        <h2>Audit log</h2>
-        <button id="exportAuditBtn" class="btn btn-secondary">Export JSON</button>
+      <h2>Sound &amp; notifications</h2>
+      <label class="check-row">
+        <input id="soundToggle" type="checkbox" checked>
+        <span>Play a tone with approval prompts <span class="hint-inline">(so you hear it while working elsewhere — the speaker in the header toggles the same thing)</span></span>
+      </label>
+      <div class="row">
+        <button id="testNotifBtn" class="btn btn-secondary">Test approval notification</button>
       </div>
-      <p class="hint">Every proposed and executed action, kept only on this machine.</p>
-      <div id="auditList" class="audit-list"></div>
+      <p class="hint">The test plays the approval chime and raises a test toast, so you know exactly what an approval sounds and looks like before one matters.</p>
+      <div id="notifWarn" class="key-warning hidden">
+        ⚠️ <strong>Approval notifications are blocked</strong> (<span id="notifWarnErr"></span>).
+        Without them you can miss consent requests when this panel is closed.
+        Check Windows notification settings for Chrome, then test again.
+      </div>
+      <p class="hint">Appearance: the moon/sun button in the header switches day / night. Night is Forest Lime; day is the same instrument on warm paper.</p>
     </div>
   </section>
 </main>

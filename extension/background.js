@@ -83,6 +83,10 @@ var state = {
   keyEpoch: 1,                 // current key epoch; grants from older epochs are invalid
   peerPresent: false,          // a driver is currently paired into the room (peer.joined/left + pair.confirm)
   peerSince: 0,                // when the current driver's presence began (usage accounting)
+  peerSeenAt: 0,               // first time any driver peer was seen this worker life (header honesty)
+  lastFlapAt: 0,               // last time a present peer vanished (header "last flap" + feed)
+  planHold: [],                // [{ proposal, source, receivedAt }] steps held by the plan start/pause gate
+  lastMedia: null,             // latest media.progress from a tab — powers the panel mini-player
   keyMeta: null,               // mirror of K.KEYMETA { createdAt, ttlMs }; null = pre-expiry key (never expires until regenerated)
   keyUsage: { connectedMs: 0, acts: 0 }, // mirror of K.KEYUSAGE — cumulative usage of the current key
   keyExpiryArmed: null,        // reason string once a deadline passed mid-task; expiry fires at disconnect
@@ -827,12 +831,41 @@ function markConsentShown(proposalId, via) {
   sendToRelay(JBB.Message.consentShown(proposalId, via));
 }
 
+// The 60s escalation, made perceivable (Prompt 16 §5.3): fresh toast ID,
+// offscreen recreated before the chime when needed, failures audited.
+function escalateConsent(entry) {
+  var fire = function () { notifyConsent(entry.proposal, { escalation: true }); };
+  if (!offscreenAvailable()) {
+    audit({ site: entry.proposal.site || "-", action: "consent escalation", tier: "T0",
+            result: "failed",
+            detail: "escalation chime failed — the offscreen tone engine is unavailable on this Chrome; the toast was still re-raised under a fresh ID" });
+    fire();
+    return;
+  }
+  ensureOffscreenDocument(fire);
+}
+
 function consentHeartbeatSweep() {
   var now = Date.now();
   // Held proposals get a queued heartbeat so the driver keeps waiting
   // instead of timing out while the user drives.
   state.holdQueue.forEach(function (h) {
     sendToRelay(JBB.Message.proposalQueued(h.proposal.proposalId));
+  });
+  state.planHold.forEach(function (h) {
+    sendToRelay(JBB.Message.proposalQueued(h.proposal.proposalId));
+  });
+  // A plan the user approved but never started releases its held steps
+  // after the start window — an approved plan is not a parked task.
+  state.plans.forEach(function (plan, planId) {
+    if (!plan.started && now - plan.approvedAt > PLAN_START_WINDOW_MS) {
+      flushPlanHold(planId, "the plan was approved but never started — press Start task within " +
+        Math.round(PLAN_START_WINDOW_MS / 60000) + " minutes of approving");
+      state.plans.delete(planId);
+      audit({ site: "-", action: "plan expired unstarted", tier: "T0", result: "expired",
+              detail: "\u201C" + plan.title + "\u201D approved but not started in time — held steps released as failed" });
+      pushToPanel({ kind: "jbb.ui.planChanged" });
+    }
   });
   // A lapsed temporary grant announces itself instead of vanishing silently.
   if (state.tempGrant && now >= state.tempGrant.expiresAt) expireTemp("15 minutes passed");
@@ -843,16 +876,20 @@ function consentHeartbeatSweep() {
       entry.lastWaitingAt = now;
       sendToRelay(JBB.Message.consentWaiting(proposalId, waited));
     }
-    // One escalation at ~60s unanswered: re-chime + re-raise the toast
-    // once (notifyConsent does both, same notification ID in place) and
-    // flash the badge. Once per proposal — this is a nudge, not a loop.
+    // One escalation at ~60s unanswered: a NEW notification (fresh ID —
+    // the OS actually alerts), a re-chime, and the badge flash. The chime
+    // engine lives in the offscreen document; if it is down at this
+    // moment, recreate it FIRST and then chime, and audit a failed chime
+    // as a failure — never swallow it. Once per proposal.
     if (waited >= 60000 && !entry.escalated) {
       entry.escalated = true;
+      entry.escalatedAt = now;
       audit({ site: entry.proposal.site || "-", action: entry.proposal.description || entry.proposal.type,
               tier: entry.proposal.actionTier, result: "escalated",
-              detail: "consent prompt unanswered for 60s — re-chimed, toast re-raised once, badge flashing" });
-      notifyConsent(entry.proposal);
+              detail: "consent prompt unanswered for 60s — new notification raised, re-chimed, badge flashing" });
+      escalateConsent(entry);
       flashBadge();
+      pushToPanel({ kind: "jbb.ui.consentEscalated", proposalId: proposalId, at: now });
     }
   });
 }
@@ -996,8 +1033,12 @@ function playConsentTone() {
   } catch (e) { /* audio unavailable — visual prompt still stands */ }
 }
 
-function notifyConsent(proposal) {
-  var notifId = "jbb-consent-" + proposal.proposalId;
+function notifyConsent(proposal, opts) {
+  // Escalation raises under a FRESH notification id: re-using the original
+  // id makes the OS update the existing toast silently, which is exactly
+  // the invisibility bug the 60s escalation exists to fix (Prompt 16).
+  var notifId = "jbb-consent-" + proposal.proposalId +
+    (opts && opts.escalation ? "-esc" : "");
   state.consentNotifs[notifId] = proposal.proposalId;
   var count = (state.raiseCount[proposal.proposalId] || 0) + 1;
   state.raiseCount[proposal.proposalId] = count;
@@ -1675,6 +1716,7 @@ function handleRelayMessage(raw) {
       if (msg.peer) {
         state.peerPresent = true;
         if (!state.peerSince) state.peerSince = Date.now();
+        if (!state.peerSeenAt) state.peerSeenAt = Date.now();
       }
       if (!state.sessionStartedAt) {
         // A fresh pairing opens a new session window for the summary;
@@ -1699,6 +1741,7 @@ function handleRelayMessage(raw) {
     case "peer.joined":
       state.peerPresent = true;
       if (!state.peerSince) state.peerSince = Date.now();
+      if (!state.peerSeenAt) state.peerSeenAt = Date.now();
       break;
     case "peer.left":
       // The driver hung up: fold its connected time into the key's usage
@@ -1707,6 +1750,7 @@ function handleRelayMessage(raw) {
       foldPeerTime();
       state.peerPresent = false;
       state.peerSince = 0;
+      state.lastFlapAt = Date.now();
       checkKeyExpiry();
       break;
     case "act.propose":
@@ -1790,6 +1834,12 @@ function handleProposal(proposal, source) {
     sendToRelay(JBB.Message.proposalQueued(proposal.proposalId));
     return;
   }
+  // Same for a step held by the plan start/pause gate.
+  if (state.planHold.some(function (h) { return h.proposal.proposalId === proposal.proposalId; })) {
+    sendToRelay(JBB.Message.proposalReceived(proposal.proposalId));
+    sendToRelay(JBB.Message.proposalQueued(proposal.proposalId));
+    return;
+  }
 
   // Lifecycle ack: the proposal is in the gate now. Sent before the verdict
   // so the driver can distinguish "never arrived" (PEER_DOWN) from what
@@ -1810,6 +1860,24 @@ function handleProposal(proposal, source) {
             tier: proposal.actionTier, result: "queued",
             detail: "queued during take-over — runs when you hand back",
             type: proposal.type, proposalId: proposal.proposalId, via: "takeover" });
+    return;
+  }
+
+  // PLAN START GATE: a step of an approved plan that has not been
+  // STARTED yet (or is paused) holds here — it does not prompt, does not
+  // execute, and does not die. Start/Resume replays it through this same
+  // function, where viaPlan can finally cover it.
+  var gatePlan = proposal.planId ? state.plans.get(proposal.planId) : null;
+  if (gatePlan && (!gatePlan.started || gatePlan.paused)) {
+    state.planHold.push({ proposal: proposal, source: source, receivedAt: Date.now() });
+    sendToRelay(JBB.Message.proposalQueued(proposal.proposalId));
+    audit({ site: proposal.site || "-", action: proposal.description || proposal.type,
+            tier: proposal.actionTier, result: "queued",
+            detail: gatePlan.started
+              ? "plan “" + gatePlan.title + "” is paused — runs when the plan resumes"
+              : "plan “" + gatePlan.title + "” is approved but not started — runs when you press Start task",
+            type: proposal.type, proposalId: proposal.proposalId, via: "plan" });
+    pushToPanel({ kind: "jbb.ui.planChanged" });
     return;
   }
 
@@ -1865,7 +1933,7 @@ function proceedWithVerdict(proposal) {
                   proposal.actionTier !== "T3";
   var plan = proposal.planId ? state.plans.get(proposal.planId) : null;
   if (plan && Date.now() >= plan.expiresAt) { state.plans.delete(proposal.planId); plan = null; }
-  var viaPlan = layerBase && !!plan &&
+  var viaPlan = layerBase && !!plan && plan.started && !plan.paused &&
                 plan.usedSteps < plan.stepCount &&
                 plan.sites.indexOf(hostOf(proposal.site || "")) >= 0;
   var viaTemp = layerBase && !strictMode && tempAllows(proposal);
@@ -2117,6 +2185,7 @@ function dropHold(reason) {
 // unlisted site asks like any ungranted action.
 var PLAN_MAX_STEPS = 20;
 var PLAN_TTL_MS = 30 * 60000;
+var PLAN_START_WINDOW_MS = 120000; // approved-but-unstarted plans release held steps after 2 min
 
 function denyPlan(planId, reason) {
   sendToRelay(JBB.Message.planDenied(planId, reason));
@@ -2173,14 +2242,84 @@ function resolvePlan(planId, approved) {
   var plan = {
     planId: planId, title: record.title, sites: record.sites,
     stepCount: record.steps.length, usedSteps: 0,
-    approvedAt: Date.now(), expiresAt: Date.now() + PLAN_TTL_MS
+    approvedAt: Date.now(), expiresAt: Date.now() + PLAN_TTL_MS,
+    started: false, startedAt: 0, paused: false
   };
   state.plans.set(planId, plan);
   sendToRelay(JBB.Message.planApproved(planId, { sites: plan.sites, stepCount: plan.stepCount, expiresAt: plan.expiresAt }));
   audit({ site: "-", action: "plan approved", tier: "T0", result: "allowed",
           detail: "“" + plan.title + "” — " + plan.stepCount + " steps on " + plan.sites.join(", ") +
-                  "; steps run without prompts except T3, which still asks" });
+                  "; approved is not started: nothing runs until Start task; T3 steps still ask individually" });
   playVerdictTone(true);
+}
+
+// ------------------------------------------------------------ plan start gate
+// Approving a plan scopes it; STARTING it runs it (Prompt 16 §5.4, the
+// Gemini two-stage pattern). Steps that arrive while the plan is
+// unstarted or paused HOLD — receipt + queued heartbeats, no prompt, no
+// execution — exactly like take-over holds, and they replay in order on
+// Start/Resume. Stop (or the start window lapsing) releases them as
+// plain failures: the driver always hears an outcome.
+function flushPlanHold(planId, reason) {
+  var mine = state.planHold.filter(function (h) { return h.proposal.planId === planId; });
+  if (!mine.length) return;
+  state.planHold = state.planHold.filter(function (h) { return h.proposal.planId !== planId; });
+  mine.forEach(function (h) {
+    recordActResult(h.proposal.proposalId, false, reason);
+    sendToRelay(JBB.Message.actResult(h.proposal.proposalId, false, reason));
+    audit({ site: h.proposal.site || "-", action: h.proposal.description || h.proposal.type,
+            tier: h.proposal.actionTier, result: "failed", detail: reason,
+            type: h.proposal.type, proposalId: h.proposal.proposalId, via: "plan" });
+  });
+}
+
+function replayPlanHold(planId) {
+  var mine = state.planHold.filter(function (h) { return h.proposal.planId === planId; });
+  if (!mine.length) return;
+  state.planHold = state.planHold.filter(function (h) { return h.proposal.planId !== planId; });
+  mine.forEach(function (h) { handleProposal(h.proposal, h.source); });
+}
+
+function startPlan(planId) {
+  var plan = state.plans.get(planId);
+  if (!plan || plan.started) return;
+  plan.started = true;
+  plan.startedAt = Date.now();
+  plan.paused = false;
+  audit({ site: "-", action: "plan started", tier: "T0", result: "allowed",
+          detail: "“" + plan.title + "” started by user — steps now run under the plan" });
+  pushToPanel({ kind: "jbb.ui.planChanged" });
+  replayPlanHold(planId);
+}
+
+function pausePlan(planId) {
+  var plan = state.plans.get(planId);
+  if (!plan || !plan.started || plan.paused) return;
+  plan.paused = true;
+  audit({ site: "-", action: "plan paused", tier: "T0", result: "allowed",
+          detail: "“" + plan.title + "” paused by user — further steps hold until resume" });
+  pushToPanel({ kind: "jbb.ui.planChanged" });
+}
+
+function resumePlan(planId) {
+  var plan = state.plans.get(planId);
+  if (!plan || !plan.paused) return;
+  plan.paused = false;
+  audit({ site: "-", action: "plan resumed", tier: "T0", result: "allowed",
+          detail: "“" + plan.title + "” resumed by user" });
+  pushToPanel({ kind: "jbb.ui.planChanged" });
+  replayPlanHold(planId);
+}
+
+function stopPlan(planId, reason) {
+  var plan = state.plans.get(planId);
+  flushPlanHold(planId, reason || "plan stopped by user");
+  if (plan) {
+    state.plans.delete(planId);
+    audit({ site: "-", action: "plan stopped", tier: "T0", result: "denied",
+            detail: "“" + plan.title + "” stopped — " + plan.usedSteps + " of " + plan.stepCount + " steps ran" });
+  }
+  pushToPanel({ kind: "jbb.ui.planChanged" });
 }
 
 function endPlans(reason) {
@@ -2188,6 +2327,7 @@ function endPlans(reason) {
     sendToRelay(JBB.Message.planDenied(planId, reason));
   });
   state.planPending.clear();
+  state.plans.forEach(function (plan, planId) { flushPlanHold(planId, reason); });
   state.plans.clear();
 }
 
@@ -2781,6 +2921,9 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   // never stored. Only real tab senders count.
   if (msg.kind === "jbb.media.progress") {
     if (!sender || !sender.tab) return false;
+    state.lastMedia = { tabId: sender.tab.id, title: msg.title || "", url: msg.url || "",
+                        currentTime: msg.currentTime, duration: msg.duration,
+                        paused: !!msg.paused, ended: !!msg.ended, at: Date.now() };
     if (state.connected && !state.sessionKilled) {
       sendToRelay(JBB.Message.mediaProgress({
         tabId: sender.tab.id, title: msg.title, url: msg.url, event: msg.event,
@@ -2850,7 +2993,31 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
             return { planId: p.planId, title: p.title, sites: p.sites, steps: p.steps };
           }),
           killed: state.sessionKilled,
-          pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
+          sessionStartedAt: state.sessionStartedAt || 0,
+          media: state.lastMedia,
+          peer: {
+            present: !!state.peerPresent,
+            seenAt: state.peerSeenAt || 0,
+            lastFlapAt: state.lastFlapAt || 0,
+            pendingCount: state.pending.size
+          },
+          plans: Array.from(state.plans.values()).map(function (pl) {
+            return { planId: pl.planId, title: pl.title, sites: pl.sites,
+                     stepCount: pl.stepCount, usedSteps: pl.usedSteps,
+                     started: !!pl.started, startedAt: pl.startedAt || 0,
+                     approvedAt: pl.approvedAt, paused: !!pl.paused,
+                     heldCount: state.planHold.filter(function (h) {
+                       return h.proposal.planId === pl.planId;
+                     }).length };
+          }),
+          pending: Array.from(state.pending.values()).map(function (p) {
+            var out = {};
+            for (var k in p.proposal) out[k] = p.proposal[k];
+            out._createdAt = p.createdAt || 0;
+            out._escalated = !!p.escalated;
+            out._escalatedAt = p.escalatedAt || 0;
+            return out;
+          }),
           session: sess ? { site: sess.site, label: sess.label,
                             remainingMs: Math.max(0, sess.expiresAt - Date.now()) } : null,
           audit: res[K.AUDIT] || []
@@ -2899,6 +3066,32 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       done();
       break;
 
+    case "jbb.ui.mediaAct": {
+      // The user pressing Play in their own panel IS the consent — the
+      // same rule as the panel's tab actions. No proposal, no prompt;
+      // the act is audited like everything else.
+      chrome.tabs.query({ active: true, currentWindow: true }, function (tabs) {
+        var tab = tabs && tabs[0];
+        if (!tab) { done({ ok: false, error: "no active tab" }); return; }
+        var type = msg.actType || "media";
+        var proposal = { proposalId: "panel-" + Date.now(), actionTier: "T2", type: type,
+          site: tab.url || "", target: { ref: null, label: msg.label || "" },
+          description: type + " from the panel", source: "panel" };
+        if (type === "media") proposal.media = { action: msg.action || "play", seekTo: msg.seekTo };
+        if (type === "captions") { proposal.from = msg.from; proposal.to = msg.to; }
+        executeProposal(proposal).then(function (r) {
+          audit({ site: hostOf(tab.url || ""), action: proposal.description, tier: "T2",
+                  result: "executed", detail: r.detail || "" });
+          done({ ok: true, detail: r.detail, data: r.data });
+        }, function (err) {
+          audit({ site: hostOf(tab.url || ""), action: proposal.description, tier: "T2",
+                  result: "failed", detail: String((err && err.message) || err) });
+          done({ ok: false, error: String((err && err.message) || err) });
+        });
+      });
+      return true;
+    }
+
     case "jbb.ui.closeInactiveTabs":
       // The user clicking in their own panel IS the consent — this is
       // their control surface, not an agent action. Same guarded
@@ -2931,6 +3124,46 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
 
     case "jbb.ui.planResolve":
       resolvePlan(msg.planId, !!msg.approved);
+      done({ ok: true });
+      break;
+
+    case "jbb.ui.planEdit": {
+      var rec = state.planPending.get(msg.planId);
+      if (!rec) { done({ ok: false, error: "plan no longer pending" }); break; }
+      var keep = Array.isArray(msg.keep) ? msg.keep : [];
+      rec.steps = rec.steps.filter(function (_, i) { return keep.indexOf(i) >= 0; });
+      if (!rec.steps.length) {
+        resolvePlan(msg.planId, false);
+        done({ ok: true, removedAll: true });
+        break;
+      }
+      var siteSet = {};
+      rec.steps.forEach(function (st) { var h = hostOf(st.site || ""); if (h) siteSet[h] = 1; });
+      rec.sites = Object.keys(siteSet);
+      audit({ site: "-", action: "plan edited", tier: "T0", result: "allowed",
+              detail: "“" + rec.title + "” re-scoped to " + rec.steps.length + " steps on " + rec.sites.join(", ") });
+      pushToPanel({ kind: "jbb.ui.planChanged" });
+      done({ ok: true });
+      break;
+    }
+
+    case "jbb.ui.planStart":
+      startPlan(msg.planId);
+      done({ ok: true });
+      break;
+
+    case "jbb.ui.planPause":
+      pausePlan(msg.planId);
+      done({ ok: true });
+      break;
+
+    case "jbb.ui.planResume":
+      resumePlan(msg.planId);
+      done({ ok: true });
+      break;
+
+    case "jbb.ui.planStop":
+      stopPlan(msg.planId);
       done({ ok: true });
       break;
 

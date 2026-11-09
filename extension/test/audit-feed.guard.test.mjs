@@ -52,7 +52,7 @@ check("protocol exports the shared feed language",
   proto.includes("Auto-allowed by whitelist: "));
 check("panel: feed card, summary card, End session button exist and render via JBB.feedRows",
   panelHtml.includes('id="feedList"') && panelHtml.includes('id="summaryCard"') &&
-  panelHtml.includes('id="endSessionBtn"') && panel.includes("JBB.feedRows(entries || [], 10)") &&
+  panelHtml.includes('id="endSessionBtn"') && panel.includes("JBB.feedRows(entries || [], 50)") &&
   panel.includes("renderSummary(s.lastSummary)"));
 
 console.log(failures === 0 ? "ALL AUDIT FEED GUARD TESTS PASSED" : failures + " AUDIT FEED GUARD CHECK(S) FAILED");

@@ -189,8 +189,19 @@ ui({ kind: "jbb.ui.planResolve", planId: "plan-1", approved: true });
 await tick(40);
 check("approval is relayed to the driver",
   relayPayloads().some((m) => m.type === "plan.approved" && m.planId === "plan-1"));
+// Prompt 16 two-stage gate: approved is NOT started. A step that arrives
+// before Start task holds — no prompt, no execution, no result.
+await propose({ proposalId: "pl-0", planId: "plan-1" });
+check("a step arriving before Start task is HELD by the plan gate",
+  sandbox.state.planHold.some((h) => h.proposal.proposalId === "pl-0") &&
+  !sandbox.state.pending.has("pl-0") && !actResult("pl-0"));
+ui({ kind: "jbb.ui.planStart", planId: "plan-1" });
+await tick(60);
+check("Start task replays the held step, which runs under the plan",
+  !sandbox.state.planHold.some((h) => h.proposal.proposalId === "pl-0") &&
+  !!actResult("pl-0") && actResult("pl-0").ok === true);
 await propose({ proposalId: "pl-1", planId: "plan-1" });
-check("an approved plan's T1 step runs with no prompt",
+check("an approved + started plan's T1 step runs with no prompt",
   !sandbox.state.pending.has("pl-1") && !!actResult("pl-1") && actResult("pl-1").ok === true);
 await propose({ proposalId: "pl-2", planId: "plan-1", actionTier: "T3", description: "pay now" });
 check("the plan NEVER covers a T3 step — it asks", sandbox.state.pending.has("pl-2"));

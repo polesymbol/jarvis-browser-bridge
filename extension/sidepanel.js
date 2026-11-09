@@ -26,6 +26,17 @@ function api(msg) {
   return chrome.runtime.sendMessage(msg);
 }
 
+var lastState = null;      // most recent getState — cards look plans up here
+var feedFilter = "all";    // Activity feed chip: all | asked | auto | denied | failed
+var auditFilter = { cat: "all", site: "", session: "all" };
+var statusOpen = false;    // header connection breakdown expanded
+
+function fmtAge(ms) {
+  var sec = Math.max(0, Math.floor(ms / 1000));
+  var m = Math.floor(sec / 60);
+  return m + ":" + String(sec % 60).padStart(2, "0");
+}
+
 function toast(text) {
   var t = el("toast");
   t.textContent = text;
@@ -93,43 +104,97 @@ function renderStatus(s) {
     pill.className = "signal" + (cls ? " " + cls : "");
     label.textContent = text;
   }
+  var peer = s.peer || { present: false, seenAt: 0, lastFlapAt: 0 };
   if (s.killed) {
     setSignal("dead", "Killed");
-  } else if (s.connected) {
-    setSignal("on", "Connected");
+  } else if (s.takeover) {
+    setSignal("", "Paused — you're driving");
+  } else if (s.connected && peer.present) {
+    setSignal("on", "Connected · peer live");
     el("keyReconnectNotice").classList.add("hidden");
+  } else if (s.connected && peer.seenAt) {
+    // The peer was here and is gone: that is "reconnecting", never
+    // "connected" — the flap the old single green dot used to hide.
+    setSignal("warn", "Reconnecting…");
+  } else if (s.connected) {
+    setSignal("dead", "Peer never joined");
   } else if (s.mockMode) {
     setSignal("", "Mock mode");
+  } else if (s.relayUrl) {
+    setSignal("dead", "Relay down");
   } else {
     setSignal("", "Idle");
   }
+  if (s.grantsPaused && !s.killed) label.textContent += " · grants paused";
+  // Sound header icon mirrors the Setup checkbox.
+  var soundOn = (typeof s.soundOn === "boolean") ? s.soundOn : true;
+  el("iconSoundOn").classList.toggle("hidden", !soundOn);
+  el("iconSoundOff").classList.toggle("hidden", soundOn);
+  renderStatusDetail(s);
   el("mockBanner").classList.toggle("hidden", !s.mockMode);
   el("killBtn").classList.toggle("hidden", !!s.killed);
   el("reviveBtn").classList.toggle("hidden", !s.killed);
   el("killedBanner").classList.toggle("hidden", !s.killed);
 }
 
+function renderStatusDetail(s) {
+  var box = el("statusDetail");
+  if (!statusOpen) { box.classList.add("hidden"); return; }
+  var peer = s.peer || { present: false, seenAt: 0, lastFlapAt: 0, pendingCount: 0 };
+  var lines = [
+    "Relay: " + (s.connected ? "up — extension joined" : (s.relayUrl ? "down — cannot reach it" : "not configured (mock mode)")),
+    "Peer (driver): " + (peer.present ? "live in the room" : (peer.seenAt ? "absent — was here, dropped out" : "never joined — a wrong key pairs into an empty room silently; the key may not match")),
+    "Worker: alive (it answered this panel)",
+    "Pending proposals: " + ((s.pending || []).length),
+    "Last flap: " + (peer.lastFlapAt ? new Date(peer.lastFlapAt).toLocaleTimeString() : "—")
+  ];
+  box.textContent = lines.join(" · ");
+  box.classList.remove("hidden");
+}
+
+// The mode selector lives in the header now — always visible, one tap,
+// takes effect immediately (the worker audits the change). Four segments:
+// Readonly stays (Pratik's call, 2026-11-09) — observe-only is a real
+// safety posture, not a legacy mode.
 function renderModes(mode) {
-  var list = el("modeList");
-  list.innerHTML = "";
+  var seg = el("modeSeg");
+  seg.innerHTML = "";
   Object.keys(JBB.MODES).forEach(function (key) {
     var m = JBB.MODES[key];
-    var label = document.createElement("label");
-    label.className = "mode-opt" + (key === mode ? " selected" : "");
-    label.innerHTML =
-      '<input type="radio" name="mode" value="' + key + '"' + (key === mode ? " checked" : "") + ">" +
-      '<span><span class="mode-label">' + esc(m.label) + "</span><br>" +
-      '<span class="mode-desc">' + esc(m.desc) + "</span></span>";
-    label.querySelector("input").addEventListener("change", function () {
+    var btn = document.createElement("button");
+    btn.className = "mode-seg-btn" + (key === mode ? " active" : "");
+    btn.textContent = m.label;
+    btn.setAttribute("aria-pressed", key === mode ? "true" : "false");
+    btn.addEventListener("click", function () {
+      if (key === mode) return;
       api({ kind: "jbb.ui.setMode", mode: key }).then(function () {
         toast("Mode: " + m.label);
+        refresh();
       });
     });
-    list.appendChild(label);
+    seg.appendChild(btn);
   });
+  var cur = JBB.MODES[mode];
+  el("modeCaption").textContent = cur ? cur.label + ": " + cur.desc : "";
 }
 
 // ---------------------------------------------------------------- consent cards
+// The hero element. One card per pending proposal, newest first: tier,
+// plain-words action, exact domain, WHY (plan/step), an age timer that
+// counts up, and the decisions — four max, with timed grants folded into
+// "More options". A card never auto-denies and never vanishes: after the
+// driver's 120s window it stays queued here, and says so.
+function planWhyLine(proposal) {
+  if (!proposal.planId) return "No plan context — asked on its own.";
+  var plans = (lastState && lastState.plans) || [];
+  var pending = (lastState && lastState.planPending) || [];
+  var found = null;
+  plans.concat(pending).forEach(function (pl) { if (pl.planId === proposal.planId) found = pl; });
+  if (!found) return "Plan step — asked on its own.";
+  var stepNote = found.stepCount ? "step " + (Math.min((found.usedSteps || 0) + 1, found.stepCount)) + " of " + found.stepCount : "a step";
+  return "Plan “" + (found.title || "Untitled plan") + "” · " + stepNote + ".";
+}
+
 function renderConsentCard(proposal) {
   var area = el("consentArea");
   // One card per proposal; replace if re-rendered.
@@ -137,37 +202,49 @@ function renderConsentCard(proposal) {
   if (old) old.remove();
 
   var tier = JBB.ACTION_TIERS[proposal.actionTier] || { label: proposal.actionTier, desc: "" };
+  var isT3 = proposal.actionTier === "T3";
+  var routine = proposal.actionTier === "T1" || proposal.actionTier === "T2";
+  var createdAt = proposal._createdAt || Date.now();
   var card = document.createElement("div");
   card.className = "consent-card tier-" + proposal.actionTier;
   card.id = "consent-" + proposal.proposalId;
+  card.setAttribute("role", "group");
+  card.setAttribute("aria-label", "Approval request");
   card.innerHTML =
     '<div class="consent-head">' +
       '<span class="tier-badge">' + esc(tier.label) + "</span>" +
       '<span class="consent-site">' + esc(hostOf(proposal.site)) + "</span>" +
+      '<span class="consent-age" data-age-since="' + createdAt + '">waiting ' + fmtAge(Date.now() - createdAt) + "</span>" +
     "</div>" +
     '<div class="consent-desc">' + esc(proposal.description || proposal.type) + "</div>" +
+    '<div class="consent-why">' + esc(planWhyLine(proposal)) + "</div>" +
     '<div class="consent-tier-desc">' + esc(tier.desc) + "</div>" +
+    (isT3 ? '<div class="consent-t3warn">⚠ Critical action. This always asks, even inside a grant or a plan.</div>' : "") +
     '<div class="consent-actions">' +
       '<button class="btn btn-primary" data-choice="once">Allow once</button>' +
-      (proposal.actionTier === "T1" || proposal.actionTier === "T2"
-        ? '<button class="btn btn-secondary" data-choice="whitelist">Always allow on this site</button>'
-        : '') +
-      (proposal.actionTier === "T1" || proposal.actionTier === "T2"
-        ? '<button class="btn btn-secondary" data-choice="untilLeave">Allow until I leave this site</button>'
-        : '') +
-      '<button class="btn btn-secondary" data-choice="session1h">For 1 hour</button>' +
-      '<button class="btn btn-secondary" data-choice="session24h">For 1 day</button>' +
-      '<button class="btn btn-secondary" data-choice="session1w">For 1 week</button>' +
+      (routine ? '<button class="btn btn-secondary" data-choice="session1h">Allow for this session</button>' : "") +
+      (routine ? '<button class="btn btn-secondary" data-choice="whitelist">Always allow on this site</button>' : "") +
       '<button class="btn btn-danger" data-choice="deny">Deny</button>' +
     "</div>" +
-    '<div class="consent-custom">' +
-      '<label for="until-' + proposal.proposalId + '">Or until</label>' +
-      '<input type="datetime-local" class="consent-until" id="until-' + proposal.proposalId + '">' +
-      '<button class="btn btn-secondary" data-choice="sessionCustom">Allow until then</button>' +
-    "</div>" +
-    '<div class="consent-grant-note">Timed grants cover routine (T1–T2) actions on this site until they lapse. “Allow until I leave this site” covers this site in this tab until you navigate away, close the tab, or 15 minutes pass — whichever comes first. “Always allow on this site” writes a whitelist entry for this action’s tier on this exact domain only — subdomains are separate entries, and you can narrow it per action in the Sites tab. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
+    (routine ?
+    '<details class="consent-more"><summary>More options — timed grants</summary>' +
+      '<div class="consent-actions">' +
+        '<button class="btn btn-secondary" data-choice="untilLeave">Until I leave this site</button>' +
+        '<button class="btn btn-secondary" data-choice="session24h">For 1 day</button>' +
+        '<button class="btn btn-secondary" data-choice="session1w">For 1 week</button>' +
+      "</div>" +
+      '<div class="consent-custom">' +
+        '<label for="until-' + proposal.proposalId + '">Or until</label>' +
+        '<input type="datetime-local" class="consent-until" id="until-' + proposal.proposalId + '">' +
+        '<button class="btn btn-secondary" data-choice="sessionCustom">Allow until then</button>' +
+      "</div>" +
+    "</details>" : "") +
+    '<div class="consent-grant-note">Timed grants cover routine (T1–T2) actions on this site until they lapse. “Always allow on this site” writes a whitelist entry for this action’s tier on this exact domain only — subdomains are separate entries, and you can narrow it per action in the Sites tab. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>' +
+    '<div class="consent-queue-note">Unanswered — still queued, never auto-denied. It will wait here until you answer or the session ends.</div>' +
+    (proposal._escalated ? '<div class="consent-esc-line">Escalated at 1:00 — chimed again with a new notification.</div>' : "") +
+    '<div class="consent-driver-note hidden">Timed out on the driver side — still queued here. You can still answer it.</div>';
 
-  card.querySelectorAll("button").forEach(function (btn) {
+  card.querySelectorAll("button[data-choice]").forEach(function (btn) {
     btn.addEventListener("click", function () {
       var choice = btn.getAttribute("data-choice");
       var payload = { kind: "jbb.ui.consent", proposalId: proposal.proposalId, choice: choice };
@@ -217,34 +294,162 @@ function renderPlanCard(plan) {
   var area = el("planArea");
   if (!area || document.getElementById("plan-" + plan.planId)) return;
   var card = document.createElement("div");
-  card.className = "consent-card";
+  card.className = "consent-card plan-card";
   card.id = "plan-" + plan.planId;
-  var stepsHtml = (plan.steps || []).map(function (s, i) {
-    var t3 = s.actionTier === "T3";
-    return '<div class="plan-step">' + (i + 1) + ". " + esc(s.description || s.type) +
-      ' <span class="mini-tag' + (t3 ? " tag-warn" : "") + '">' + esc(s.actionTier || "T1") + (t3 ? " — will ask" : "") + "</span>" +
-      ' <span class="hint-inline">' + esc(hostOf(s.site || "")) + "</span></div>";
-  }).join("");
-  card.innerHTML =
-    '<div class="consent-head"><span class="tier-badge">PLAN</span>' +
-      '<span class="consent-site">' + esc(plan.title || "Plan") + "</span></div>" +
-    '<div class="consent-desc">Approve once and these ' + (plan.steps || []).length +
-      ' steps run without per-step prompts — except T3 steps, which still ask individually.</div>' +
-    '<div class="plan-steps">' + stepsHtml + "</div>" +
-    '<div class="consent-tier-desc">Sites covered: ' + esc((plan.sites || []).join(", ")) +
-      '. The plan ends when its steps run out or after 30 minutes.</div>' +
-    '<div class="consent-actions">' +
-      '<button class="btn btn-primary" data-plan="approve">Approve plan</button>' +
-      '<button class="btn btn-danger" data-plan="deny">Deny</button>' +
-    "</div>";
-  card.querySelectorAll("button").forEach(function (btn) {
-    btn.addEventListener("click", function () {
-      api({ kind: "jbb.ui.planResolve", planId: plan.planId,
-            approved: btn.getAttribute("data-plan") === "approve" })
-        .then(function () { card.remove(); });
+  var steps = (plan.steps || []).slice();
+  function stepsHtml(editing) {
+    return steps.map(function (st, i) {
+      var t3 = st.actionTier === "T3";
+      return '<div class="plan-step">' + (i + 1) + ". " + esc(st.description || st.type) +
+        ' <span class="mini-tag' + (t3 ? " tag-bad" : "") + '">' + esc(st.actionTier || "T1") + (t3 ? " — will ask" : "") + "</span>" +
+        ' <span class="hint-inline">' + esc(hostOf(st.site || "")) + "</span>" +
+        (editing ? ' <button class="plan-remove" data-remove="' + i + '" aria-label="Remove step ' + (i + 1) + '">✕</button>' : "") +
+        "</div>";
+    }).join("");
+  }
+  function paint(editing) {
+    card.innerHTML =
+      '<div class="consent-head"><span class="tier-badge">PLAN</span>' +
+        '<span class="consent-site">' + esc(plan.title || "Plan") + "</span></div>" +
+      '<div class="consent-desc">Plan: ' + esc(plan.title || "Untitled plan") + " — " + steps.length +
+        " steps. Approving scopes the run; it does not start it — you start it with a separate Start task.</div>" +
+      '<div class="plan-steps">' + stepsHtml(editing) + "</div>" +
+      '<div class="consent-tier-desc">Sites covered: ' + esc((plan.sites || []).join(", ")) +
+        '. T3 steps still ask individually, even inside the plan.</div>' +
+      (editing
+        ? '<div class="consent-actions"><button class="btn btn-primary" data-plan="doneedit">Done editing</button></div>'
+        : '<div class="consent-actions">' +
+            '<button class="btn btn-primary" data-plan="approve">Approve plan</button>' +
+            '<button class="btn btn-secondary" data-plan="edit">Edit</button>' +
+            '<button class="btn btn-danger" data-plan="deny">Deny</button>' +
+          "</div>");
+    card.querySelectorAll("button").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var rm = btn.getAttribute("data-remove");
+        if (rm !== null && rm !== undefined) {
+          steps.splice(Number(rm), 1);
+          paint(true);
+          return;
+        }
+        var act = btn.getAttribute("data-plan");
+        if (act === "edit") { paint(true); return; }
+        if (act === "doneedit") {
+          var keep = steps.map(function (st) { return (plan.steps || []).indexOf(st); })
+                          .filter(function (i) { return i >= 0; });
+          api({ kind: "jbb.ui.planEdit", planId: plan.planId, keep: keep }).then(function (res) {
+            if (res && res.removedAll) { card.remove(); toast("Plan emptied — treated as denied"); }
+            else paint(false);
+          });
+          return;
+        }
+        api({ kind: "jbb.ui.planResolve", planId: plan.planId, approved: act === "approve" })
+          .then(function () { card.remove(); refresh(); });
+      });
     });
-  });
+  }
+  paint(false);
   area.prepend(card);
+}
+
+// Approved plans: progress view + the two-stage gate controls. Rendered
+// from getState on every refresh, into #planProgress.
+function renderPlans(plans) {
+  var box = el("planProgress");
+  if (!box) return;
+  box.innerHTML = "";
+  (plans || []).forEach(function (pl) {
+    var card = document.createElement("div");
+    card.className = "consent-card plan-progress";
+    var status = !pl.started
+      ? "Approved — not started. Steps are holding; nothing runs until you start the task."
+      : pl.paused
+        ? "Paused at step " + Math.min(pl.usedSteps + 1, pl.stepCount) + " of " + pl.stepCount + "."
+        : "Running — step " + Math.min(pl.usedSteps + 1, pl.stepCount) + " of " + pl.stepCount + ".";
+    card.innerHTML =
+      '<div class="consent-head"><span class="tier-badge">PLAN</span>' +
+        '<span class="consent-site">' + esc(pl.title || "Plan") + "</span></div>" +
+      '<div class="plan-status">' + esc(status) +
+        (pl.heldCount ? ' <span class="hint-inline">(' + pl.heldCount + " step" + (pl.heldCount === 1 ? "" : "s") + " held)</span>" : "") +
+      "</div>" +
+      '<div class="plan-bar"><div class="plan-bar-fill"></div></div>' +
+      '<div class="consent-actions">' +
+        (!pl.started ? '<button class="btn btn-primary" data-pact="start">Start task</button>' : "") +
+        (pl.started && !pl.paused ? '<button class="btn btn-secondary" data-pact="pause">Pause</button>' : "") +
+        (pl.paused ? '<button class="btn btn-primary" data-pact="resume">Resume</button>' : "") +
+        '<button class="btn btn-danger" data-pact="stop">Stop</button>' +
+      "</div>";
+    // Progress width via JS property — a style="" attribute in innerHTML
+    // would trip the panel's CSP (the v0.2.3 lesson).
+    var fill = card.querySelector(".plan-bar-fill");
+    if (fill) fill.style.width = (pl.stepCount ? Math.round(100 * pl.usedSteps / pl.stepCount) : 0) + "%";
+    card.querySelectorAll("button[data-pact]").forEach(function (btn) {
+      btn.addEventListener("click", function () {
+        var kind = { start: "jbb.ui.planStart", pause: "jbb.ui.planPause",
+                     resume: "jbb.ui.planResume", stop: "jbb.ui.planStop" }[btn.getAttribute("data-pact")];
+        api({ kind: kind, planId: pl.planId }).then(function () { refresh(); });
+      });
+    });
+    box.appendChild(card);
+  });
+}
+
+// ------------------------------------------------------------- now strip
+// The sticky "what is Muse doing" strip: visible only while something
+// is happening — a plan, a pending approval, a capture, or take-over.
+function renderNowStrip(s) {
+  var strip = el("nowStrip");
+  if (!strip) return;
+  var plan = (s.plans || []).filter(function (pl) { return pl.started; })[0] ||
+             (s.plans || [])[0];
+  var pending = (s.pending || [])[0];
+  var show = !!(s.takeover || plan || pending || (s.capture && s.capture.active));
+  strip.classList.toggle("hidden", !show);
+  if (!show) return;
+  var l1 = "", l2 = "";
+  if (s.takeover) {
+    l1 = "You're driving — Muse is paused";
+    l2 = "Proposals queue; nothing runs, nothing is lost. Nothing is recorded or screenshotted while you drive.";
+  } else if (plan && plan.started) {
+    l1 = "Step " + Math.min(plan.usedSteps + 1, plan.stepCount) + " of " + plan.stepCount + ": " + (plan.title || "Plan");
+    l2 = (plan.sites || []).join(", ") + (plan.paused ? " · paused" : "");
+  } else if (plan) {
+    l1 = "Plan approved — waiting for Start task";
+    l2 = plan.title || "";
+  } else if (pending) {
+    l1 = "Waiting for your approval — " + (pending.description || pending.type);
+    l2 = hostOf(pending.site || "");
+  } else if (s.capture && s.capture.active) {
+    l1 = "Listening to " + (s.capture.host || "a tab");
+    l2 = "Audio capture is running — the tab shows a red pill.";
+  }
+  el("nowLine1").textContent = l1;
+  el("nowLine2").textContent = l2;
+  el("nowTakeoverBtn").classList.toggle("hidden", !!s.takeover);
+  el("nowHandbackBtn").classList.toggle("hidden", !s.takeover);
+  el("nowStopBtn").textContent = plan ? "Stop plan" : "Stop";
+  strip.dataset.planId = plan ? plan.planId : "";
+}
+
+// ------------------------------------------------------------- media mini-player
+function fmtClock(sec) {
+  if (typeof sec !== "number" || !isFinite(sec)) return "0:00";
+  var m = Math.floor(sec / 60), ss = Math.floor(sec % 60);
+  return m + ":" + String(ss).padStart(2, "0");
+}
+
+function renderMedia(s) {
+  var card = el("mediaCard");
+  if (!card) return;
+  var m = s.media;
+  if (!m || !m.at || Date.now() - m.at > 45000) { card.classList.add("hidden"); return; }
+  card.classList.remove("hidden");
+  el("mediaTitle").textContent = m.title || hostOf(m.url || "");
+  el("mediaTime").textContent = fmtClock(m.currentTime) + " / " + fmtClock(m.duration);
+  var seek = el("mediaSeek");
+  if (document.activeElement !== seek && m.duration) {
+    seek.max = m.duration;
+    seek.value = m.currentTime || 0;
+  }
 }
 
 // ---------------------------------------------------------------- session grant
@@ -334,6 +539,10 @@ var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelect
                   "waitFor", "fetch", "media", "captions", "frameGrab", "audioCapture"];
 var WL_REVIEW_MS = 30 * 86400e3;
 
+function lastConfirmedTs(entry) {
+  return Math.max(entry.grantedAt || 0, entry.reviewedAt || 0);
+}
+
 function fmtDate(ts) {
   if (!ts) return "never";
   return new Date(ts).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
@@ -342,6 +551,17 @@ function fmtDate(ts) {
 function renderSites(sites, whitelist, currentSchema) {
   var list = el("sitesList");
   list.innerHTML = "";
+  var countEl = el("sitesCount");
+  if (countEl) {
+    var nWl = Object.keys(whitelist || {}).length;
+    var nBlocked = Object.keys(sites || {}).filter(function (h) { return sites[h] === "deny"; }).length;
+    var due = Object.keys(whitelist || {}).filter(function (h) {
+      return Date.now() - lastConfirmedTs(whitelist[h]) > WL_REVIEW_MS;
+    }).length;
+    countEl.textContent = nWl + " site" + (nWl === 1 ? "" : "s") + " whitelisted" +
+      (due ? " · " + due + " due for review" : "") +
+      (nBlocked ? " · " + nBlocked + " blocked" : "");
+  }
   var hosts = Object.keys(sites || {});
   var wlHosts = Object.keys(whitelist || {});
   if (!hosts.length && !wlHosts.length) {
@@ -376,8 +596,10 @@ function renderSites(sites, whitelist, currentSchema) {
 
     var meta = document.createElement("div");
     meta.className = "wl-meta";
+    var reviewInDays = Math.ceil((lastConfirmedTs(entry) + WL_REVIEW_MS - Date.now()) / 86400e3);
     meta.textContent = "Granted " + fmtDate(entry.grantedAt) + " · Last used " + fmtDate(entry.lastUsedAt) +
       " · schema v" + (entry.schemaVersion || "?") +
+      " · " + (reviewInDays > 0 ? "review due in " + reviewInDays + "d" : "review overdue") +
       " · Allows: " + ((entry.actions || []).join(", ") || "nothing (all ask)");
     wrap.appendChild(meta);
 
@@ -392,7 +614,7 @@ function renderSites(sites, whitelist, currentSchema) {
 
     // 30-day review: no silent permanence. Keep re-confirms (and adopts
     // the current schema); Revoke removes.
-    var lastConfirmed = Math.max(entry.grantedAt || 0, entry.reviewedAt || 0);
+    var lastConfirmed = lastConfirmedTs(entry);
     var reviewDue = staleSchema || (Date.now() - lastConfirmed > WL_REVIEW_MS);
     if (reviewDue) {
       var rv = document.createElement("div");
@@ -467,11 +689,11 @@ function renderSites(sites, whitelist, currentSchema) {
     row.innerHTML = '<span class="site-host">' + esc(host) + "</span>" +
       '<span class="mini-tag tag-bad">blocked</span>';
     var btn = document.createElement("button");
-    btn.className = "btn btn-danger";
-    btn.textContent = "Revoke";
+    btn.className = "btn btn-secondary";
+    btn.textContent = "Unblock";
     btn.addEventListener("click", function () {
       api({ kind: "jbb.ui.revokeSite", host: host }).then(function () {
-        toast("Revoked: " + host);
+        toast("Unblocked: " + host);
       });
     });
     row.appendChild(btn);
@@ -499,32 +721,88 @@ function auditRow(e) {
       '<span class="audit-time">' + esc(time) + "</span>" +
     "</div>" +
     '<div class="audit-action">' + esc(e.action || "") + "</div>" +
-    '<div class="audit-site">' + esc(e.site || "") + (e.detail ? " · " + esc(e.detail) : "") + "</div>" +
+    '<div class="audit-site">' + esc(e.site || "") + (e.detail ? " · " + esc(e.detail) : "") +
+      (e.proposalId ? " · " + esc(e.proposalId) : "") + "</div>" +
     (plain && plain.why ? '<div class="feed-why">' + esc(plain.why) + (plain.fix ? " " + esc(plain.fix) : "") + "</div>" : "");
   return row;
+}
+
+function auditCatOf(e) {
+  var cat = JBB.feedCategory(e);
+  if (cat) {
+    if (cat.category.indexOf("auto") === 0) return "auto";
+    if (cat.category.indexOf("asked") === 0) return "asked";
+    if (cat.category === "blocked") return "denied";
+    if (cat.category === "failed") return "failed";
+    return "allowed";
+  }
+  if (e.result === "denied") return "denied";
+  if (e.result === "failed") return "failed";
+  return "allowed";
 }
 
 function renderAudit(entries) {
   var list = el("auditList");
   list.innerHTML = "";
   var items = (entries || []).slice().reverse();
+  var s = lastState || {};
+  items = items.filter(function (e) {
+    if (auditFilter.cat !== "all") {
+      var c = auditCatOf(e);
+      if (auditFilter.cat === "allowed" && c !== "allowed") return false;
+      if (auditFilter.cat === "denied" && c !== "denied") return false;
+      if (auditFilter.cat === "failed" && c !== "failed") return false;
+      if (auditFilter.cat === "asked" && c !== "asked" && c !== "denied") return false;
+      if (auditFilter.cat === "auto" && c !== "auto") return false;
+    }
+    if (auditFilter.site && (e.site || "").indexOf(auditFilter.site) === -1) return false;
+    if (auditFilter.session === "this" && s.sessionStartedAt && (e.ts || 0) < s.sessionStartedAt) return false;
+    if (auditFilter.session === "last" && s.lastSummary) {
+      if ((e.ts || 0) < (s.lastSummary.startedAt || 0) || (e.ts || 0) > (s.lastSummary.endedAt || Infinity)) return false;
+    }
+    return true;
+  });
   if (!items.length) {
-    list.innerHTML = '<div class="empty">No activity yet.</div>';
+    list.innerHTML = '<div class="empty">No activity matches these filters.</div>';
     return;
   }
   items.slice(0, 200).forEach(function (e) { list.appendChild(auditRow(e)); });
 }
 
 // ------------------------------------------------------------- live feed
-// The last ~10 finished actions, in plain language. One row per action:
-// what happened, where, and — for anything stopped — why, and what would
-// allow it. Updates live via the auditAppended push (no reload).
+// One feed (the Session "recent activity" and this merge — the Audit tab
+// is the same truth, full-length). Rows carry the plain category, the
+// grant's name for auto-allowed actions, and why + fix for failures.
+function feedRowMatches(r) {
+  if (feedFilter === "all") return true;
+  if (feedFilter === "asked") return r.category.indexOf("asked") === 0 || r.category === "blocked";
+  if (feedFilter === "auto") return r.category.indexOf("auto") === 0;
+  if (feedFilter === "denied") return r.category === "asked-denied" || r.category === "blocked";
+  if (feedFilter === "failed") return r.category === "failed";
+  return true;
+}
+
 function renderFeed(entries) {
   var list = el("feedList");
   if (!list) return;
   list.innerHTML = "";
-  var rows = JBB.feedRows(entries || [], 10);
-  if (!rows.length) {
+  // In-flight row: a proposal waiting on the user right now, with the
+  // same age timer as its card.
+  var pend = (lastState && lastState.pending) || [];
+  pend.forEach(function (pr) {
+    if (feedFilter !== "all" && feedFilter !== "asked") return;
+    var row = document.createElement("div");
+    row.className = "feed-row feed-live";
+    row.innerHTML =
+      '<div class="feed-top"><span class="feed-label cat-asked">Waiting for consent…</span>' +
+      '<span class="feed-time" data-age-since="' + (pr._createdAt || Date.now()) + '">' +
+      fmtAge(Date.now() - (pr._createdAt || Date.now())) + "</span></div>" +
+      '<div class="feed-action">' + esc(pr.description || pr.type) + "</div>" +
+      '<div class="feed-site">' + esc(hostOf(pr.site || "")) + "</div>";
+    list.appendChild(row);
+  });
+  var rows = JBB.feedRows(entries || [], 50).filter(feedRowMatches);
+  if (!rows.length && !pend.length) {
     list.innerHTML = '<div class="empty">Nothing yet — actions will appear here as Muse works.</div>';
     return;
   }
@@ -603,13 +881,35 @@ function renderSummary(summary) {
     }).join("") + "</ul>";
   }
   body.innerHTML = html;
+  var row = document.createElement("div");
+  row.className = "row";
+  var startBtn = document.createElement("button");
+  startBtn.className = "btn btn-primary";
+  startBtn.textContent = "Start new session";
+  startBtn.addEventListener("click", function () {
+    api({ kind: "jbb.ui.revive" }).then(function () { toast("New session started"); refresh(); });
+  });
+  var auditBtn = document.createElement("button");
+  auditBtn.className = "btn btn-secondary";
+  auditBtn.textContent = "View full audit";
+  auditBtn.addEventListener("click", function () {
+    var t = document.querySelector('.tab[data-tab="audit"]');
+    if (t) t.click();
+  });
+  row.appendChild(startBtn);
+  row.appendChild(auditBtn);
+  body.appendChild(row);
 }
 
 // ---------------------------------------------------------------- boot & events
 function refresh() {
   api({ kind: "jbb.ui.getState" }).then(function (s) {
     if (!s || !s.ok) return;
+    lastState = s;
     renderStatus(s);
+    renderPlans(s.plans);
+    renderNowStrip(s);
+    renderMedia(s);
     renderModes(s.mode);
     renderSites(s.sites, s.whitelist, s.whitelistSchema);
     el("grantsPauseToggle").checked = !!s.grantsPaused;
@@ -678,7 +978,7 @@ chrome.runtime.onMessage.addListener(function (msg) {
       refresh();
       break;
     case "jbb.ui.signInChanged":
-      renderSignInBlock(msg);
+      if (typeof renderSignInBlock === "function") renderSignInBlock(msg);
       refresh();
       break;
     case "jbb.ui.notifFailed":
@@ -702,9 +1002,22 @@ chrome.runtime.onMessage.addListener(function (msg) {
       break;
     case "jbb.ui.auditAppended":
       api({ kind: "jbb.ui.getState" }).then(function (s) {
-        if (s && s.ok) { renderAudit(s.audit); renderFeed(s.audit); }
+        if (s && s.ok) { lastState = s; renderAudit(s.audit); renderFeed(s.audit); renderNowStrip(s); renderMedia(s); }
       });
       break;
+    case "jbb.ui.planChanged":
+      refresh();
+      break;
+    case "jbb.ui.consentEscalated": {
+      var ecard = document.getElementById("consent-" + msg.proposalId);
+      if (ecard && !ecard.querySelector(".consent-esc-line")) {
+        var line = document.createElement("div");
+        line.className = "consent-esc-line";
+        line.textContent = "Escalated at 1:00 — chimed again with a new notification.";
+        ecard.appendChild(line);
+      }
+      break;
+    }
     case "jbb.ui.sessionSummary":
       refresh();
       break;
@@ -772,6 +1085,118 @@ document.addEventListener("DOMContentLoaded", function () {
   api({ kind: "jbb.ui.getSignInState" }).then(function (s) {
     if (s && s.ok) renderSignInBlock(s);
   });
+
+  // Header: status detail toggle + sound icon (mirrors the Setup toggle)
+  el("statusPill").addEventListener("click", function () {
+    statusOpen = !statusOpen;
+    if (lastState) renderStatusDetail(lastState);
+  });
+  el("soundBtn").addEventListener("click", function () {
+    var on = !(lastState && lastState.soundOn === false);
+    api({ kind: "jbb.ui.setSound", on: !on }).then(function () { refresh(); });
+  });
+
+  // Now strip controls — the same actions as the Control card / plan card.
+  function stripTakeover(on) {
+    api({ kind: "jbb.ui.setTakeover", on: on }).then(function () {
+      toast(on ? "You have control — Muse is paused" : "Handed back — Muse resumes");
+      refresh();
+    });
+  }
+  el("nowTakeoverBtn").addEventListener("click", function () { stripTakeover(true); });
+  el("nowHandbackBtn").addEventListener("click", function () { stripTakeover(false); });
+  el("nowStopBtn").addEventListener("click", function () {
+    var strip = el("nowStrip");
+    if (strip.dataset.planId) {
+      api({ kind: "jbb.ui.planStop", planId: strip.dataset.planId }).then(function () {
+        toast("Plan stopped");
+        refresh();
+      });
+    } else {
+      api({ kind: "jbb.ui.endSession" }).then(function () {
+        toast("Session ended");
+        refresh();
+      });
+    }
+  });
+
+  // Activity feed chips — the choice persists for the panel session.
+  document.querySelectorAll("#feedChips .chip").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      feedFilter = chip.getAttribute("data-feed");
+      document.querySelectorAll("#feedChips .chip").forEach(function (c) {
+        c.classList.toggle("active", c === chip);
+      });
+      if (lastState) renderFeed(lastState.audit);
+    });
+  });
+
+  // Audit filters.
+  document.querySelectorAll("#auditChips .chip").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      auditFilter.cat = chip.getAttribute("data-audit");
+      document.querySelectorAll("#auditChips .chip").forEach(function (c) {
+        c.classList.toggle("active", c === chip);
+      });
+      if (lastState) renderAudit(lastState.audit);
+    });
+  });
+  el("auditSiteFilter").addEventListener("input", function () {
+    auditFilter.site = el("auditSiteFilter").value.trim();
+    if (lastState) renderAudit(lastState.audit);
+  });
+  el("auditSessionSel").addEventListener("change", function () {
+    auditFilter.session = el("auditSessionSel").value;
+    if (lastState) renderAudit(lastState.audit);
+  });
+
+  // Media mini-player: the panel's own buttons (user click = consent).
+  function mediaAct(payload, doneMsg) {
+    api(Object.assign({ kind: "jbb.ui.mediaAct" }, payload)).then(function (res) {
+      var msg = el("mediaMsg");
+      if (res && res.ok) {
+        msg.textContent = res.detail || doneMsg || "";
+        if (res.data && res.data.image) {
+          var img = el("mediaFrame");
+          img.src = res.data.image;
+          img.classList.remove("hidden");
+        }
+        if (res.data && res.data.cues) {
+          var cues = el("mediaCues");
+          cues.textContent = res.data.cues.map(function (c) { return c.text; }).join("\n");
+          cues.classList.remove("hidden");
+        }
+      } else {
+        msg.textContent = "Could not: " + ((res && res.error) || "unknown error");
+      }
+      refresh();
+    });
+  }
+  el("mediaPlayBtn").addEventListener("click", function () { mediaAct({ actType: "media", action: "play" }); });
+  el("mediaPauseBtn").addEventListener("click", function () { mediaAct({ actType: "media", action: "pause" }); });
+  el("mediaSeek").addEventListener("change", function () {
+    mediaAct({ actType: "media", action: "seek", seekTo: Number(el("mediaSeek").value) });
+  });
+  el("mediaCapBtn").addEventListener("click", function () { mediaAct({ actType: "captions" }); });
+  el("mediaGrabBtn").addEventListener("click", function () { mediaAct({ actType: "frameGrab" }); });
+
+  // 1s ticker: age timers on consent cards + the feed's waiting rows,
+  // and the driver-timeout note once a card passes the 120s window.
+  setInterval(function () {
+    var now = Date.now();
+    document.querySelectorAll("[data-age-since]").forEach(function (node) {
+      var since = Number(node.getAttribute("data-age-since"));
+      if (since) node.textContent = (node.classList.contains("consent-age") ? "waiting " : "") + fmtAge(now - since);
+    });
+    document.querySelectorAll(".consent-card").forEach(function (card) {
+      var ageEl = card.querySelector(".consent-age");
+      var note = card.querySelector(".consent-driver-note");
+      if (ageEl && note) {
+        var since = Number(ageEl.getAttribute("data-age-since"));
+        note.classList.toggle("hidden", !(since && now - since >= 120000));
+      }
+    });
+  }, 1000);
 
   // Tabs
   document.querySelectorAll(".tab").forEach(function (tab) {

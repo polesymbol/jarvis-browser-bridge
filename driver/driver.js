@@ -105,7 +105,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
       'listen flags: --duration <seconds> --out <file.webm> (proposes audio capture — T2 — then writes the streamed Opus/WebM chunks to the file)',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
       'watch flags: --duration <seconds> (stream media.progress events as JSON lines; 0 = until Ctrl-C)',
-      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab|audioCapture --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file>',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab|audioCapture --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file> --direction up|down|top|bottom --amount <px>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -905,6 +905,23 @@ async function main() {
         const fromName = proposal.dragFrom.point ? `(${fx}, ${fy})` : `'${targetLabel}'`;
         const toName = proposal.dragTo.point ? `(${tx}, ${ty})` : `'${toLabel}'`;
         proposal.description = `drag ${fromName} to ${toName}`;
+      } else if (type === 'scroll') {
+        // Scroll carries its direction + distance IN the proposal — the
+        // content script can only report (and do) what it is told. Until
+        // v0.3.0 the driver sent neither, and every scroll reported
+        // "scrolled undefined" while moving nothing.
+        const direction = opt('--direction', 'down');
+        if (!['up', 'down', 'top', 'bottom'].includes(direction)) {
+          throw new DriverError('USAGE', '--direction must be up, down, top or bottom');
+        }
+        const amountRaw = opt('--amount', undefined);
+        const amount = amountRaw === undefined ? 600 : Number(amountRaw);
+        if (!Number.isFinite(amount) || amount <= 0) {
+          throw new DriverError('USAGE', '--amount must be a positive number of pixels');
+        }
+        proposal.direction = direction;
+        proposal.amount = amount;
+        proposal.description = `scroll ${direction}`;
       } else if (isTabType) {
         // Tab actions: ids come from a prior listTabs act (its result
         // carries data.tabs). The extension resolves each tab's real

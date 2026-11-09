@@ -961,12 +961,22 @@
   }
 
   function doScroll(direction, amount) {
+    // The result must name what actually happened (Prompt 16 §5.5): a
+    // missing direction defaults to "down" instead of printing
+    // "scrolled undefined", the scroll is applied instantly so the
+    // movement can be measured truthfully, and a page that cannot move
+    // says so instead of claiming success.
+    var dir = ["up", "down", "top", "bottom"].indexOf(direction) >= 0 ? direction : "down";
     var px = amount || 600;
-    if (direction === "up") window.scrollBy({ top: -px, behavior: "smooth" });
-    else if (direction === "down") window.scrollBy({ top: px, behavior: "smooth" });
-    else if (direction === "top") window.scrollTo({ top: 0, behavior: "smooth" });
-    else if (direction === "bottom") window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
-    return "scrolled " + direction;
+    var before = window.scrollY || 0;
+    if (dir === "up") window.scrollBy({ top: -px, behavior: "auto" });
+    else if (dir === "down") window.scrollBy({ top: px, behavior: "auto" });
+    else if (dir === "top") window.scrollTo({ top: 0, behavior: "auto" });
+    else window.scrollTo({ top: document.body.scrollHeight, behavior: "auto" });
+    var moved = Math.abs((window.scrollY || 0) - before);
+    if (moved > 0) return "scrolled " + dir + " " + Math.round(moved) + "px";
+    return "scroll " + dir + " requested — the page did not move (already at the " +
+      (dir === "up" || dir === "top" ? "top" : "bottom") + ")";
   }
 
   // ------------------------------------------------------------ media progress
