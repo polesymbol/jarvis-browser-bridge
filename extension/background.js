@@ -220,7 +220,7 @@ var WHITELIST_SCHEMA = 1;
 var WHITELIST_ACTIONS_V1 = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
                             "hover", "select", "drag", "setValue",
                             "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab",
-                            "waitFor", "fetch"];
+                            "waitFor", "fetch", "media", "captions", "frameGrab"];
 
 function saveWhitelist() {
   chrome.storage.local.set({ [K.WHITELIST]: state.whitelist });

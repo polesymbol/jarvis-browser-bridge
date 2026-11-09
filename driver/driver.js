@@ -52,7 +52,9 @@
 
 import WebSocket from 'ws';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { writeSync } from 'node:fs';
+import { writeSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const args = process.argv.slice(2);
 function opt(name, def) {
@@ -99,7 +101,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
       'commands: observe | act | abort | status | watch',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
       'watch flags: --duration <seconds> (stream media.progress events as JSON lines; 0 = until Ctrl-C)',
-      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms>',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -315,6 +317,66 @@ function denyError(msg) {
 // An act.result ends the act. A STALE_SNAPSHOT refusal gets the crisp
 // machine-readable surface (non-zero exit, current version included) —
 // every other result prints verbatim, as before.
+// ---------------------------------------------------------- player memory
+// Per-player failure memory: a player that fails to start twice is
+// recorded NOT VERIFIED and the driver refuses to burn more waits on
+// it. A verified play clears the record. Stored on this machine only
+// (JBB_PLAYER_MEMORY overrides the path, e.g. for tests).
+const PLAYER_MEMORY_PATH = process.env.JBB_PLAYER_MEMORY
+  || path.join(os.homedir(), '.jbb-player-memory.json');
+
+function playerGateKey(proposal) {
+  const label = (proposal.target && proposal.target.label) || '';
+  return `${proposal.site || ''}|${label}`;
+}
+function loadPlayerMemory() {
+  try { return JSON.parse(readFileSync(PLAYER_MEMORY_PATH, 'utf8')); } catch { return {}; }
+}
+function savePlayerMemory(mem) {
+  try {
+    mkdirSync(path.dirname(PLAYER_MEMORY_PATH), { recursive: true });
+    writeFileSync(PLAYER_MEMORY_PATH, JSON.stringify(mem, null, 2));
+  } catch { /* memory is best-effort; a read-only disk must not break acts */ }
+}
+function mediaGate(proposal) {
+  if (proposal.type !== 'media' || !proposal.media || proposal.media.action !== 'play') return;
+  const mem = loadPlayerMemory();
+  const entry = mem[playerGateKey(proposal)];
+  if (entry && entry.fails >= 2 && !entry.verified) {
+    emitAndExit({
+      ok: false,
+      error: 'NOT_VERIFIED',
+      message: `this player failed to start ${entry.fails} times (last reason: ${entry.lastReason || 'unknown'}) and is recorded NOT VERIFIED — not retrying`,
+      player: playerGateKey(proposal),
+      attempts: entry.fails,
+      lastReason: entry.lastReason || null,
+    }, 1);
+  }
+}
+function mediaRecord(proposal, msg) {
+  if (proposal.type !== 'media' || !proposal.media || proposal.media.action !== 'play' || !msg) return;
+  const key = playerGateKey(proposal);
+  const mem = loadPlayerMemory();
+  const d = msg.data || {};
+  if (msg.ok && d.verified) {
+    if (mem[key]) { delete mem[key]; savePlayerMemory(mem); }
+    return;
+  }
+  const entry = mem[key] || { fails: 0 };
+  entry.fails = (entry.fails || 0) + 1;
+  entry.verified = false;
+  entry.lastReason = d.reason || (msg.ok ? 'did-not-start' : (msg.error || 'act failed'));
+  entry.playerKey = d.playerKey || entry.playerKey || null;
+  entry.at = new Date().toISOString();
+  mem[key] = entry;
+  savePlayerMemory(mem);
+  if (entry.fails >= 2) {
+    console.error(`[player-memory] ${key} recorded NOT VERIFIED after ${entry.fails} failed attempts (${entry.lastReason})`);
+  } else {
+    console.error(`[player-memory] ${key} failed attempt ${entry.fails}/2 (${entry.lastReason})`);
+  }
+}
+
 function finishResult(msg) {
   if (msg && msg.error === 'STALE_SNAPSHOT') {
     emitAndExit({
@@ -327,6 +389,28 @@ function finishResult(msg) {
   console.log(JSON.stringify(msg, null, 2));
 }
 
+// runAct's exit door: record media outcomes in the player memory and
+// write frame grabs to --out before the result is printed.
+function finishActResult(proposal, msg) {
+  mediaRecord(proposal, msg);
+  if (proposal.type === 'frameGrab' && msg && msg.ok && msg.data && msg.data.dataUrl) {
+    const out = opt('--out', undefined);
+    if (out) {
+      try {
+        const b64 = String(msg.data.dataUrl).split(',')[1] || '';
+        const buf = Buffer.from(b64, 'base64');
+        writeFileSync(out, buf);
+        msg.data = { ...msg.data, savedTo: out, bytes: buf.length };
+        delete msg.data.dataUrl;
+        console.error(`[frame] wrote ${buf.length} bytes to ${out}`);
+      } catch (e) {
+        console.error('[frame] could not write --out file: ' + e.message);
+      }
+    }
+  }
+  finishResult(msg);
+}
+
 // Run one act through its lifecycle phases. The proposal is (re)sent ONLY
 // in the receipt phase, when the extension has not yet acknowledged it —
 // peer.unavailable means the relay never forwarded it, and a rejoin resend
@@ -334,6 +418,7 @@ function finishResult(msg) {
 // is never resent under any circumstances.
 async function runAct(ws, proposal, id) {
   const pump = createPump(ws, id);
+  const finish = (msg) => finishActResult(proposal, msg);
   const sendPropose = () => ws.send(JSON.stringify({ v: 1, type: 'act.propose', id, proposal }));
   const isTimeout = (e) => e && e.pumpTimeout;
   pendingProposals++;
@@ -366,7 +451,7 @@ async function runAct(ws, proposal, id) {
 
     let verdict = null;
     if (early) {
-      if (early.type === 'act.result') { finishResult(early); return; }
+      if (early.type === 'act.result') { finish(early); return; }
       if (early.type === 'consent.deny') throw denyError(early);
       verdict = early; // consent.grant
     }
@@ -385,7 +470,7 @@ async function runAct(ws, proposal, id) {
           throw e;
         }
         if (got.type === 'consent.shown' || got.type === 'consent.waiting') break;
-        if (got.type === 'act.result') { finishResult(got); return; }
+        if (got.type === 'act.result') { finish(got); return; }
         if (got.type === 'consent.deny') throw denyError(got);
         verdict = got; break; // consent.grant (auto-allow: no prompt needed)
       }
@@ -409,7 +494,7 @@ async function runAct(ws, proposal, id) {
           console.error(`[waiting] consent prompt open, unanswered for ${Math.round((got.waitedMs || 0) / 1000)}s — waiting for the user`);
           continue;
         }
-        if (got.type === 'act.result') { finishResult(got); return; }
+        if (got.type === 'act.result') { finish(got); return; }
         if (got.type === 'consent.deny') throw denyError(got);
         verdict = got; break; // consent.grant
       }
@@ -433,7 +518,7 @@ async function runAct(ws, proposal, id) {
       }
       throw e;
     }
-    finishResult(result);
+    finish(result);
   } finally {
     pendingProposals--;
   }
@@ -541,7 +626,7 @@ async function main() {
       const TAB_TYPES = ['listTabs', 'switchTab', 'closeTab', 'closeInactiveTabs', 'openTab', 'pinTab'];
       const isTabType = TAB_TYPES.includes(type);
       const proposal = {
-        actionTier: opt('--tier', isTabType || type === 'fetch' ? 'T2' : 'T1'),
+        actionTier: opt('--tier', isTabType || type === 'fetch' || type === 'media' || type === 'frameGrab' ? 'T2' : 'T1'),
         type,
         target: { ref: opt('--ref', null), label: targetLabel },
         value: opt('--value', undefined),
@@ -697,6 +782,51 @@ async function main() {
         }
         proposal.timeoutMs = tmo;
         proposal.description = `wait for ${kind}${w.text ? ` '${w.text}'` : w.selector ? ` '${w.selector}'` : w.label ? ` '${w.label}'` : ''} (up to ${Math.round(tmo / 1000)}s)`;
+      } else if (type === 'media') {
+        const action = opt('--media', undefined);
+        if (!['play', 'pause', 'seek'].includes(action)) {
+          throw new DriverError('USAGE', '--type media requires --media play|pause|seek');
+        }
+        proposal.media = { action };
+        if (action === 'seek') {
+          const to = Number(opt('--seek-to', ''));
+          if (!Number.isFinite(to)) {
+            throw new DriverError('USAGE', '--media seek requires --seek-to <seconds>');
+          }
+          proposal.media.seekTo = to;
+        }
+        proposal.description = action === 'seek'
+          ? `seek media to ${proposal.media.seekTo}s`
+          : `${action} media${targetLabel ? ` '${targetLabel}'` : ''}`;
+        // The NOT VERIFIED gate: two verified failures on this player
+        // and the driver refuses locally — no proposal is even sent.
+        mediaGate(proposal);
+      } else if (type === 'captions') {
+        const from = opt('--from', undefined);
+        const toS = opt('--to', undefined);
+        if (from !== undefined) {
+          const f = Number(from);
+          if (!Number.isFinite(f) || f < 0) throw new DriverError('USAGE', '--from must be a non-negative number of seconds');
+          proposal.from = f;
+        }
+        if (toS !== undefined) {
+          const t2 = Number(toS);
+          if (!Number.isFinite(t2) || t2 < 0) throw new DriverError('USAGE', '--to must be a non-negative number of seconds');
+          proposal.to = t2;
+        }
+        const lang = opt('--language', undefined);
+        if (lang !== undefined) proposal.language = lang;
+        const ti = opt('--track-index', undefined);
+        if (ti !== undefined) proposal.trackIndex = Number(ti);
+        proposal.description = `read captions ${proposal.from || 0}s–${proposal.to != null ? proposal.to + 's' : 'end'}${lang ? ` [${lang}]` : ''}`;
+      } else if (type === 'frameGrab') {
+        const at = opt('--at', undefined);
+        if (at !== undefined) {
+          const a2 = Number(at);
+          if (!Number.isFinite(a2) || a2 < 0) throw new DriverError('USAGE', '--at must be a non-negative number of seconds');
+          proposal.at = a2;
+        }
+        proposal.description = `grab a frame of the video${at !== undefined ? ` at ${at}s` : ''}`;
       }
       const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       console.error('[sent] act.propose — following the consent lifecycle…');

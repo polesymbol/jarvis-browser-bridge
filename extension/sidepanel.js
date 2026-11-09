@@ -215,7 +215,7 @@ function renderSession(session) {
 var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
                   "hover", "select", "drag", "setValue",
                   "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab",
-                  "waitFor", "fetch"];
+                  "waitFor", "fetch", "media", "captions", "frameGrab"];
 var WL_REVIEW_MS = 30 * 86400e3;
 
 function fmtDate(ts) {

@@ -210,7 +210,9 @@
         var tracks = v.textTracks;
         for (var t = 0; t < tracks.length; t++) {
           var tr = tracks[t];
-          var ti = { kind: tr.kind, label: tr.label, language: tr.language, mode: tr.mode };
+          var ti = { kind: tr.kind, label: tr.label, language: tr.language, mode: tr.mode,
+                     active: tr.mode === "showing", cues: null };
+          try { ti.cues = tr.cues ? tr.cues.length : null; } catch (e) { /* counted below via transcript path */ }
           try {
             if ((tr.kind === "captions" || tr.kind === "subtitles") && tr.mode === "disabled") {
               tr.mode = "hidden";
@@ -785,6 +787,179 @@
     });
   }
 
+  // ------------------------------------------------------------ media control
+  // Play/pause/seek with a VERIFIED cross-check: play is only reported
+  // as playing when currentTime actually advances across two samples.
+  // When it doesn't start, the result names why (autoplay policy,
+  // source error, off-screen, no data) instead of a bare paused:true.
+  function mediaDelay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  function playerKeyFor(el) {
+    var idPart = el.id || (typeof el.className === "string" && el.className.trim()
+      ? el.className.trim().split(/\s+/)[0] : "") || String(el.tagName || "media").toLowerCase();
+    var host = "";
+    try { host = new URL(el.currentSrc || el.src || "").host; } catch (e) { /* relative/empty src */ }
+    return String(idPart) + "@" + host;
+  }
+
+  function resolveMediaEl(a) {
+    var t = a.target || {};
+    var el = null;
+    if (t.ref || t.label) { try { el = resolveTarget(t.ref, t.label).el; } catch (e) { el = null; } }
+    if (!el || !/^(VIDEO|AUDIO)$/.test(el.tagName || "")) {
+      var nodes = document.querySelectorAll("video, audio");
+      el = nodes && nodes.length ? nodes[0] : null;
+    }
+    if (!el) throw new Error("no media element found on this page");
+    return el;
+  }
+
+  function mediaState(el) {
+    return {
+      paused: !!el.paused,
+      currentTime: Math.round((el.currentTime || 0) * 10) / 10,
+      duration: (typeof el.duration === "number" && isFinite(el.duration))
+        ? Math.round(el.duration * 10) / 10 : null,
+      src: el.currentSrc || el.src || null,
+      playerKey: playerKeyFor(el)
+    };
+  }
+
+  function mediaBlockReason(el, playError) {
+    if (el.error) return "source-error: " + (el.error.message || ("code " + el.error.code));
+    if (el.networkState === 3) return "no-source";
+    if (playError && playError.name === "NotAllowedError") return "autoplay-blocked";
+    if (playError) return "play-failed: " + (playError.message || playError.name || "unknown");
+    var geo = null;
+    try { geo = boxFor(el); } catch (e) { geo = null; }
+    if (!geo || !geo.inViewport) return "not-in-viewport";
+    if (el.readyState === 0) return "no-data";
+    return "did-not-start";
+  }
+
+  function doMedia(a) {
+    var el = resolveMediaEl(a);
+    var m = a.media || {};
+    var action = m.action || "play";
+    if (action === "pause") {
+      try { el.pause(); } catch (e) { /* state check below is the verdict */ }
+      return mediaDelay(250).then(function () {
+        var s = mediaState(el);
+        var verified = s.paused === true;
+        return { detail: "paused at " + s.currentTime + "s" + (verified ? "" : " (could not verify the pause)"),
+                 data: Object.assign({ action: "pause", verified: verified }, s) };
+      });
+    }
+    if (action === "seek") {
+      var to = Number(m.seekTo);
+      if (!isFinite(to)) throw new Error("seek needs a numeric target time");
+      try { el.currentTime = to; } catch (e) { throw new Error("seek failed: " + ((e && e.message) || e)); }
+      return mediaDelay(600).then(function () {
+        var s = mediaState(el);
+        var verified = Math.abs((el.currentTime || 0) - to) < 2;
+        return { detail: "seeked to " + s.currentTime + "s" + (verified ? "" : " (the target " + to + "s was not reached)"),
+                 data: Object.assign({ action: "seek", verified: verified, seekTo: to }, s) };
+      });
+    }
+    // play: scroll into view first (decks bury players off-screen),
+    // then cross-check that currentTime actually advances.
+    try { el.scrollIntoView({ block: "center" }); } catch (e) { /* best effort */ }
+    var playError = null;
+    var p = null;
+    try { p = el.play(); } catch (e) { playError = e; }
+    var settled = (p && typeof p.then === "function")
+      ? p.then(function () {}, function (e) { playError = e; })
+      : Promise.resolve();
+    return settled.then(function () { return mediaDelay(350); }).then(function () {
+      var ct1 = el.currentTime || 0;
+      return mediaDelay(800).then(function () {
+        var ct2 = el.currentTime || 0;
+        var s = mediaState(el);
+        var verified = ct2 > ct1 + 0.1 && !el.paused;
+        if (!verified) s.reason = mediaBlockReason(el, playError);
+        return {
+          detail: verified
+            ? "playing — currentTime advancing (" + ct1.toFixed(1) + "s → " + ct2.toFixed(1) + "s of " + s.duration + "s)"
+            : "did not start — paused: true, reason: " + s.reason,
+          data: Object.assign({ action: "play", verified: verified }, s)
+        };
+      });
+    });
+  }
+
+  // Caption text for a time range, from the track the snapshot lists.
+  function doCaptions(a) {
+    var el = resolveMediaEl(a);
+    var tracks = el.textTracks || [];
+    var chosen = null;
+    for (var i = 0; i < tracks.length; i++) {
+      var tr = tracks[i];
+      if (tr.kind !== "captions" && tr.kind !== "subtitles") continue;
+      if (a.language && tr.language && tr.language.indexOf(a.language) !== 0) continue;
+      if (typeof a.trackIndex === "number" && a.trackIndex !== i) continue;
+      chosen = tr;
+      break;
+    }
+    if (!chosen) {
+      throw new Error("no caption/subtitle track matches" +
+        (a.language ? " language '" + a.language + "'" : "") + " on this media element");
+    }
+    if (chosen.mode === "disabled") {
+      try { chosen.mode = "hidden"; } catch (e) { /* read-only mode */ }
+    }
+    var from = Number(a.from || 0);
+    var to = a.to != null ? Number(a.to) : Infinity;
+    var list = [];
+    try { list = chosen.cues || []; } catch (e) { list = []; }
+    var cues = [];
+    for (var j = 0; j < list.length; j++) {
+      var c = list[j];
+      if (c.endTime < from || c.startTime > to) continue;
+      cues.push({ start: Math.round(c.startTime * 10) / 10,
+                  end: Math.round(c.endTime * 10) / 10,
+                  text: stripCueMarkup(c.text) });
+      if (cues.length >= 500) break;
+    }
+    return {
+      detail: "captions [" + (chosen.language || "unknown") + "] " + from + "s–" +
+              (a.to != null ? a.to + "s" : "end") + ": " + cues.length + " cue(s)",
+      data: { track: { kind: chosen.kind, label: chosen.label, language: chosen.language, mode: chosen.mode },
+              cues: cues, text: cues.map(function (c) { return c.text; }).join("\n") }
+    };
+  }
+
+  // A still of the video element at a timestamp, via canvas. DRM or
+  // cross-origin media taints the canvas — that refusal is reported,
+  // never faked around.
+  function doFrameGrab(a) {
+    var el = resolveMediaEl(a);
+    if (el.tagName !== "VIDEO") throw new Error("frame grab needs a <video> element");
+    function grab() {
+      var w = el.videoWidth || 640, h = el.videoHeight || 360;
+      var scale = Math.min(1, 640 / (w || 640));
+      var canvas = document.createElement("canvas");
+      canvas.width = Math.max(2, Math.round(w * scale));
+      canvas.height = Math.max(2, Math.round(h * scale));
+      var ctx = canvas.getContext("2d");
+      ctx.drawImage(el, 0, 0, canvas.width, canvas.height);
+      var url;
+      try { url = canvas.toDataURL("image/jpeg", 0.82); }
+      catch (e) {
+        throw new Error("frame grab blocked: the canvas is tainted (DRM or cross-origin media) — the browser will not expose these pixels");
+      }
+      var s = mediaState(el);
+      return { detail: "frame at " + s.currentTime + "s (" + canvas.width + "×" + canvas.height + ")",
+               data: { mime: "image/jpeg", dataUrl: url, width: canvas.width, height: canvas.height,
+                       currentTime: s.currentTime, playerKey: s.playerKey, src: s.src } };
+    }
+    var at = a.at != null ? Number(a.at) : null;
+    if (at != null && isFinite(at) && Math.abs((el.currentTime || 0) - at) > 0.5) {
+      try { el.currentTime = at; } catch (e) { /* grab whatever is showing */ }
+      return mediaDelay(700).then(grab);
+    }
+    return mediaDelay(50).then(grab);
+  }
+
   function doScroll(direction, amount) {
     var px = amount || 600;
     if (direction === "up") window.scrollBy({ top: -px, behavior: "smooth" });
@@ -840,12 +1015,15 @@
       } else if (msg.kind === "jbb.content.act") {
         var a = msg.action || {};
         var t = a.target || {};
-        if (a.type === "hover" || a.type === "waitFor" || a.type === "fetch") {
+        if (a.type === "hover" || a.type === "waitFor" || a.type === "fetch" ||
+            a.type === "media" || a.type === "frameGrab") {
           // Async actions: hover waits for menus, waitFor waits for its
-          // condition, fetch waits on the network.
+          // condition, fetch waits on the network, media verifies state.
           var p = a.type === "hover" ? doHover(t.ref, t.label)
                 : a.type === "waitFor" ? doWaitFor(a.wait, a.timeoutMs)
-                : doFetch(a);
+                : a.type === "fetch" ? doFetch(a)
+                : a.type === "media" ? doMedia(a)
+                : doFrameGrab(a);
           p.then(function (out) {
             var resp = { ok: true, detail: out.detail };
             if (out.matchQuality) resp.matchQuality = out.matchQuality;
@@ -866,6 +1044,7 @@
         else if (a.type === "select") out = doSelect(t.ref, t.label, a.optionValue != null ? a.optionValue : a.value, a.optionText);
         else if (a.type === "setValue") out = doSetValue(t.ref, a.value, t.label);
         else if (a.type === "drag") out = doDrag(a.dragFrom || t, a.dragTo);
+        else if (a.type === "captions") out = doCaptions(a);
         else if (a.type === "scroll") out = { detail: doScroll(a.direction, a.amount) };
         else throw new Error("unknown action type: " + a.type);
         var resp = { ok: true, detail: out.detail };

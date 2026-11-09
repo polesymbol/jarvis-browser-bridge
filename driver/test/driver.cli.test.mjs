@@ -121,6 +121,18 @@ function fakeLifecycleExt(port, key, mode) {
         after(40, () => send({ type: "act.result", proposalId: pid, ok: false,
           error: "STALE_SNAPSHOT", snapshotVersion: 9,
           detail: "stale snapshot: act built against v3, current snapshot is v9 — re-observe and rebuild the act" }));
+      } else if (mode === "mediafail") {
+        after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
+        after(180, () => send({ type: "act.result", proposalId: pid, ok: true,
+          detail: "did not start — paused: true, reason: autoplay-blocked",
+          data: { action: "play", verified: false, reason: "autoplay-blocked", paused: true,
+                  currentTime: 0, duration: 2100, playerKey: "deck-player@cdn.example.com" } }));
+      } else if (mode === "mediaok") {
+        after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
+        after(180, () => send({ type: "act.result", proposalId: pid, ok: true,
+          detail: "playing — currentTime advancing (0.4s → 1.2s of 2100s)",
+          data: { action: "play", verified: true, paused: false, currentTime: 1.2, duration: 2100,
+                  playerKey: "deck-player@cdn.example.com" } }));
       } else if (mode === "revoke") {
         // The user rotates the key mid-consent: the extension revokes its
         // key at the relay, which notifies the driver and tears the room
@@ -423,6 +435,41 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
     r18.code === 0 && r18.out.includes('"media.progress"') && r18.out.includes('"currentTime":42') && r18.out.includes('"duration":2100'),
     "stdout=" + r18.out.slice(0, 300));
   stopExt(e);
+
+  // ------------------------------------------------------------ player memory
+  // Two verified play failures on the same player → NOT VERIFIED, and
+  // the third attempt is refused LOCALLY (no proposal is even sent).
+  const fsx = await import("node:fs");
+  const osx = await import("node:os");
+  const pathx = await import("node:path");
+  const memPath = pathx.join(osx.tmpdir(), `jbb-player-memory-${Date.now()}.json`);
+  const MENV = { ...FAST, JBB_PLAYER_MEMORY: memPath };
+  const mkey = "media-key-0123456789abcdef";
+  const mArg = `ws://127.0.0.1:${(await startRelay()).port}`;
+  const mf = await fakeLifecycleExt(Number(new URL(mArg).port), mkey, "mediafail");
+  const playArgs = ["--relay", mArg, "--key", mkey, "act", "--type", "media", "--media", "play",
+                    "--site", "https://academy.example.com/lesson", "--target", "Lesson video"];
+  const p1 = await runDriver(playArgs, MENV);
+  const p2 = await runDriver(playArgs, MENV);
+  const memAfter2 = JSON.parse(fsx.readFileSync(memPath, "utf8"));
+  const gateKey = Object.keys(memAfter2)[0];
+  check("two failed plays are recorded against the player",
+    p1.code === 0 && p2.code === 0 && !!gateKey && memAfter2[gateKey].fails === 2 &&
+    memAfter2[gateKey].lastReason === "autoplay-blocked",
+    "mem=" + JSON.stringify(memAfter2));
+  const p3 = await runDriver(playArgs, MENV);
+  let p3j = null; try { p3j = JSON.parse(p3.out); } catch {}
+  check("the third attempt is refused locally as NOT_VERIFIED — no proposal sent, no wait burned",
+    p3.code !== 0 && !!p3j && p3j.error === "NOT_VERIFIED" && mf.proposeCount === 2,
+    "stdout=" + p3.out + " proposeCount=" + mf.proposeCount);
+  stopExt(mf);
+  const mo = await fakeLifecycleExt(Number(new URL(mArg).port), mkey, "mediaok");
+  const memPath2 = pathx.join(osx.tmpdir(), `jbb-player-memory-ok-${Date.now()}.json`);
+  const p4 = await runDriver(playArgs, { ...FAST, JBB_PLAYER_MEMORY: memPath2 });
+  const memOk = fsx.existsSync(memPath2) ? JSON.parse(fsx.readFileSync(memPath2, "utf8")) : {};
+  check("a verified play leaves no failure record",
+    p4.code === 0 && Object.keys(memOk).length === 0, "mem=" + JSON.stringify(memOk));
+  stopExt(mo);
 }
 L.httpServer.close();
 

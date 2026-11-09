@@ -44,7 +44,7 @@ check("background forwards media progress only from tab senders, only while conn
 check("protocol carries media.progress as a live-only message",
   proto.includes('base("media.progress", fields || {})'));
 check("driver: fetch defaults T2, waitFor is validated, watch streams, result budget covers waits",
-  driver.includes("type === 'fetch' ? 'T2' : 'T1'") || driver.includes("isTabType || type === 'fetch' ? 'T2' : 'T1'") &&
+  driver.includes("type === 'fetch'") && driver.includes("? 'T2' : 'T1'") &&
   driver.includes("tmo < 250 || tmo > 120000") &&
   driver.includes("CMD === 'watch'") && driver.includes("(proposal.timeoutMs || 0) + 20000"));
 check("vocabulary covers waitFor + fetch for new grants (background + panel)",
