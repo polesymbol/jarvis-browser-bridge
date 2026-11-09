@@ -56,8 +56,8 @@ function emitAndExit(obj, code) {
   process.exit(code);
 }
 
-function failNow(code, message, exitCode) {
-  emitAndExit({ ok: false, error: code, message }, exitCode || 1);
+function failNow(code, message, exitCode, extra) {
+  emitAndExit({ ok: false, error: code, message, ...(extra || {}) }, exitCode || 1);
 }
 
 // Help is a successful invocation: valid JSON on stdout, exit 0, no key needed.
@@ -82,11 +82,26 @@ const CMD = args.find((a) => ['observe', 'act', 'abort', 'status'].includes(a));
 // decorative, if this process is ever embedded.
 let pendingProposals = 0;
 
+// The four status fields, always present in `status` output — including its
+// error paths, so a failed status check still reports peer/worker as "no"
+// alongside the structured error instead of a bare error object.
+function statusSnapshot(peer) {
+  const p = peer ? 'yes' : 'no';
+  return {
+    peerConnected: p,
+    workerAlive: p,
+    pendingProposals,
+    sessionTimeRemaining: null,
+  };
+}
+
 if (!KEY) {
-  failNow('KEY_MISSING', 'connector key is missing — pass --key <connector-key> or set the KEY environment variable', 2);
+  failNow('KEY_MISSING', 'connector key is missing — pass --key <connector-key> or set the KEY environment variable', 2,
+    CMD === 'status' ? statusSnapshot(false) : undefined);
 }
 if (KEY.length < 16) {
-  failNow('KEY_INVALID', 'connector key is too short — it must be at least 16 characters', 2);
+  failNow('KEY_INVALID', 'connector key is too short — it must be at least 16 characters', 2,
+    CMD === 'status' ? statusSnapshot(false) : undefined);
 }
 if (!CMD) {
   failNow('USAGE', 'command required: observe | act | abort | status', 2);
@@ -228,14 +243,10 @@ async function main() {
       // protocol v1 exposes. Session grants live inside the extension and
       // protocol v1 has no message to query their remaining time, so that
       // field is reported as null (unknown), never invented.
-      const peer = confirm.peer ? 'yes' : 'no';
       console.log(JSON.stringify({
         ok: true,
         command: 'status',
-        peerConnected: peer,
-        workerAlive: peer,
-        pendingProposals,
-        sessionTimeRemaining: null,
+        ...statusSnapshot(!!confirm.peer),
       }, null, 2));
       return;
     }
@@ -301,5 +312,5 @@ async function main() {
 main().catch((e) => {
   const code = e && e.code ? e.code : 'INTERNAL';
   const message = e && e.message ? e.message : 'unexpected driver error';
-  failNow(code, message, 1);
+  failNow(code, message, 1, CMD === 'status' ? statusSnapshot(false) : undefined);
 });

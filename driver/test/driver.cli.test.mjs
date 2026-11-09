@@ -128,6 +128,25 @@ const relayArg = `ws://127.0.0.1:${port}`;
     "stdout=" + r.out);
 }
 
+// --- status error paths still carry the four fields -------------------------
+{
+  const r = await runDriver(["--relay", relayArg, "status"], { KEY: "" });
+  const j = parseStdout(r.out);
+  check("status with KEY= exits non-zero, error JSON plus the four fields",
+    r.code !== 0 && !!j && j.ok === false && j.error === "KEY_MISSING" &&
+    j.peerConnected === "no" && j.workerAlive === "no" && j.pendingProposals === 0 && j.sessionTimeRemaining === null,
+    "stdout=" + r.out);
+}
+{
+  const dead = await closedPort();
+  const r = await runDriver(["--relay", `ws://127.0.0.1:${dead}`, "--key", KEY, "status"]);
+  const j = parseStdout(r.out);
+  check("status with unreachable relay exits non-zero, error JSON plus the four fields",
+    r.code !== 0 && !!j && j.ok === false && j.error === "RELAY_UNREACHABLE" &&
+    j.peerConnected === "no" && j.workerAlive === "no" && j.pendingProposals === 0 && j.sessionTimeRemaining === null,
+    "stdout=" + r.out);
+}
+
 // --- peer-backed checks ------------------------------------------------------
 const ext = await fakeExtension(port, KEY);
 {
