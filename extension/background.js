@@ -73,6 +73,9 @@ var state = {
   raiseCount: {},              // proposalId -> number of toast raises (escalation cap)
   consentBanners: {},          // proposalId -> tabId (in-page banner)
   session: null,               // time-boxed grant: { site, grantedAt, expiresAt, label }
+  capture: null,               // live audio capture: { tabId, host, captureId, startedAt }
+  captureWaiter: null,         // pending capture-start handshake with the offscreen doc
+  capturePermission: false,    // tabCapture optional permission granted by the user?
   chromeSignedInEmail: null,   // Chrome profile sign-in email (null = not signed in)
   signInBlocked: false,        // true when signed in but the account is unacknowledged
   soundOn: true                // audible tone on consent prompts (user works in other windows)
@@ -115,7 +118,7 @@ chrome.runtime.onInstalled.addListener(function () {
 });
 
 chrome.runtime.onStartup.addListener(function () {
-  loadPersisted(); hydratePendings(); checkNotificationPermission();
+  loadPersisted(); hydratePendings(); checkNotificationPermission(); refreshCapturePermission();
   // Pre-warm the consent tone engine so the first chime isn't slow:
   // creating the offscreen document + AudioContext takes a beat on cold start.
   setTimeout(function () { if (state.soundOn) ensureOffscreenDocument(function () {}); }, 3000);
@@ -220,7 +223,7 @@ var WHITELIST_SCHEMA = 1;
 var WHITELIST_ACTIONS_V1 = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
                             "hover", "select", "drag", "setValue",
                             "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab",
-                            "waitFor", "fetch", "media", "captions", "frameGrab"];
+                            "waitFor", "fetch", "media", "captions", "frameGrab", "audioCapture"];
 
 function saveWhitelist() {
   chrome.storage.local.set({ [K.WHITELIST]: state.whitelist });
@@ -732,9 +735,20 @@ function onOffscreenReady() {
   if (state.relayUrl && !state.sessionKilled) postRelayConnect();
 }
 
-function sendPlayTone() {
-  try { chrome.runtime.sendMessage({ kind: "jbb.offscreen.playTone" }); }
+function sendPlayTone(kind) {
+  try { chrome.runtime.sendMessage({ kind: "jbb.offscreen.playTone", tone: kind || "waiting" }); }
   catch (e) { /* offscreen gone */ }
+}
+
+// Distinct verdict tones (accessibility): grant rises, deny descends.
+// Same soundOn master switch as the waiting chime.
+function playVerdictTone(granted) {
+  if (!state.soundOn) return;
+  try {
+    ensureOffscreenDocument(function () {
+      sendPlayTone(granted ? "grant" : "deny");
+    });
+  } catch (e) { /* tones are best-effort */ }
 }
 
 function playConsentTone() {
@@ -1107,6 +1121,8 @@ function onRelayState(connected) {
   if (connected) state.relayDownSince = null;
   else if (state.relayUrl && state.relayDownSince == null) state.relayDownSince = Date.now();
   if (was !== connected) pushToPanel({ kind: "jbb.ui.status", connected: connected });
+  // A capture whose driver went away has no listener left — stop it.
+  if (!connected && state.capture) stopCapture("driver disconnected");
 }
 
 // Watchdog (keepalive alarm): if the transport reports down — or goes
@@ -1257,6 +1273,12 @@ function decideAction(proposal) {
     return proposal.actionTier === "T0"
       ? { decision: "allow" }
       : { decision: "deny", reason: "readonly mode" };
+  }
+  // 4b. STOPPING an audio capture is always allowed, in every mode:
+  // ending a capture is the privacy-safe direction and must never wait
+  // on a grant or a mode. (STARTING capture is T2 and gates normally.)
+  if (proposal.type === "audioCapture" && proposal.capture && proposal.capture.action === "stop") {
+    return { decision: "allow", via: "auto", reason: "stopping capture is always allowed" };
   }
   // 5. T3 ALWAYS confirms — in every mode, on every site. No exceptions.
   if (proposal.actionTier === "T3") {
@@ -1554,6 +1576,7 @@ function resolveConsent(proposal, answer) {
       type: proposal.type, proposalId: proposal.proposalId, via: "consent"
     });
     pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: proposal.proposalId, choice: "deny" });
+    playVerdictTone(false);
     return;
   }
 
@@ -1618,6 +1641,7 @@ function resolveConsent(proposal, answer) {
   }
   sendToRelay(JBB.Message.consentGrant(proposal.proposalId, answer.choice));
   pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: proposal.proposalId, choice: answer.choice });
+  playVerdictTone(true);
   executeProposal(proposal);
 }
 
@@ -1671,6 +1695,24 @@ if (chrome.tabs) {
       chrome.tabs[ev].addListener(function () { refreshTabsCache(); });
     }
   });
+  // Capture follows its tab: navigating the captured tab to a DIFFERENT
+  // site ends the capture (consent was per-site), and a finished load
+  // re-asserts the indicator (the new page's content script is fresh).
+  if (chrome.tabs.onUpdated && chrome.tabs.onUpdated.addListener) {
+    chrome.tabs.onUpdated.addListener(function (tabId, changeInfo, tab) {
+      if (!state.capture || tabId !== state.capture.tabId) return;
+      if (changeInfo.url && hostOf(changeInfo.url) !== state.capture.host) {
+        stopCapture("the captured tab navigated to a different site");
+      } else if (changeInfo.status === "complete") {
+        setCaptureIndicator(tabId, true);
+      }
+    });
+  }
+  if (chrome.tabs.onRemoved && chrome.tabs.onRemoved.addListener) {
+    chrome.tabs.onRemoved.addListener(function (tabId) {
+      if (state.capture && tabId === state.capture.tabId) stopCapture("the captured tab was closed");
+    });
+  }
 }
 
 function closeInactiveTabsNow() {
@@ -1749,9 +1791,122 @@ function executeTabAction(proposal) {
   return Promise.reject(new Error("unknown tab action: " + proposal.type));
 }
 
+// ---------------------------------------------------------------- audio capture
+// Tab audio capture (T2). The chain of custody is deliberate:
+//   consent (gate) → the tabCapture OPTIONAL permission, which only the
+//   user can grant, from the side panel, in plain language → a stream
+//   id for the ACTIVE tab → the offscreen document records and chunks
+//   → chunks relay live to the driver. Nothing is stored anywhere.
+// The captured tab shows an on-page indicator the whole time (plus
+// Chrome's own capture icon), the panel shows it too, and capture
+// stops on: agent stop, panel stop, the indicator's own Stop button,
+// tab navigation to another site, driver disconnect, or the capture
+// engine dying. Per-tab and per-site by construction: one capture,
+// bound to the tab + host it was consented for.
+function refreshCapturePermission() {
+  return new Promise(function (resolve) {
+    var done = false;
+    function fin(has) {
+      if (done) return;
+      done = true;
+      state.capturePermission = !!has;
+      resolve(state.capturePermission);
+    }
+    try {
+      var ret = chrome.permissions.contains({ permissions: ["tabCapture"] }, function (has) {
+        fin(has && !chrome.runtime.lastError);
+      });
+      if (ret && typeof ret.then === "function") ret.then(function (has) { fin(has); }, function () { fin(false); });
+    } catch (e) { fin(false); }
+  });
+}
+
+function getCaptureStreamId(tabId) {
+  return new Promise(function (resolve, reject) {
+    var done = false;
+    function ok(id) { if (!done) { done = true; id ? resolve(id) : reject(new Error("Chrome did not hand over a capture stream for this tab")); } }
+    function fail(e) { if (!done) { done = true; reject(e instanceof Error ? e : new Error(String((e && e.message) || e))); } }
+    try {
+      var ret = chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, function (id) {
+        if (chrome.runtime.lastError) fail(new Error(chrome.runtime.lastError.message));
+        else ok(id);
+      });
+      if (ret && typeof ret.then === "function") ret.then(ok, fail);
+    } catch (e) { fail(e); }
+  });
+}
+
+function setCaptureIndicator(tabId, active) {
+  try {
+    var p = chrome.tabs.sendMessage(tabId, { kind: "jbb.capture.indicator", active: !!active });
+    if (p && typeof p.catch === "function") p.catch(function () {});
+  } catch (e) { /* no content script there — Chrome's own capture icon still shows */ }
+}
+
+function stopCapture(reason) {
+  postToOffscreen({ kind: "jbb.capture.stop" });
+  if (!state.capture) return;
+  var cap = state.capture;
+  state.capture = null;
+  setCaptureIndicator(cap.tabId, false);
+  pushToPanel({ kind: "jbb.ui.captureChanged" });
+  audit({ site: cap.host, action: "audio capture stopped", tier: "T0",
+          result: "executed", detail: reason || "stopped" });
+}
+
+function waitCaptureActive(captureId, streamId) {
+  return new Promise(function (resolve, reject) {
+    var timer = setTimeout(function () {
+      state.captureWaiter = null;
+      reject(new Error("the capture engine did not start in time — Chrome may require the captured tab to be the active one"));
+    }, 6000);
+    state.captureWaiter = {
+      captureId: captureId,
+      resolve: function () { clearTimeout(timer); state.captureWaiter = null; resolve(); },
+      reject: function (e) { clearTimeout(timer); state.captureWaiter = null; reject(e); }
+    };
+    postToOffscreen({ kind: "jbb.capture.start", streamId: streamId, captureId: captureId });
+  });
+}
+
+function executeAudioCapture(proposal) {
+  var action = (proposal.capture && proposal.capture.action) || "start";
+  if (action === "stop") {
+    if (!state.capture) return Promise.resolve({ detail: "audio capture was not running" });
+    var wasHost = state.capture.host;
+    stopCapture("agent request");
+    return Promise.resolve({ detail: "audio capture stopped (was listening to " + wasHost + ")" });
+  }
+  if (state.capture) {
+    return Promise.reject(new Error("audio capture is already running on " + state.capture.host + " — stop it before starting another"));
+  }
+  return refreshCapturePermission().then(function (granted) {
+    if (!granted) {
+      throw new Error("audio capture is not enabled yet: the tabCapture permission is granted only by the user, from the side panel — Session tab → Audio capture → Enable. Nothing was captured.");
+    }
+    return getActiveTab();
+  }).then(function (tab) {
+    if (!tab || tab.id == null) throw new Error("no active tab to capture");
+    var host = hostOf(tab.url || "");
+    return getCaptureStreamId(tab.id).then(function (streamId) {
+      var captureId = "cap-" + Date.now().toString(36);
+      return waitCaptureActive(captureId, streamId).then(function () {
+        state.capture = { tabId: tab.id, host: host, captureId: captureId, startedAt: Date.now() };
+        setCaptureIndicator(tab.id, true);
+        pushToPanel({ kind: "jbb.ui.captureChanged" });
+        return {
+          detail: "listening to " + (host || "this tab") + " — audio streams to the driver in chunks; nothing is stored",
+          data: { captureId: captureId, site: host }
+        };
+      });
+    });
+  });
+}
+
 function executeProposal(proposal) {
   state.executing.add(proposal.proposalId);
-  var run = TAB_ACTIONS[proposal.type] ? executeTabAction(proposal) : runOnPage(proposal);
+  var run = proposal.type === "audioCapture" ? executeAudioCapture(proposal)
+          : TAB_ACTIONS[proposal.type] ? executeTabAction(proposal) : runOnPage(proposal);
   run.then(
     function (out) {
       var detail = (out && out.detail) || "";
@@ -2019,7 +2174,42 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   if (!msg || typeof msg.kind !== "string" ||
       (msg.kind.indexOf("jbb.ui.") !== 0 && msg.kind !== "jbb.banner.decision" &&
        msg.kind.indexOf("jbb.offscreen.") !== 0 && msg.kind.indexOf("jbb.relay.") !== 0 &&
-       msg.kind !== "jbb.media.progress")) {
+       msg.kind !== "jbb.media.progress" && msg.kind.indexOf("jbb.capture.") !== 0)) {
+    return false;
+  }
+  // Audio capture plumbing. Chunks and engine state are accepted ONLY
+  // from the offscreen document (same sender rule as the relay
+  // transport — a page must never be able to inject fake audio or fake
+  // a capture state). The stop request comes from the captured tab's
+  // own on-page indicator.
+  if (msg.kind.indexOf("jbb.capture.") === 0) {
+    var fromOffscreen = !!(sender && sender.url && sender.url.indexOf("offscreen.html") !== -1);
+    if (msg.kind === "jbb.capture.chunk") {
+      if (!fromOffscreen) return false;
+      if (state.capture && msg.captureId === state.capture.captureId &&
+          state.connected && !state.sessionKilled) {
+        sendToRelay(JBB.Message.audioChunk({
+          captureId: msg.captureId, seq: msg.seq, mimeType: msg.mimeType, data: msg.data
+        }));
+      }
+      return false;
+    }
+    if (msg.kind === "jbb.capture.state") {
+      if (!fromOffscreen) return false;
+      if (state.captureWaiter && msg.captureId === state.captureWaiter.captureId) {
+        if (msg.active) state.captureWaiter.resolve();
+        else state.captureWaiter.reject(new Error(msg.error || "the capture engine refused to start"));
+      } else if (!msg.active && state.capture && msg.captureId === state.capture.captureId) {
+        stopCapture("capture engine stopped");
+      }
+      return false;
+    }
+    if (msg.kind === "jbb.capture.stopRequest") {
+      if (sender && sender.tab && state.capture && sender.tab.id === state.capture.tabId) {
+        stopCapture("stopped from the on-page indicator");
+      }
+      return false;
+    }
     return false;
   }
   // Media progress from content scripts: relayed live to the driver,
@@ -2076,6 +2266,9 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           grantsPaused: state.grantsPaused,
           lastSummary: state.lastSummary,
           tabs: state.tabsCache || [],
+          capture: state.capture ? { active: true, host: state.capture.host, tabId: state.capture.tabId,
+                                     startedAt: state.capture.startedAt } : { active: false },
+          capturePermission: !!state.capturePermission,
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
           session: sess ? { site: sess.site, label: sess.label,
@@ -2138,6 +2331,19 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         done({ ok: true, closed: r.closed.length, kept: r.kept });
       }, function (err) { done({ ok: false, error: String(err) }); });
       return true;
+    case "jbb.ui.stopCapture":
+      stopCapture("stopped from the side panel");
+      done({ ok: true });
+      return true;
+
+    case "jbb.ui.capturePermissionChanged":
+      refreshCapturePermission().then(function (granted) {
+        if (!granted && state.capture) stopCapture("capture permission revoked");
+        pushToPanel({ kind: "jbb.ui.captureChanged" });
+        done({ ok: true, granted: granted });
+      });
+      return true;
+
     case "jbb.ui.endSession":
       // The user's deliberate end: summarize first, then disconnect.
       // (Unlike the kill switch this does not block reconnection.)

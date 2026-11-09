@@ -121,6 +121,12 @@
       return m;
     },
 
+    audioChunk: function (fields) {
+      // One ~1s chunk of captured tab audio (base64 Opus/WebM),
+      // extension → driver. Transits the relay; stored nowhere.
+      return base("audio.chunk", fields || {});
+    },
+
     mediaProgress: function (fields) {
       // Live media progress, extension → driver. Transits the relay;
       // stored nowhere.

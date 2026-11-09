@@ -69,8 +69,8 @@ check("offscreen: no consent machinery (never approves/denies/applies)",
   !off.includes("decideAction") && !off.includes("consent.grant") &&
   !off.includes("consent.deny") && !off.includes("act.result") &&
   !off.includes("executeProposal") && !off.includes("resolveConsent"));
-check("offscreen: chime path intact",
-  off.includes('msg.kind === "jbb.offscreen.playTone"') && off.includes("playChime()"));
+check("offscreen: chime path intact (tone variants ride the same message)",
+  off.includes('msg.kind === "jbb.offscreen.playTone"') && off.includes("playChime(msg.tone)"));
 
 console.log(failures === 0 ? "ALL TRANSPORT GUARD TESTS PASSED" : failures + " TRANSPORT GUARD CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

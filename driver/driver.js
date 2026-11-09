@@ -52,7 +52,7 @@
 
 import WebSocket from 'ws';
 import { HttpsProxyAgent } from 'https-proxy-agent';
-import { writeSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { writeSync, readFileSync, writeFileSync, mkdirSync, createWriteStream } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -98,10 +98,11 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
     ok: true,
     usage: [
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
-      'commands: observe | act | abort | status | watch',
+      'commands: observe | act | abort | status | watch | listen',
+      'listen flags: --duration <seconds> --out <file.webm> (proposes audio capture — T2 — then writes the streamed Opus/WebM chunks to the file)',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
       'watch flags: --duration <seconds> (stream media.progress events as JSON lines; 0 = until Ctrl-C)',
-      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file>',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab|audioCapture --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -109,7 +110,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
 
 const RELAY = opt('--relay', 'ws://127.0.0.1:8787');
 const KEY = opt('--key', '');
-const CMD = args.find((a) => ['observe', 'act', 'abort', 'status', 'watch'].includes(a));
+const CMD = args.find((a) => ['observe', 'act', 'abort', 'status', 'watch', 'listen'].includes(a));
 
 // In-flight act proposals owned by this process. A one-shot CLI holds none at
 // rest, so `status` reports 0; the counter exists so the field is real, not
@@ -389,9 +390,13 @@ function finishResult(msg) {
   console.log(JSON.stringify(msg, null, 2));
 }
 
+let lastActResult = null;
+let suppressActPrint = false; // listen: the start result is plumbing, not output
+
 // runAct's exit door: record media outcomes in the player memory and
 // write frame grabs to --out before the result is printed.
 function finishActResult(proposal, msg) {
+  lastActResult = msg;
   mediaRecord(proposal, msg);
   if (proposal.type === 'frameGrab' && msg && msg.ok && msg.data && msg.data.dataUrl) {
     const out = opt('--out', undefined);
@@ -408,7 +413,11 @@ function finishActResult(proposal, msg) {
       }
     }
   }
-  finishResult(msg);
+  if (suppressActPrint) {
+    console.error(`[act] ${msg.ok ? 'ok' : 'failed'} — ${msg.detail || ''}`);
+  } else {
+    finishResult(msg);
+  }
 }
 
 // Run one act through its lifecycle phases. The proposal is (re)sent ONLY
@@ -597,6 +606,68 @@ async function main() {
       return;
     }
 
+    if (CMD === 'listen') {
+      // Propose audio capture (T2 consent in the extension), then write
+      // the streamed chunks to a file the agent can transcribe. The
+      // chunk collector attaches BEFORE the proposal so nothing is lost
+      // between the start handshake and the stream.
+      const durS = Number(opt('--duration', '0'));
+      const outPath = opt('--out', `capture-${Date.now()}.webm`);
+      const outStream = createWriteStream(outPath);
+      let chunks = 0, bytes = 0;
+      const onMsg = (raw) => {
+        let m;
+        try { m = JSON.parse(String(raw)); } catch { return; }
+        if (m && m.type === 'audio.chunk' && typeof m.data === 'string') {
+          const buf = Buffer.from(m.data, 'base64');
+          outStream.write(buf);
+          chunks++;
+          bytes += buf.length;
+        }
+      };
+      ws.on('message', onMsg);
+      const proposal = {
+        actionTier: 'T2', type: 'audioCapture', capture: { action: 'start' },
+        target: { ref: null, label: '' }, site: opt('--site', ''),
+        description: 'start audio capture on this tab — audio streams to the driver only, never stored',
+      };
+      suppressActPrint = true;
+      try {
+        await runAct(ws, proposal, `act-${Date.now()}-listen`);
+      } finally {
+        suppressActPrint = false;
+      }
+      if (!lastActResult || !lastActResult.ok) {
+        ws.off('message', onMsg);
+        outStream.end();
+        emitAndExit({
+          ok: false, error: 'CAPTURE_NOT_STARTED',
+          message: (lastActResult && lastActResult.detail) || 'audio capture did not start',
+        }, 1);
+      }
+      console.error(`[listen] capturing to ${outPath}${durS > 0 ? ` for ${durS}s` : ' (Ctrl-C to stop)'}`);
+      await new Promise((resolve) => {
+        if (durS > 0) setTimeout(resolve, durS * 1000);
+        process.once('SIGINT', resolve);
+      });
+      // Stop is fire-and-forget: stopping a capture never needs consent
+      // (the extension allows it unconditionally).
+      try {
+        ws.send(JSON.stringify({
+          v: 1, type: 'act.propose', id: `act-${Date.now()}-stop`,
+          proposal: {
+            actionTier: 'T2', type: 'audioCapture', capture: { action: 'stop' },
+            target: { ref: null, label: '' }, site: '', description: 'stop audio capture',
+          },
+        }));
+      } catch { /* socket already going away */ }
+      await new Promise((r) => setTimeout(r, 600));
+      ws.off('message', onMsg);
+      await new Promise((r) => outStream.end(r));
+      console.log(JSON.stringify({ ok: true, command: 'listen', file: outPath, chunks, bytes }, null, 2));
+      return;
+    }
+
     if (CMD === 'observe') {
       const req = { v: 1, type: 'observe.request', id: `obs-${Date.now()}` };
       const offRaw = opt('--text-offset', undefined);
@@ -626,7 +697,7 @@ async function main() {
       const TAB_TYPES = ['listTabs', 'switchTab', 'closeTab', 'closeInactiveTabs', 'openTab', 'pinTab'];
       const isTabType = TAB_TYPES.includes(type);
       const proposal = {
-        actionTier: opt('--tier', isTabType || type === 'fetch' || type === 'media' || type === 'frameGrab' ? 'T2' : 'T1'),
+        actionTier: opt('--tier', isTabType || type === 'fetch' || type === 'media' || type === 'frameGrab' || type === 'audioCapture' ? 'T2' : 'T1'),
         type,
         target: { ref: opt('--ref', null), label: targetLabel },
         value: opt('--value', undefined),
@@ -827,6 +898,15 @@ async function main() {
           proposal.at = a2;
         }
         proposal.description = `grab a frame of the video${at !== undefined ? ` at ${at}s` : ''}`;
+      } else if (type === 'audioCapture') {
+        const capAction = opt('--capture', undefined);
+        if (!['start', 'stop'].includes(capAction)) {
+          throw new DriverError('USAGE', '--type audioCapture requires --capture start|stop');
+        }
+        proposal.capture = { action: capAction };
+        proposal.description = capAction === 'start'
+          ? 'start audio capture on this tab — audio streams to the driver only, never stored'
+          : 'stop audio capture';
       }
       const id = `act-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       console.error('[sent] act.propose — following the consent lifecycle…');

@@ -1005,7 +1005,44 @@
     window.__jbbMediaScan = scanMediaProgress; // test hook
   }
 
+  // ------------------------------------------------------------ capture indicator
+  // While this tab's audio is captured, a persistent pill says so —
+  // with its own Stop button. Capture NEVER runs without this on
+  // screen (Chrome's own capture icon shows as well).
+  var capturePill = null;
+  function setCaptureIndicator(active) {
+    try {
+      if (active) {
+        if (capturePill) return;
+        var host = document.createElement("div");
+        host.id = "jbb-capture-pill";
+        host.style.cssText = "position:fixed;top:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#7f1d1d;color:#fff;font:600 13px/1.4 system-ui,sans-serif;padding:8px 14px;border-radius:999px;box-shadow:0 4px 18px rgba(0,0,0,.35);display:flex;gap:10px;align-items:center;";
+        var label = document.createElement("span");
+        label.textContent = "🎙 Muse is listening to this tab's audio";
+        var btn = document.createElement("button");
+        btn.textContent = "Stop";
+        btn.style.cssText = "background:#fff;color:#7f1d1d;border:0;border-radius:999px;padding:2px 10px;font:600 12px system-ui,sans-serif;cursor:pointer;";
+        btn.addEventListener("click", function () {
+          try { chrome.runtime.sendMessage({ kind: "jbb.capture.stopRequest" }); } catch (e) {}
+          setCaptureIndicator(false);
+        });
+        host.appendChild(label);
+        host.appendChild(btn);
+        (document.body || document.documentElement).appendChild(host);
+        capturePill = host;
+      } else if (capturePill) {
+        if (capturePill.remove) capturePill.remove();
+        capturePill = null;
+      }
+    } catch (e) { /* pages that refuse DOM edits still get Chrome's capture icon */ }
+  }
+
   chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
+    if (msg && msg.kind === "jbb.capture.indicator") {
+      setCaptureIndicator(!!msg.active);
+      sendResponse({ ok: true });
+      return false;
+    }
     if (!msg || typeof msg.kind !== "string" || msg.kind.indexOf("jbb.content.") !== 0) {
       return false;
     }

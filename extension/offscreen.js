@@ -1,16 +1,21 @@
 /**
  * Jarvis Browser Bridge — offscreen document: audio player + relay transport.
  *
- * Two jobs, one persistent context:
+ * Three jobs, one persistent context:
  *  1. Consent attention tones (reason: AUDIO_PLAYBACK) — MV3 service workers
  *     cannot reliably play audio. The tone is synthesized with WebAudio — no
- *     audio files, nothing to fetch. Soft two-tone chime: noticeable across
- *     the room, not an alarm.
+ *     audio files, nothing to fetch. Distinct melodies per outcome:
+ *     waiting (the original two-tone), grant (rising), deny (descending).
  *  2. The relay WebSocket lives here now. Chrome suspends the service worker
  *     aggressively and every suspension used to drop the socket (the #1
  *     outage cause: driver peer.unavailable / consent timeouts). This
  *     document is not suspended the same way, so the socket — and the
  *     driver's session — survives worker restarts.
+ *  3. Tab audio capture: when the worker hands over a tabCapture stream
+ *     id (obtained only after consent + the user-enabled tabCapture
+ *     permission), this document records the tab's audio with
+ *     MediaRecorder and forwards ~1s Opus chunks to the worker, which
+ *     relays them to the driver. Audio is never stored here.
  *
  * TRANSPORT ONLY: this code pairs, forwards raw protocol strings both ways,
  * reconnects with backoff, queues sends while unpaired, and reports state.
@@ -54,7 +59,7 @@
     osc.stop(startAt + dur + 0.05);
   }
 
-  function playChime() {
+  function playChime(kind) {
     ensureCtx(function (ac) {
       if (!ac) {
         report("no-context");
@@ -62,8 +67,20 @@
       }
       try {
         var t = ac.currentTime;
-        tone(880, t, 0.22);          // A5
-        tone(659.25, t + 0.18, 0.3); // E5 — soft "attention" interval
+        if (kind === "grant") {
+          // Rising triad — decision made, approved.
+          tone(523.25, t, 0.16);       // C5
+          tone(659.25, t + 0.12, 0.16); // E5
+          tone(783.99, t + 0.24, 0.3);  // G5
+        } else if (kind === "deny") {
+          // Descending — decision made, refused.
+          tone(392, t, 0.2);           // G4
+          tone(261.63, t + 0.18, 0.34); // C4
+        } else {
+          // "waiting" — the original soft attention interval.
+          tone(880, t, 0.22);          // A5
+          tone(659.25, t + 0.18, 0.3); // E5
+        }
         report("played");
       } catch (e) {
         report("play-threw: " + String(e && e.message || e));
@@ -161,10 +178,71 @@
 
   setInterval(reportState, 15000);
 
+  // ------------------------------------------------------------ tab audio capture
+  var cap = null; // { recorder, stream, captureId, seq, mime }
+  function b64encode(buf) {
+    var bytes = new Uint8Array(buf);
+    var s = "";
+    for (var i = 0; i < bytes.length; i += 0x8000) {
+      s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    }
+    return btoa(s);
+  }
+  function captureState(active, captureId, error) {
+    try {
+      var m = { kind: "jbb.capture.state", active: !!active, captureId: captureId };
+      if (error) m.error = error;
+      chrome.runtime.sendMessage(m);
+    } catch (e) { /* background gone */ }
+  }
+  function stopTabCapture(notify) {
+    if (!cap) return;
+    var c = cap; cap = null;
+    try { c.recorder.stop(); } catch (e) {}
+    try { c.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    if (notify !== false) captureState(false, c.captureId);
+  }
+  function startTabCapture(streamId, captureId) {
+    stopTabCapture(false);
+    navigator.mediaDevices.getUserMedia({
+      audio: { mandatory: { chromeMediaSource: "tab", chromeMediaSourceId: streamId } },
+      video: false
+    }).then(function (stream) {
+      var mime = "audio/webm;codecs=opus";
+      if (typeof MediaRecorder === "function" && !MediaRecorder.isTypeSupported(mime)) mime = "audio/webm";
+      var rec = new MediaRecorder(stream, { mimeType: mime });
+      cap = { recorder: rec, stream: stream, captureId: captureId, seq: 0, mime: mime };
+      rec.ondataavailable = function (e) {
+        if (!e.data || !e.data.size || !cap) return;
+        e.data.arrayBuffer().then(function (buf) {
+          if (!cap) return;
+          try {
+            chrome.runtime.sendMessage({
+              kind: "jbb.capture.chunk", captureId: captureId,
+              seq: cap.seq++, mimeType: mime, data: b64encode(buf)
+            });
+          } catch (err) {}
+        });
+      };
+      rec.onstop = function () { stopTabCapture(true); };
+      stream.getAudioTracks().forEach(function (t) {
+        t.onended = function () { stopTabCapture(true); };
+      });
+      rec.start(1000);
+      captureState(true, captureId);
+    }).catch(function (err) {
+      captureState(false, captureId, String((err && err.message) || err));
+    });
+  }
+
   chrome.runtime.onMessage.addListener(function (msg) {
     if (!msg || typeof msg.kind !== "string") return;
     if (msg.kind === "jbb.offscreen.playTone") {
-      try { playChime(); } catch (e) { report("listener-threw"); }
+      try { playChime(msg.tone); } catch (e) { report("listener-threw"); }
+    } else if (msg.kind === "jbb.capture.start") {
+      startTabCapture(msg.streamId, msg.captureId);
+    } else if (msg.kind === "jbb.capture.stop") {
+      stopTabCapture(true);
     } else if (msg.kind === "jbb.relay.connect") {
       relayConnect(msg.url, msg.key);
     } else if (msg.kind === "jbb.relay.disconnect") {

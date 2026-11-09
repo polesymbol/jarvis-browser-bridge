@@ -88,6 +88,11 @@ function fakeLifecycleExt(port, key, mode) {
     ws.on("message", (raw) => {
       let m; try { m = JSON.parse(raw.toString()); } catch { return; }
       if (m.type === "pair.confirm") { resolve(state); return; }
+      if (m.type === "act.propose" && m.proposal && m.proposal.type === "audioCapture" &&
+          m.proposal.capture && m.proposal.capture.action === "stop") {
+        state.stopProposals = (state.stopProposals || 0) + 1;
+        return;
+      }
       if (m.type !== "act.propose" && m.type !== "observe.request") return;
       const send = (o) => { try { ws.send(JSON.stringify({ v: 1, ...o })); } catch {} };
       const after = (ms, fn) => { state.timers.push(setTimeout(fn, ms)); };
@@ -102,6 +107,18 @@ function fakeLifecycleExt(port, key, mode) {
       state.lastProposal = m.proposal;
       const pid = m.id;
       send({ type: "proposal.received", proposalId: pid });
+      if (mode === "capture") {
+        after(30, () => send({ type: "consent.shown", proposalId: pid, via: "panel" }));
+        after(80, () => send({ type: "consent.grant", proposalId: pid, scope: "once" }));
+        after(150, () => send({ type: "act.result", proposalId: pid, ok: true,
+          detail: "listening to example.com — audio streams to the driver in chunks; nothing is stored",
+          data: { captureId: "cap-test", site: "example.com" } }));
+        after(400, () => send({ type: "audio.chunk", captureId: "cap-test", seq: 0,
+          mimeType: "audio/webm;codecs=opus", data: Buffer.from("CHUNK1").toString("base64") }));
+        after(700, () => send({ type: "audio.chunk", captureId: "cap-test", seq: 1,
+          mimeType: "audio/webm;codecs=opus", data: Buffer.from("CHUNK2").toString("base64") }));
+        return;
+      }
       if (mode === "notshown") return; // received, but no prompt ever appears
       after(30, () => send({ type: "consent.shown", proposalId: pid, via: "panel" }));
       if (mode === "grant") {
@@ -470,6 +487,19 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   check("a verified play leaves no failure record",
     p4.code === 0 && Object.keys(memOk).length === 0, "mem=" + JSON.stringify(memOk));
   stopExt(mo);
+
+  // ------------------------------------------------------------ listen
+  const capKey = "capture-key-0123456789abcde";
+  const capOut = pathx.join(osx.tmpdir(), `jbb-listen-${Date.now()}.webm`);
+  const ce = await fakeLifecycleExt(Number(new URL(mArg).port), capKey, "capture");
+  const lr = await runDriver(["--relay", mArg, "--key", capKey, "listen", "--duration", "2", "--out", capOut], FAST);
+  let lrj = null; try { lrj = JSON.parse(lr.out); } catch {}
+  const fileBytes = fsx.existsSync(capOut) ? fsx.readFileSync(capOut, "utf8") : "";
+  check("listen proposes capture, streams chunks to a transcribable file, and stops it",
+    lr.code === 0 && !!lrj && lrj.command === "listen" && lrj.chunks === 2 && lrj.bytes === 12 &&
+    fileBytes === "CHUNK1CHUNK2" && (ce.stopProposals || 0) === 1,
+    "stdout=" + lr.out + " file=" + JSON.stringify(fileBytes) + " stops=" + (ce.stopProposals || 0));
+  stopExt(ce);
 }
 L.httpServer.close();
 

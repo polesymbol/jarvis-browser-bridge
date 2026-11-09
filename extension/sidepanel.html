@@ -114,6 +114,18 @@
     </div>
 
     <div class="card">
+      <h2>Audio capture</h2>
+      <p class="hint">Lets Muse hear what a tab is playing (for example, a lesson video) and transcribe it. Audio streams to Muse only — it is never stored. Capture always asks first, works per site, and shows a red “listening” pill on the tab itself.</p>
+      <p id="captureStatus" class="status-line">Checking…</p>
+      <div class="row">
+        <button id="capEnableBtn" class="btn btn-secondary hidden">Enable audio capture</button>
+        <button id="capRevokeBtn" class="btn btn-secondary hidden">Revoke permission</button>
+        <button id="capStopBtn" class="btn btn-danger hidden">Stop capture</button>
+      </div>
+      <p class="hint">Enabling asks Chrome for the “capture tab audio” permission — that request only ever happens here, when you click, never automatically.</p>
+    </div>
+
+    <div class="card">
       <h2>Current page</h2>
       <div class="row">
         <button id="observeBtn" class="btn btn-secondary">Snapshot this page</button>

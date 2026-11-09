@@ -208,6 +208,41 @@ function renderSession(session) {
   bar.appendChild(revoke);
 }
 
+// ---------------------------------------------------------------- audio capture
+function renderCapture(st) {
+  var status = el("captureStatus");
+  var enableBtn = el("capEnableBtn"), revokeBtn = el("capRevokeBtn"), stopBtn = el("capStopBtn");
+  if (!status) return;
+  var cap = st.capture || { active: false };
+  if (cap.active) {
+    status.textContent = "🎙 Listening to " + (cap.host || "a tab") + " since " +
+      new Date(cap.startedAt).toLocaleTimeString() + " — the tab shows a red pill while this runs.";
+  } else if (st.capturePermission) {
+    status.textContent = "Enabled. Capture still asks before it starts, every time, unless you whitelist it per site.";
+  } else {
+    status.textContent = "Not enabled. Muse cannot hear any tab until you enable this.";
+  }
+  enableBtn.classList.toggle("hidden", !!st.capturePermission);
+  revokeBtn.classList.toggle("hidden", !st.capturePermission);
+  stopBtn.classList.toggle("hidden", !cap.active);
+}
+
+el("capEnableBtn").addEventListener("click", function () {
+  // The permission request must come from THIS click (a user gesture in
+  // an extension page) — the background can never ask for it.
+  chrome.permissions.request({ permissions: ["tabCapture"] }, function () {
+    api({ kind: "jbb.ui.capturePermissionChanged" }).then(function () { refresh(); });
+  });
+});
+el("capRevokeBtn").addEventListener("click", function () {
+  chrome.permissions.remove({ permissions: ["tabCapture"] }, function () {
+    api({ kind: "jbb.ui.capturePermissionChanged" }).then(function () { refresh(); });
+  });
+});
+el("capStopBtn").addEventListener("click", function () {
+  api({ kind: "jbb.ui.stopCapture" }).then(function () { refresh(); });
+});
+
 // ---------------------------------------------------------------- sites
 // The action vocabulary mirrors WHITELIST_ACTIONS_V1 in background.js;
 // the background sanitizes whatever the manager sends, so drift here can
@@ -215,7 +250,7 @@ function renderSession(session) {
 var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key",
                   "hover", "select", "drag", "setValue",
                   "listTabs", "switchTab", "closeTab", "closeInactiveTabs", "openTab", "pinTab",
-                  "waitFor", "fetch", "media", "captions", "frameGrab"];
+                  "waitFor", "fetch", "media", "captions", "frameGrab", "audioCapture"];
 var WL_REVIEW_MS = 30 * 86400e3;
 
 function fmtDate(ts) {
@@ -506,6 +541,7 @@ function refresh() {
       ? "0 active grants — re-grant to continue"
       : grantCount + " active grant" + (grantCount === 1 ? "" : "s");
     renderAudit(s.audit);
+    renderCapture(s);
     renderFeed(s.audit);
     renderSummary(s.lastSummary);
     renderTabs(s.tabs);
@@ -571,6 +607,9 @@ chrome.runtime.onMessage.addListener(function (msg) {
       refresh();
       break;
     case "jbb.ui.tabsChanged":
+      refresh();
+      break;
+    case "jbb.ui.captureChanged":
       refresh();
       break;
     case "jbb.ui.toast":
