@@ -138,7 +138,7 @@ function renderConsentCard(proposal) {
     '<div class="consent-tier-desc">' + esc(tier.desc) + "</div>" +
     '<div class="consent-actions">' +
       '<button class="btn btn-primary" data-choice="once">Allow once</button>' +
-      (proposal.actionTier === "T1"
+      (proposal.actionTier === "T1" || proposal.actionTier === "T2"
         ? '<button class="btn btn-secondary" data-choice="whitelist">Always allow on this site</button>'
         : '') +
       '<button class="btn btn-secondary" data-choice="session1h">For 1 hour</button>' +
@@ -151,7 +151,7 @@ function renderConsentCard(proposal) {
       '<input type="datetime-local" class="consent-until" id="until-' + proposal.proposalId + '">' +
       '<button class="btn btn-secondary" data-choice="sessionCustom">Allow until then</button>' +
     "</div>" +
-    '<div class="consent-grant-note">Timed grants cover routine (T1–T2) actions on this site until they lapse. “Always allow on this site” writes a whitelist entry for T1 actions on this exact domain only — subdomains are separate entries. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
+    '<div class="consent-grant-note">Timed grants cover routine (T1–T2) actions on this site until they lapse. “Always allow on this site” writes a whitelist entry for this action’s tier on this exact domain only — subdomains are separate entries, and you can narrow it per action in the Sites tab. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
 
   card.querySelectorAll("button").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -209,40 +209,144 @@ function renderSession(session) {
 }
 
 // ---------------------------------------------------------------- sites
-function renderSites(sites, whitelist) {
+// The action vocabulary mirrors WHITELIST_ACTIONS_V1 in background.js;
+// the background sanitizes whatever the manager sends, so drift here can
+// only ever narrow coverage, never widen it.
+var WL_ACTIONS = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key"];
+var WL_REVIEW_MS = 30 * 86400e3;
+
+function fmtDate(ts) {
+  if (!ts) return "never";
+  return new Date(ts).toLocaleDateString([], { year: "numeric", month: "short", day: "numeric" });
+}
+
+function renderSites(sites, whitelist, currentSchema) {
   var list = el("sitesList");
   list.innerHTML = "";
   var hosts = Object.keys(sites || {});
   var wlHosts = Object.keys(whitelist || {});
   if (!hosts.length && !wlHosts.length) {
-    list.innerHTML = '<div class="empty">No site grants yet. Approve a T1 action with “Always allow on this site” to add one.</div>';
+    list.innerHTML = '<div class="empty">No site grants yet. Approve a T1/T2 action with “Always allow on this site”, or add a domain above.</div>';
     return;
   }
-  // Whitelist entries first: domain + the tiers they cover.
+  // Whitelist entries: the manager. Domain, coverage, dates, schema,
+  // review state, per-action checkboxes, revoke.
   wlHosts.sort().forEach(function (host) {
     var entry = whitelist[host];
-    var row = document.createElement("div");
-    row.className = "site-row";
-    row.innerHTML = '<span class="site-host">' + esc(host) + "</span>" +
-      '<span class="mini-tag tag-ok">whitelisted · ' + esc((entry.tiers || []).join("+")) + "</span>";
-    var btn = document.createElement("button");
-    btn.className = "btn btn-danger";
-    btn.textContent = "Revoke";
-    btn.addEventListener("click", function () {
+    var wrap = document.createElement("div");
+    wrap.className = "wl-entry";
+
+    var head = document.createElement("div");
+    head.className = "wl-entry-head";
+    head.innerHTML = '<span class="site-host">' + esc(host) + "</span>" +
+      '<span class="mini-tag tag-ok">whitelisted · ' + esc((entry.tiers || []).join("+") || "—") + "</span>";
+    var manageBtn = document.createElement("button");
+    manageBtn.className = "btn btn-secondary";
+    manageBtn.textContent = "Manage";
+    var revokeBtn = document.createElement("button");
+    revokeBtn.className = "btn btn-danger";
+    revokeBtn.textContent = "Revoke";
+    revokeBtn.addEventListener("click", function () {
       api({ kind: "jbb.ui.revokeSite", host: host }).then(function () {
         toast("Revoked: " + host);
       });
     });
-    row.appendChild(btn);
-    list.appendChild(row);
+    head.appendChild(manageBtn);
+    head.appendChild(revokeBtn);
+    wrap.appendChild(head);
+
+    var meta = document.createElement("div");
+    meta.className = "wl-meta";
+    meta.textContent = "Granted " + fmtDate(entry.grantedAt) + " · Last used " + fmtDate(entry.lastUsedAt) +
+      " · schema v" + (entry.schemaVersion || "?") +
+      " · Allows: " + ((entry.actions || []).join(", ") || "nothing (all ask)");
+    wrap.appendChild(meta);
+
+    var staleSchema = typeof currentSchema === "number" && entry.schemaVersion !== currentSchema;
+    if (staleSchema) {
+      var sw = document.createElement("div");
+      sw.className = "wl-schema-warn";
+      sw.textContent = "Review needed — new action types are not covered by this entry (schema v" +
+        entry.schemaVersion + " < v" + currentSchema + ").";
+      wrap.appendChild(sw);
+    }
+
+    // 30-day review: no silent permanence. Keep re-confirms (and adopts
+    // the current schema); Revoke removes.
+    var lastConfirmed = Math.max(entry.grantedAt || 0, entry.reviewedAt || 0);
+    var reviewDue = staleSchema || (Date.now() - lastConfirmed > WL_REVIEW_MS);
+    if (reviewDue) {
+      var rv = document.createElement("div");
+      rv.className = "wl-review";
+      var q = document.createElement("span");
+      q.textContent = "Still want Muse to have " + ((entry.tiers || []).join("/") || "access") + " on " + host + "?";
+      var keepBtn = document.createElement("button");
+      keepBtn.className = "btn btn-primary";
+      keepBtn.textContent = "Keep";
+      keepBtn.addEventListener("click", function () {
+        api({ kind: "jbb.ui.keepWhitelist", domain: host }).then(function () {
+          toast("Kept: " + host);
+        });
+      });
+      var rvRevoke = document.createElement("button");
+      rvRevoke.className = "btn btn-danger";
+      rvRevoke.textContent = "Revoke";
+      rvRevoke.addEventListener("click", function () {
+        api({ kind: "jbb.ui.revokeSite", host: host }).then(function () {
+          toast("Revoked: " + host);
+        });
+      });
+      rv.appendChild(q);
+      rv.appendChild(keepBtn);
+      rv.appendChild(rvRevoke);
+      wrap.appendChild(rv);
+    }
+
+    // Per-action manager: tier toggles + action checkboxes. Unchecked
+    // means "ask" — the default for everything.
+    var grid = document.createElement("div");
+    grid.className = "wl-grid hidden";
+    function pushUpdate() {
+      var tiers = Array.prototype.slice.call(grid.querySelectorAll("input[data-tier]:checked"))
+        .map(function (i) { return i.getAttribute("data-tier"); });
+      var actions = Array.prototype.slice.call(grid.querySelectorAll("input[data-action]:checked"))
+        .map(function (i) { return i.getAttribute("data-action"); });
+      api({ kind: "jbb.ui.updateWhitelist", domain: host, tiers: tiers, actions: actions });
+    }
+    ["T1", "T2"].forEach(function (t) {
+      var lab = document.createElement("label");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.setAttribute("data-tier", t);
+      cb.checked = (entry.tiers || []).indexOf(t) !== -1;
+      cb.addEventListener("change", pushUpdate);
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(t));
+      grid.appendChild(lab);
+    });
+    WL_ACTIONS.forEach(function (a) {
+      var lab = document.createElement("label");
+      var cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.setAttribute("data-action", a);
+      cb.checked = (entry.actions || []).indexOf(a) !== -1;
+      cb.addEventListener("change", pushUpdate);
+      lab.appendChild(cb);
+      lab.appendChild(document.createTextNode(a));
+      grid.appendChild(lab);
+    });
+    manageBtn.addEventListener("click", function () { grid.classList.toggle("hidden"); });
+    wrap.appendChild(grid);
+
+    list.appendChild(wrap);
   });
+  // Blocked hosts (sites map deny entries).
   hosts.sort().forEach(function (host) {
+    if (sites[host] !== "deny") return;
     var row = document.createElement("div");
     row.className = "site-row";
-    var tag = sites[host] === "deny"
-      ? '<span class="mini-tag tag-bad">blocked</span>'
-      : '<span class="mini-tag tag-ok">allowed</span>';
-    row.innerHTML = '<span class="site-host">' + esc(host) + "</span>" + tag;
+    row.innerHTML = '<span class="site-host">' + esc(host) + "</span>" +
+      '<span class="mini-tag tag-bad">blocked</span>';
     var btn = document.createElement("button");
     btn.className = "btn btn-danger";
     btn.textContent = "Revoke";
@@ -292,7 +396,8 @@ function refresh() {
     if (!s || !s.ok) return;
     renderStatus(s);
     renderModes(s.mode);
-    renderSites(s.sites, s.whitelist);
+    renderSites(s.sites, s.whitelist, s.whitelistSchema);
+    el("grantsPauseToggle").checked = !!s.grantsPaused;
     renderSession(s.session);
     // Grants line: session grant + whitelist entries are the active grants.
     var grantCount = (s.session ? 1 : 0) + Object.keys(s.sites || {}).filter(function (h) {
@@ -515,6 +620,54 @@ document.addEventListener("DOMContentLoaded", function () {
           toast("Blocked: " + host);
         });
       }
+    });
+  });
+
+  // Whitelist manager: pause switch, add-by-typing, add-current, revoke all.
+  el("grantsPauseToggle").addEventListener("change", function () {
+    api({ kind: "jbb.ui.setGrantsPaused", paused: el("grantsPauseToggle").checked }).then(function (res) {
+      toast(res && res.grantsPaused ? "All grants paused — everything will ask" : "Grants resumed");
+    });
+  });
+  function wlAdd(domain, confirmed) {
+    api({ kind: "jbb.ui.addWhitelist", domain: domain, tiers: ["T1"], confirmed: !!confirmed }).then(function (res) {
+      var warn = el("wlWarn");
+      if (res && res.ok) {
+        warn.classList.add("hidden");
+        el("wlDomainInput").value = "";
+        toast("Whitelisted: " + domain + " (T1)");
+      } else if (res && res.warning === "punycode") {
+        warn.innerHTML = "";
+        var span = document.createElement("span");
+        span.textContent = "⚠ " + res.domain + " is a punycode (xn--) domain — the classic lookalike trick. " +
+          "Double-check this is really the site you mean.";
+        var btn = document.createElement("button");
+        btn.className = "btn btn-danger";
+        btn.textContent = "Add anyway";
+        btn.addEventListener("click", function () { wlAdd(res.domain, true); });
+        warn.appendChild(span);
+        warn.appendChild(btn);
+        warn.classList.remove("hidden");
+      } else {
+        warn.textContent = "Could not add: " + ((res && res.error) || "unknown error");
+        warn.classList.remove("hidden");
+      }
+    });
+  }
+  el("wlAddBtn").addEventListener("click", function () {
+    var v = el("wlDomainInput").value.trim();
+    if (v) wlAdd(v, false);
+  });
+  el("wlAddCurrentBtn").addEventListener("click", function () {
+    chrome.tabs.query({ active: true, lastFocusedWindow: true }).then(function (tabs) {
+      var host = hostOf(tabs[0] && tabs[0].url);
+      if (host && host !== "-") wlAdd(host, false);
+    });
+  });
+  el("wlRevokeAllBtn").addEventListener("click", function () {
+    if (!confirm("Remove ALL whitelist entries? Muse will ask before acting on every site again.")) return;
+    api({ kind: "jbb.ui.revokeAllWhitelist" }).then(function () {
+      toast("All whitelist entries revoked");
     });
   });
 

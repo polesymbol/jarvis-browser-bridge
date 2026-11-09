@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 const dir = path.dirname(fileURLToPath(import.meta.url));
 const bg = fs.readFileSync(path.join(dir, "../background.js"), "utf8");
 const panel = fs.readFileSync(path.join(dir, "../sidepanel.js"), "utf8");
+const panelHtml = fs.readFileSync(path.join(dir, "../sidepanel.html"), "utf8");
 
 let failures = 0;
 function check(name, cond) {
@@ -50,6 +51,29 @@ check("panel: 'Always allow on this site' is offered for T1 only",
   panel.includes('proposal.actionTier === "T1"'));
 check("panel: grants line counts whitelist entries",
   panel.includes("Object.keys(s.whitelist || {}).length"));
+
+// ------------------------------------------------------------- manager (v0.2.22)
+check("pause switch gates BOTH auto-allow paths (whitelist + session)",
+  bg.includes("if (state.grantsPaused) return null; // master pause") &&
+  bg.includes("!state.grantsPaused &&"));
+check("manager handlers exist (add / update / keep / revoke-all / pause)",
+  bg.includes('case "jbb.ui.addWhitelist"') && bg.includes('case "jbb.ui.updateWhitelist"') &&
+  bg.includes('case "jbb.ui.keepWhitelist"') && bg.includes('case "jbb.ui.revokeAllWhitelist"') &&
+  bg.includes('case "jbb.ui.setGrantsPaused"'));
+check("typed domains are normalized and wildcards refused",
+  bg.includes("function normalizeDomain(raw)") && bg.includes('d.indexOf("*") !== -1'));
+check("punycode adds are gated behind an explicit confirm",
+  bg.includes('warning: "punycode"') && bg.includes("!msg.confirmed"));
+check("manager update sanitizes tiers to T1/T2 and actions to the known vocabulary",
+  bg.includes('.filter(function (t) { return t === "T1" || t === "T2"; })') &&
+  bg.includes("WHITELIST_ACTIONS_V1.indexOf(a) !== -1"));
+check("Keep re-confirms: schema upgrade + review clock restart",
+  bg.includes("kEntry.schemaVersion = WHITELIST_SCHEMA") && bg.includes("kEntry.reviewedAt = Date.now()"));
+check("panel: manager surface (pause, add, review prompt, schema warning, revoke all)",
+  panelHtml.includes("Pause all grants") && panel.includes("Still want Muse to have") &&
+  panel.includes("Review needed — new action types are not covered") &&
+  panel.includes("jbb.ui.revokeAllWhitelist") && panel.includes('data-choice="whitelist"') &&
+  panel.includes('proposal.actionTier === "T2"'));
 
 console.log(failures === 0 ? "ALL WHITELIST GUARD TESTS PASSED" : failures + " WHITELIST GUARD CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);

@@ -56,6 +56,7 @@ var state = {
   mode: "ask-some",            // readonly | ask-some | always-ask
   sites: {},
   whitelist: {},               // domain -> entry (see grantWhitelist); exact-domain, tier-scoped, epoch-bound
+  grantsPaused: false,         // master switch: while true, NO grant auto-allows (whitelist or session)
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer, createdAt, shown, shownVia, escalated, lastWaitingAt, elapsed }
   executing: new Set(),        // proposalIds currently executing (dedupe)
@@ -144,6 +145,7 @@ function loadPersisted() {
     state.soundOn = (typeof s.soundOn === "boolean") ? s.soundOn : true;
     state.relayUrl = s.relayUrl || "";
     state.sites = res[K.SITES] || {};
+    state.grantsPaused = !!s.grantsPaused;
     state.whitelist = res[K.WHITELIST] || {};
     if (typeof res[K.EPOCH] === "number" && res[K.EPOCH] > 0) state.keyEpoch = res[K.EPOCH];
     // Migrate legacy blanket site-allows (pre-whitelist builds stored
@@ -177,7 +179,7 @@ function loadPersisted() {
 function saveSettings() {
   chrome.storage.local.set({
     [K.SETTINGS]: { mode: state.mode, relayUrl: state.relayUrl, killed: state.sessionKilled,
-                    soundOn: state.soundOn },
+                    soundOn: state.soundOn, grantsPaused: state.grantsPaused },
     [K.SITES]: state.sites
   });
 }
@@ -218,6 +220,7 @@ function whitelistEntryFor(host) {
 }
 
 function whitelistCovers(proposal, host) {
+  if (state.grantsPaused) return null; // master pause: nothing auto-allows
   if (!host || proposal.actionTier === "T3") return null; // hard carve-out
   var e = whitelistEntryFor(host);
   if (!e) return null;
@@ -235,13 +238,61 @@ function grantWhitelist(host, tier) {
   var entry = {
     domain: host,
     tiers: tiers,
-    actions: WHITELIST_ACTIONS_V1.slice(),
+    // An existing entry keeps its per-action checkboxes (the manager may
+    // have deliberately unchecked some); only a fresh entry starts with
+    // the full schema vocabulary.
+    actions: existing ? existing.actions.slice() : WHITELIST_ACTIONS_V1.slice(),
     grantedAt: existing ? existing.grantedAt : now,
     lastUsedAt: now,
+    reviewedAt: now,
     keyId: state.keyEpoch,
     schemaVersion: WHITELIST_SCHEMA
   };
   state.whitelist[host] = entry;
+  saveWhitelist();
+  pushToPanel({ kind: "jbb.ui.sitesChanged" });
+  return entry;
+}
+
+// Normalize a user-typed domain for the whitelist manager: lowercase,
+// strip scheme / path / query / port. Returns null for anything that is
+// not a plain hostname — wildcards are refused here too (a "*.domain"
+// entry is a separate explicit feature, never a typing accident).
+function normalizeDomain(raw) {
+  if (typeof raw !== "string") return null;
+  var d = raw.trim().toLowerCase();
+  d = d.replace(/^[a-z][a-z0-9+.-]*:\/\//, "");
+  d = d.split("/")[0].split("?")[0].split("#")[0];
+  d = d.split(":")[0];
+  d = d.replace(/\.$/, "").replace(/^\./, "");
+  if (!d || d.indexOf("*") !== -1 || /[^a-z0-9.\-]/.test(d)) return null;
+  if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(d)) return null;
+  return d;
+}
+
+function looksPunycode(domain) {
+  return domain.indexOf("xn--") !== -1;
+}
+
+// Manager add: tiers default to T1 and are sanitized to T1/T2 — T3 can
+// never be granted from anywhere, the manager included.
+function addWhitelistEntry(domain, tiers) {
+  var clean = (Array.isArray(tiers) ? tiers : ["T1"]).filter(function (t) {
+    return t === "T1" || t === "T2";
+  });
+  if (!clean.length) clean = ["T1"];
+  var now = Date.now();
+  var entry = {
+    domain: domain,
+    tiers: clean,
+    actions: WHITELIST_ACTIONS_V1.slice(),
+    grantedAt: now,
+    lastUsedAt: 0,
+    reviewedAt: now,
+    keyId: state.keyEpoch,
+    schemaVersion: WHITELIST_SCHEMA
+  };
+  state.whitelist[domain] = entry;
   saveWhitelist();
   pushToPanel({ kind: "jbb.ui.sitesChanged" });
   return entry;
@@ -1317,6 +1368,7 @@ function handleProposal(proposal, source) {
   // Session grants layer on top of "ask": a live time-boxed grant auto-allows
   // T1/T2 on its site. T3 is NEVER covered — sensitive actions always ask.
   var viaSession = verdict.decision === "ask" &&
+                   !state.grantsPaused &&
                    proposal.actionTier !== "T3" &&
                    sessionAllows(proposal);
 
@@ -1753,6 +1805,8 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           soundOn: state.soundOn,
           sites: state.sites,
           whitelist: state.whitelist,
+          whitelistSchema: WHITELIST_SCHEMA,
+          grantsPaused: state.grantsPaused,
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
           session: sess ? { site: sess.site, label: sess.label,
@@ -1874,6 +1928,78 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
         pushToPanel({ kind: "jbb.ui.sitesChanged" });
       }
       done();
+      break;
+
+    // ------------------------------------------------ whitelist manager
+    // The manager is the USER's control surface: it works entirely
+    // through panel messages, no driver connection needed, and every
+    // change lands in state immediately (revoke/pause bite mid-session,
+    // on the very next proposal).
+    case "jbb.ui.addWhitelist": {
+      var domain = normalizeDomain(msg.domain || msg.host || "");
+      if (!domain) { done({ ok: false, error: "that does not look like a domain" }); break; }
+      if (looksPunycode(domain) && !msg.confirmed) {
+        // Punycode (xn--) domains are the classic lookalike vector: make
+        // the user confirm they mean THIS domain before it takes effect.
+        done({ ok: false, warning: "punycode", domain: domain });
+        break;
+      }
+      var added = addWhitelistEntry(domain, msg.tiers);
+      audit({ site: domain, action: "whitelist entry added", tier: added.tiers.join("+"),
+              result: "allowed", detail: "added from the whitelist manager" });
+      done({ ok: true, entry: added });
+      break;
+    }
+
+    case "jbb.ui.updateWhitelist": {
+      var uEntry = state.whitelist[msg.domain];
+      if (!uEntry) { done({ ok: false, error: "no such entry" }); break; }
+      // Sanitize: tiers can only ever be T1/T2, actions only known types.
+      // Anything else the UI sends is dropped, never stored.
+      uEntry.tiers = (Array.isArray(msg.tiers) ? msg.tiers : uEntry.tiers)
+        .filter(function (t) { return t === "T1" || t === "T2"; });
+      uEntry.actions = (Array.isArray(msg.actions) ? msg.actions : uEntry.actions)
+        .filter(function (a) { return WHITELIST_ACTIONS_V1.indexOf(a) !== -1; });
+      saveWhitelist();
+      pushToPanel({ kind: "jbb.ui.sitesChanged" });
+      done({ ok: true, entry: uEntry });
+      break;
+    }
+
+    case "jbb.ui.keepWhitelist": {
+      // Review "Keep": re-confirm the entry. The 30-day clock restarts,
+      // the schema is upgraded to current, and the action list extends
+      // to the current vocabulary — re-confirming is exactly the moment
+      // the user accepts coverage of action types added since the grant.
+      var kEntry = state.whitelist[msg.domain];
+      if (!kEntry) { done({ ok: false, error: "no such entry" }); break; }
+      kEntry.reviewedAt = Date.now();
+      kEntry.schemaVersion = WHITELIST_SCHEMA;
+      WHITELIST_ACTIONS_V1.forEach(function (a) {
+        if (kEntry.actions.indexOf(a) === -1) kEntry.actions.push(a);
+      });
+      saveWhitelist();
+      pushToPanel({ kind: "jbb.ui.sitesChanged" });
+      done({ ok: true, entry: kEntry });
+      break;
+    }
+
+    case "jbb.ui.revokeAllWhitelist":
+      state.whitelist = {};
+      chrome.storage.local.remove([K.WHITELIST]);
+      audit({ site: "-", action: "whitelist: revoke all", tier: "-",
+              result: "executed", detail: "all whitelist entries removed from the manager" });
+      pushToPanel({ kind: "jbb.ui.sitesChanged" });
+      done({ ok: true });
+      break;
+
+    case "jbb.ui.setGrantsPaused":
+      state.grantsPaused = !!msg.paused;
+      saveSettings();
+      audit({ site: "-", action: state.grantsPaused ? "grants paused" : "grants resumed", tier: "-",
+              result: "executed", detail: "master switch in the whitelist manager" });
+      pushToPanel({ kind: "jbb.ui.status", connected: state.connected });
+      done({ ok: true, grantsPaused: state.grantsPaused });
       break;
 
     case "jbb.ui.revokeSession":

@@ -410,3 +410,19 @@ main { padding: 14px 16px 90px; }
 .check-row { display: flex; gap: 8px; align-items: flex-start; margin-top: 10px; font-size: 13px; cursor: pointer; }
 .check-row input[type="checkbox"] { margin-top: 2px; accent-color: #e8710a; }
 .hint-inline { color: var(--faint); font-size: 12px; }
+
+/* Whitelist manager */
+.pause-label { font-size: 13px; }
+#wlDomainInput { flex: 1; min-width: 0; }
+.wl-warn { margin-top: 8px; padding: 8px 10px; border: 1px solid var(--danger); border-radius: 8px; font-size: 12px; }
+.wl-meta { color: var(--faint); font-size: 11px; margin: 2px 0 4px; }
+.wl-review { margin: 6px 0; padding: 8px 10px; border: 1px solid var(--warn, #b58900); border-radius: 8px; font-size: 12px; }
+.wl-review .btn { margin-left: 6px; padding: 4px 10px; font-size: 11px; }
+.wl-schema-warn { color: var(--danger); font-size: 11px; margin: 2px 0; }
+.wl-grid { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 6px 0; font-size: 12px; }
+.wl-grid label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+.wl-entry { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.wl-entry:last-child { border-bottom: none; }
+.wl-entry-head { display: flex; align-items: center; gap: 8px; }
+.wl-entry-head .btn { padding: 4px 10px; font-size: 11px; margin-left: auto; }
+.wl-entry-head .btn + .btn { margin-left: 0; }

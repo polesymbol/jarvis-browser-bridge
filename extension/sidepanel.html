@@ -174,12 +174,23 @@
   <!-- ================= SITES ================= -->
   <section id="tab-sites" class="tab-panel">
     <div class="card">
-      <h2>Site permissions</h2>
-      <p class="hint">Grant or remove per-site access. One tap to revoke.</p>
+      <h2>Site whitelist</h2>
+      <p class="hint">Sites Muse may act on without asking, per tier and per action. Revoke takes effect immediately — even mid-session. This manager works whether or not the driver is connected.</p>
+      <div class="row between">
+        <label class="pause-label" for="grantsPauseToggle"><strong>Pause all grants</strong> — nothing auto-allows while on</label>
+        <input type="checkbox" id="grantsPauseToggle">
+      </div>
+      <div class="row">
+        <input type="text" id="wlDomainInput" placeholder="example.com" autocomplete="off" spellcheck="false">
+        <button id="wlAddBtn" class="btn btn-primary">Add</button>
+        <button id="wlAddCurrentBtn" class="btn btn-secondary">Add this site</button>
+      </div>
+      <div id="wlWarn" class="wl-warn hidden"></div>
+      <div id="sitesList" class="sites-list"></div>
       <div class="row">
         <button id="blockCurrentBtn" class="btn btn-secondary">Block current site</button>
+        <button id="wlRevokeAllBtn" class="btn btn-danger">Revoke all</button>
       </div>
-      <div id="sitesList" class="sites-list"></div>
     </div>
   </section>
 
