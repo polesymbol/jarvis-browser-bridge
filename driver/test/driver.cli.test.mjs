@@ -108,6 +108,8 @@ function fakeLifecycleExt(port, key, mode) {
       if (m.type !== "act.propose" && m.type !== "observe.request") return;
       if (m.type === "observe.request") {
         state.lastObserve = m;
+        state.observeCount = (state.observeCount || 0) + 1;
+        if (mode === "observeFlap" && state.observeCount === 1) return; // transport died mid-request: no reply ever comes
         send({ type: "observe.result", id: m.id, snapshotVersion: 5,
           snapshot: { title: "Long page", text_chunk: "tail chunk — COURSE COMPLETED",
             text_offset: m.textOffset || 0, text_total_chars: 31234, text_next_offset: null } });
@@ -375,6 +377,16 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
   check("--target is normalized (NBSP + zero-width stripped) before it reaches the proposal",
     !!e.lastProposal && e.lastProposal.target.label === "Buy now",
     "proposal=" + JSON.stringify(e.lastProposal));
+  stopExt(e);
+}
+{
+  const key = "obsflap-key-0123456789abc";
+  const e = await fakeLifecycleExt(L.port, key, "observeFlap");
+  const r = await runDriver(["--relay", lArg, "--key", key, "observe"], { ...FAST, JBB_OBSERVE_MS: "700" });
+  const j = parseStdout(r.out);
+  check("observe survives a transport flap: first request lost, the retry answers",
+    r.code === 0 && !!j && j.type === "observe.result" && e.observeCount === 2,
+    "code=" + r.code + " stdout=" + r.out.slice(0, 200) + " observeCount=" + e.observeCount);
   stopExt(e);
 }
 {

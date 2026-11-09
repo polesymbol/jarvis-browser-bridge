@@ -1153,7 +1153,20 @@ function dismissBannerConsent(proposalId) {
 
 function postToOffscreen(msg) {
   ensureOffscreenDocument(function () {
-    chrome.runtime.sendMessage(msg).catch(function () { /* doc raced away */ });
+    chrome.runtime.sendMessage(msg).catch(function () {
+      // The document may have been recreated between the ensure check and
+      // this post — its message listener registers a beat after creation,
+      // and a send into that gap rejects and used to vanish silently. For
+      // relay sends (observe results, consent acks, act results) that loss
+      // reads as a dead bridge at the driver, so retry ONCE after a beat.
+      // Duplicates are safe: the driver correlates by id and takes the
+      // first matching message.
+      if (msg && msg.kind === "jbb.relay.send") {
+        setTimeout(function () {
+          chrome.runtime.sendMessage(msg).catch(function () { /* doc raced away */ });
+        }, 800);
+      }
+    });
   });
 }
 
@@ -1193,21 +1206,45 @@ function onRelayState(connected) {
   if (!connected) dropHold("the driver disconnected");
 }
 
-// Watchdog (keepalive alarm): if the transport reports down — or goes
-// silent — for more than 30s while a relay is configured, recreate the
-// offscreen document. The new document says hello on load and the
-// connection is re-posted; pendings are unaffected (they persist in
-// storage and in this worker's map, and hydrate after any restart).
+// Watchdog (keepalive alarm): keep the offscreen transport document
+// alive while a relay is configured. The new document says hello on load
+// and the connection is re-posted; pendings are unaffected (they persist
+// in storage and in this worker's map, and hydrate after any restart).
+//
+// Two paths, fastest first:
+//  1. The document itself is GONE. Chrome reaps offscreen documents (an
+//     AUDIO_PLAYBACK document that isn't playing audio has no lifetime
+//     guarantee), and a dead document sends no state reports at all — the
+//     old logic inferred death from 45s of silence + 30s sustained, which
+//     left the bridge dead for 75+ seconds per cycle in the 2026-11-09
+//     live flap (driver probes: peer yes, no, no, no, no, yes over two
+//     minutes). hasDocument is ground truth: recreate immediately.
+//  2. The document lives but reports the transport down (or goes silent)
+//     for >20s: close + recreate, as before but tighter.
+var lastDocRecreateAt = 0;
 function relayWatchdog() {
   if (!state.relayUrl || state.sessionKilled) { state.relayDownSince = null; return; }
   var now = Date.now();
-  var silent = !state.offscreenSeenAt || (now - state.offscreenSeenAt > 45000);
+  if (chrome.offscreen && chrome.offscreen.hasDocument) {
+    chrome.offscreen.hasDocument(function (has) {
+      if (has || !state.relayUrl || state.sessionKilled) return;
+      if (Date.now() - lastDocRecreateAt < 20000) return; // don't thrash
+      lastDocRecreateAt = Date.now();
+      offscreenReady = false;
+      state.offscreenSeenAt = Date.now();
+      state.relayDownSince = null;
+      audit({ site: "-", action: "relay transport", tier: "T0", result: "restarted",
+              detail: "offscreen document gone — recreating it immediately" });
+      ensureOffscreenDocument(function () {});
+    });
+  }
+  var silent = !state.offscreenSeenAt || (now - state.offscreenSeenAt > 30000);
   if (state.connected && !silent) { state.relayDownSince = null; return; }
   if (state.relayDownSince == null) { state.relayDownSince = now; return; }
-  if (now - state.relayDownSince > 30000) {
+  if (now - state.relayDownSince > 20000) {
     state.relayDownSince = now; // don't thrash while it restarts
     audit({ site: "-", action: "relay transport", tier: "T0", result: "restarted",
-            detail: "offscreen relay transport down >30s — recreating the offscreen document" });
+            detail: "offscreen relay transport down >20s — recreating the offscreen document" });
     recreateOffscreenDocument();
   }
 }

@@ -8,8 +8,16 @@
  *    consumes forwarded protocol strings.
  *  - Transport messages are accepted only from the offscreen document —
  *    a forged jbb.relay.* message from anywhere else is an injection path.
- *  - The keepalive watchdog recreates the offscreen document when the
- *    transport is down/silent for >30s.
+ *  - The keepalive watchdog recreates the offscreen document
+ *    IMMEDIATELY when the document itself is gone (hasDocument is ground
+ *    truth — Chrome reaps idle offscreen documents and a dead document
+ *    reports nothing), and after >20s down/silent otherwise. The v0.2.31
+ *    thresholds (45s silence + 30s sustained) left the bridge dead for
+ *    75+ seconds per cycle in the 2026-11-09 live flap.
+ *  - The offscreen keeps the socket warm with an application-level
+ *    heartbeat data frame (intermediaries don't always count protocol
+ *    pings as activity), and the worker retries a relay send once when
+ *    the document races away mid-post.
  *  - The offscreen document is TRANSPORT ONLY: it pairs, forwards, queues,
  *    reconnects with backoff — and can never approve, deny, or apply an
  *    action. No consent vocabulary may exist in its code.
@@ -52,10 +60,16 @@ check("worker: transport kinds require the offscreen sender",
 // ---------------------------------------------------------- watchdog
 check("watchdog: exists and is hooked into the keepalive alarm",
   bg.includes("function relayWatchdog()") && bg.includes("relayWatchdog();"));
-check("watchdog: recreates the document after >30s down",
-  bg.includes("now - state.relayDownSince > 30000") && bg.includes("closeDocument"));
+check("watchdog: recreates the document after >20s down",
+  bg.includes("now - state.relayDownSince > 20000") && bg.includes("closeDocument"));
 check("watchdog: offscreen silence counts as down",
-  bg.includes("now - state.offscreenSeenAt > 45000"));
+  bg.includes("now - state.offscreenSeenAt > 30000"));
+check("watchdog: a GONE document is recreated immediately (hasDocument fast path)",
+  bg.includes("chrome.offscreen.hasDocument") &&
+  bg.includes("offscreen document gone — recreating it immediately") &&
+  bg.includes("lastDocRecreateAt"));
+check("worker: a relay send that races a document recreate is retried once",
+  bg.includes('msg.kind === "jbb.relay.send"') && bg.includes("}, 800);"));
 
 // ---------------------------------------------------------- offscreen owns the socket
 check("offscreen: constructs the WebSocket", off.includes("new WebSocket(rUrl)"));
@@ -69,6 +83,8 @@ check("offscreen: reconnects with capped exponential backoff",
   off.includes("Math.min(rBackoff * 2, 30000)") && off.includes("scheduleReconnect()"));
 check("offscreen: queues sends until pair.confirm, then flushes",
   off.includes("sendQ.push(data)") && off.includes('"pair.confirm"'));
+check("offscreen: application-level heartbeat keeps the socket warm",
+  off.includes('"transport.ping"') && off.includes("}, 20000);"));
 
 // ---------------------------------------------------------- transport only, never a judge
 check("offscreen: no consent machinery (never approves/denies/applies)",

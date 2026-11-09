@@ -178,6 +178,19 @@
 
   setInterval(reportState, 15000);
 
+  // Application-level heartbeat: a real data frame on the socket every
+  // 20s while paired. The relay's protocol-level pings don't always count
+  // as activity for intermediaries (proxies / platform routers), which can
+  // idle-kill a socket that only ever receives — the 2026-11-09 live flap
+  // (peer present, gone ~80s, present again). The driver ignores message
+  // types it doesn't know; the relay just forwards this like any other
+  // protocol frame.
+  setInterval(function () {
+    if (!rWanted || !rws || rws.readyState !== 1 || !rPaired) return;
+    try { rws.send(JSON.stringify({ v: 1, type: "transport.ping" })); }
+    catch (e) { /* the close handler drives the reconnect */ }
+  }, 20000);
+
   // ------------------------------------------------------------ tab audio capture
   var cap = null; // { recorder, stream, captureId, seq, mime }
   function b64encode(buf) {

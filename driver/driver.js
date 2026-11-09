@@ -777,7 +777,22 @@ async function main() {
         }
         req.textOffset = off;
       }
-      const res = await sendResilient(ws, req, ['observe.result'], 30000);
+      const observeMs = Number(process.env.JBB_OBSERVE_MS) || 30000;
+      let res;
+      try {
+        res = await sendResilient(ws, req, ['observe.result'], observeMs);
+      } catch (e) {
+        if (!e || e.code !== 'PEER_TIMEOUT') throw e;
+        // The extension's transport can flap mid-request (its offscreen
+        // document is mortal; the request or the reply dies with it) and
+        // the relay never says peer.unavailable for a request it already
+        // forwarded, so the resend trigger in sendResilient never fires.
+        // Observe is read-only — ONE retry across the heal is always safe.
+        console.error('[observe] no reply — retrying once in case the extension transport flapped');
+        await new Promise((r) => setTimeout(r, 3000));
+        req.id = `obs-${Date.now()}`;
+        res = await sendResilient(ws, req, ['observe.result'], observeMs);
+      }
       console.log(JSON.stringify(res, null, 2));
     } else if (CMD === 'act') {
       // Proposal shape matches the extension's handleProposal():
