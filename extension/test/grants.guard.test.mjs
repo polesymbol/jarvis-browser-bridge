@@ -12,11 +12,13 @@ const src = fs.readFileSync(new URL("../background.js", import.meta.url), "utf8"
 const checks = [];
 function check(name, ok) { checks.push([name, !!ok]); }
 
-// 1. Inside decideAction, the T3 rule precedes the trusted-site allow.
+// 1. Inside decideAction, the T3 rule precedes the whitelist allow
+// (the pre-v0.2.21 blanket sites-allow is gone; the whitelist is the only
+// persistent auto-allow, and it is consulted strictly after T3 asks).
 const decide = src.slice(src.indexOf("function decideAction"), src.indexOf("function hostOf") > 0 ? src.length : src.length);
 const t3Pos = decide.indexOf('proposal.actionTier === "T3"');
-const siteAllowPos = decide.indexOf('state.sites[host] === "allow"');
-check("decideAction: T3 asks before site-allow applies", t3Pos !== -1 && siteAllowPos !== -1 && t3Pos < siteAllowPos);
+const wlPos = decide.indexOf("whitelistCovers(proposal, host)");
+check("decideAction: T3 asks before the whitelist applies", t3Pos !== -1 && wlPos !== -1 && t3Pos < wlPos);
 
 // 2. Session fast path excludes T3.
 check("handleProposal: session grant excludes T3",

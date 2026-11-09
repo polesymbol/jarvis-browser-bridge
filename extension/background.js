@@ -27,7 +27,8 @@ importScripts("protocol.js");
 var K = {
   KEY: "jbb.connectorKey",     // connector secret (API-key model)
   SETTINGS: "jbb.settings",    // { mode, relayUrl }
-  SITES: "jbb.sites",          // { hostname: "allow" | "deny" }
+  SITES: "jbb.sites",          // { hostname: "allow" | "deny" } — deny blocks live here; allows migrated to WHITELIST
+  WHITELIST: "jbb.whitelist",  // { domain: { domain, tiers, actions, grantedAt, lastUsedAt, keyId, schemaVersion } } — persistent per-site allow
   AUDIT: "jbb.audit",          // [ entries ], capped
   PENDING: "jbb.pending",      // { proposalId: { proposal, createdAt } } — survives worker restarts
   RESULTS: "jbb.results",      // { proposalId: { ok, detail, at } } — executed acts, for id dedupe
@@ -54,6 +55,7 @@ var state = {
   relayUrl: "",
   mode: "ask-some",            // readonly | ask-some | always-ask
   sites: {},
+  whitelist: {},               // domain -> entry (see grantWhitelist); exact-domain, tier-scoped, epoch-bound
   sessionKilled: false,
   pending: new Map(),          // proposalId -> { proposal, resolve, timer, createdAt, shown, shownVia, escalated, lastWaitingAt, elapsed }
   executing: new Set(),        // proposalIds currently executing (dedupe)
@@ -136,12 +138,33 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
 });
 
 function loadPersisted() {
-  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION], function (res) {
+  chrome.storage.local.get([K.SETTINGS, K.SITES, K.SESSION, K.WHITELIST, K.EPOCH], function (res) {
     var s = res[K.SETTINGS] || {};
     state.mode = s.mode || "ask-some";
     state.soundOn = (typeof s.soundOn === "boolean") ? s.soundOn : true;
     state.relayUrl = s.relayUrl || "";
     state.sites = res[K.SITES] || {};
+    state.whitelist = res[K.WHITELIST] || {};
+    if (typeof res[K.EPOCH] === "number" && res[K.EPOCH] > 0) state.keyEpoch = res[K.EPOCH];
+    // Migrate legacy blanket site-allows (pre-whitelist builds stored
+    // sites[host] = "allow", covering every non-T3 tier forever) into
+    // whitelist entries, so they gain tier/action scoping, schema
+    // versioning, and key binding. The user's grant is preserved; its
+    // shape is upgraded. Runs once — migrated hosts leave the sites map.
+    var migrated = false;
+    Object.keys(state.sites).forEach(function (host) {
+      if (state.sites[host] !== "allow") return;
+      if (!state.whitelist[host]) {
+        state.whitelist[host] = {
+          domain: host, tiers: ["T1", "T2"], actions: WHITELIST_ACTIONS_V1.slice(),
+          grantedAt: Date.now(), lastUsedAt: Date.now(),
+          keyId: state.keyEpoch, schemaVersion: WHITELIST_SCHEMA, migrated: true
+        };
+      }
+      delete state.sites[host];
+      migrated = true;
+    });
+    if (migrated) { saveWhitelist(); saveSettings(); }
     state.sessionKilled = !!s.killed;
     var sess = res[K.SESSION];
     state.session = (sess && sess.expiresAt > Date.now()) ? sess : null;
@@ -157,6 +180,71 @@ function saveSettings() {
                     soundOn: state.soundOn },
     [K.SITES]: state.sites
   });
+}
+
+// ---------------------------------------------------------------- site whitelist
+//
+// Persistent per-site allow — the careful version of "Always allow on
+// this site". An entry covers an action only when ALL of these hold:
+//   - the site host EXACTLY equals entry.domain (no silent wildcarding;
+//     subdomains are separate entries — a "*.domain" entry can only ever
+//     be added explicitly, and this build never creates one);
+//   - the action's tier is in entry.tiers AND its type is in
+//     entry.actions (the concrete list granted at schema time, so action
+//     types added in future versions are NOT silently covered);
+//   - entry.schemaVersion is current (older entries are ignored -> ask);
+//   - entry.keyId is the current key epoch (rotation invalidates every
+//     entry — and also deletes them outright, see rotateConnectorKey).
+// T3 is carved out in code, twice: grantWhitelist refuses to write a T3
+// tier, and whitelistCovers refuses T3 proposals — and decideAction asks
+// T3 before the whitelist is even consulted. There is NO auto-allow path
+// for T3 in any mode.
+// keyId stores the key EPOCH, never key material: the epoch is the key's
+// identity for binding purposes, and the key itself is never persisted
+// outside its own storage slot.
+var WHITELIST_SCHEMA = 1;
+var WHITELIST_ACTIONS_V1 = ["click", "type", "scroll", "navigate", "clickAt", "clickSelector", "key"];
+
+function saveWhitelist() {
+  chrome.storage.local.set({ [K.WHITELIST]: state.whitelist });
+}
+
+function whitelistEntryFor(host) {
+  var e = state.whitelist[host];
+  if (!e) return null;
+  if (e.schemaVersion !== WHITELIST_SCHEMA) return null;
+  if (e.keyId !== state.keyEpoch) return null;
+  return e;
+}
+
+function whitelistCovers(proposal, host) {
+  if (!host || proposal.actionTier === "T3") return null; // hard carve-out
+  var e = whitelistEntryFor(host);
+  if (!e) return null;
+  if (e.tiers.indexOf(proposal.actionTier) === -1) return null;
+  if (e.actions.indexOf(proposal.type) === -1) return null;
+  return e;
+}
+
+function grantWhitelist(host, tier) {
+  if (!host || tier === "T3") return null; // T3 can never be written
+  var now = Date.now();
+  var existing = state.whitelist[host];
+  var tiers = existing ? existing.tiers.slice() : [];
+  if (tiers.indexOf(tier) === -1) tiers.push(tier);
+  var entry = {
+    domain: host,
+    tiers: tiers,
+    actions: WHITELIST_ACTIONS_V1.slice(),
+    grantedAt: existing ? existing.grantedAt : now,
+    lastUsedAt: now,
+    keyId: state.keyEpoch,
+    schemaVersion: WHITELIST_SCHEMA
+  };
+  state.whitelist[host] = entry;
+  saveWhitelist();
+  pushToPanel({ kind: "jbb.ui.sitesChanged" });
+  return entry;
 }
 
 // ---------------------------------------------------------------- Chrome sign-in guard
@@ -272,6 +360,12 @@ function rotateConnectorKey(done) {
     Object.keys(state.sites).forEach(function (h) {
       if (state.sites[h] === "allow") { delete state.sites[h]; grantsCleared++; }
     });
+    // Whitelist entries are bound to this key (keyId = epoch) — rotation
+    // wipes them outright, not just by epoch mismatch (belt and braces:
+    // the panel must honestly show 0 active grants afterwards).
+    grantsCleared += Object.keys(state.whitelist).length;
+    state.whitelist = {};
+    chrome.storage.local.remove([K.WHITELIST]);
     saveSettings();
     state.keyEpoch = newEpoch;
 
@@ -1049,10 +1143,12 @@ function decideAction(proposal) {
   if (state.mode === "always-ask") {
     return { decision: "ask" };
   }
-  // 7. "Ask for some actions": trusted sites act freely, unknown sites ask.
-  if (host && state.sites[host] === "allow") {
-    return { decision: "allow" };
-  }
+  // 7. "Ask for some actions": a whitelist entry for this EXACT domain
+  // covering this tier + action type acts freely. T3 already asked at
+  // step 5 and whitelistCovers refuses T3 again — there is no auto-allow
+  // path for T3 in any mode. Unknown sites ask.
+  var wl = whitelistCovers(proposal, host);
+  if (wl) return { decision: "allow", via: "whitelist", domain: wl.domain, reason: "allowed by whitelist: " + wl.domain };
   return { decision: "ask", reason: "site not yet approved" };
 }
 
@@ -1239,12 +1335,18 @@ function handleProposal(proposal, source) {
     return;
   }
   if (verdict.decision === "allow" || viaSession) {
-    // Auto-allowed (e.g. trusted site): the driver still needs the verdict —
-    // otherwise it waits for a consent message that never comes.
-    var autoScope = viaSession ? "session" : (function () {
-      var h = hostOf(proposal.site || "");
-      return (h && state.sites[h] === "allow") ? "site" : "once";
-    })();
+    // Auto-allowed (whitelist or session grant): the driver still needs
+    // the verdict — otherwise it waits for a consent message that never
+    // comes. Whitelist hits stamp lastUsedAt so stale entries are visible.
+    if (verdict.via === "whitelist") {
+      proposal._whitelistDomain = verdict.domain;
+      var wle = state.whitelist[verdict.domain];
+      if (wle && Date.now() - (wle.lastUsedAt || 0) > 60e3) {
+        wle.lastUsedAt = Date.now();
+        saveWhitelist();
+      }
+    }
+    var autoScope = viaSession ? "session" : (verdict.via === "whitelist" ? "site" : "once");
     sendToRelay(JBB.Message.consentGrant(proposal.proposalId, autoScope));
     executeProposal(proposal);
     return;
@@ -1265,7 +1367,7 @@ function resolveConsent(proposal, answer) {
   // SECURITY (enemy audit round 2): fail closed on unknown choice values.
   // Anything that isn't an explicit approval becomes a denial — never execute
   // on garbage input.
-  var VALID_CHOICES = { "once": 1, "site": 1, "session1h": 1, "session24h": 1, "session1w": 1, "sessionCustom": 1, "deny": 1 };
+  var VALID_CHOICES = { "once": 1, "site": 1, "whitelist": 1, "session1h": 1, "session24h": 1, "session1w": 1, "sessionCustom": 1, "deny": 1 };
   if (!answer || !VALID_CHOICES[answer.choice]) {
     answer = { choice: "deny", reason: "invalid consent choice" };
   }
@@ -1283,16 +1385,18 @@ function resolveConsent(proposal, answer) {
     return;
   }
 
-  // "once" or "site"
-  if (answer.choice === "site") {
+  // "once", or a permanent per-site grant: "whitelist" (the card's
+  // "Always allow on this site") and its legacy alias "site" both write a
+  // whitelist entry for the EXACT tier being asked about — never a
+  // blanket allow. grantWhitelist refuses T3 in code, so a critical
+  // action answered this way executes once and persists nothing.
+  if (answer.choice === "whitelist" || answer.choice === "site") {
     var host = hostOf(proposal.site || "");
-    if (host) {
-      state.sites[host] = "allow";
-      saveSettings();
+    var entry = grantWhitelist(host, proposal.actionTier);
+    if (entry) {
       // Request host permission on demand — the trust story in action.
       chrome.permissions.request({ origins: ["https://" + host + "/*", "http://" + host + "/*"] })
         .catch(function () {});
-      pushToPanel({ kind: "jbb.ui.sitesChanged" });
     }
   }
 
@@ -1366,7 +1470,7 @@ function executeProposal(proposal) {
         action: proposal.description || proposal.type,
         tier: proposal.actionTier,
         result: "executed",
-        detail: detail
+        detail: detail + (proposal._whitelistDomain ? " [allowed by whitelist: " + proposal._whitelistDomain + "]" : "")
       });
     },
     function (err) {
@@ -1648,6 +1752,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
           mode: state.mode,
           soundOn: state.soundOn,
           sites: state.sites,
+          whitelist: state.whitelist,
           killed: state.sessionKilled,
           pending: Array.from(state.pending.values()).map(function (p) { return p.proposal; }),
           session: sess ? { site: sess.site, label: sess.label,
@@ -1762,6 +1867,7 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
     case "jbb.ui.revokeSite":
       if (msg.host) {
         delete state.sites[msg.host];
+        if (state.whitelist[msg.host]) { delete state.whitelist[msg.host]; saveWhitelist(); }
         saveSettings();
         chrome.permissions.remove({ origins: ["https://" + msg.host + "/*", "http://" + msg.host + "/*"] })
           .catch(function () {});

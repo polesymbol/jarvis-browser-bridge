@@ -138,7 +138,9 @@ function renderConsentCard(proposal) {
     '<div class="consent-tier-desc">' + esc(tier.desc) + "</div>" +
     '<div class="consent-actions">' +
       '<button class="btn btn-primary" data-choice="once">Allow once</button>' +
-      '<button class="btn btn-secondary" data-choice="site">Always on this site (permanent)</button>' +
+      (proposal.actionTier === "T1"
+        ? '<button class="btn btn-secondary" data-choice="whitelist">Always allow on this site</button>'
+        : '') +
       '<button class="btn btn-secondary" data-choice="session1h">For 1 hour</button>' +
       '<button class="btn btn-secondary" data-choice="session24h">For 1 day</button>' +
       '<button class="btn btn-secondary" data-choice="session1w">For 1 week</button>' +
@@ -149,7 +151,7 @@ function renderConsentCard(proposal) {
       '<input type="datetime-local" class="consent-until" id="until-' + proposal.proposalId + '">' +
       '<button class="btn btn-secondary" data-choice="sessionCustom">Allow until then</button>' +
     "</div>" +
-    '<div class="consent-grant-note">Timed and permanent grants cover routine (T1–T2) actions on this site only. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
+    '<div class="consent-grant-note">Timed grants cover routine (T1–T2) actions on this site until they lapse. “Always allow on this site” writes a whitelist entry for T1 actions on this exact domain only — subdomains are separate entries. Critical T3 actions — sign-in, payments, sending, publishing, deleting — will still ask every time, even inside a grant.</div>';
 
   card.querySelectorAll("button").forEach(function (btn) {
     btn.addEventListener("click", function () {
@@ -207,14 +209,33 @@ function renderSession(session) {
 }
 
 // ---------------------------------------------------------------- sites
-function renderSites(sites) {
+function renderSites(sites, whitelist) {
   var list = el("sitesList");
   list.innerHTML = "";
   var hosts = Object.keys(sites || {});
-  if (!hosts.length) {
-    list.innerHTML = '<div class="empty">No site grants yet. Approve an action with “Always on this site” to add one.</div>';
+  var wlHosts = Object.keys(whitelist || {});
+  if (!hosts.length && !wlHosts.length) {
+    list.innerHTML = '<div class="empty">No site grants yet. Approve a T1 action with “Always allow on this site” to add one.</div>';
     return;
   }
+  // Whitelist entries first: domain + the tiers they cover.
+  wlHosts.sort().forEach(function (host) {
+    var entry = whitelist[host];
+    var row = document.createElement("div");
+    row.className = "site-row";
+    row.innerHTML = '<span class="site-host">' + esc(host) + "</span>" +
+      '<span class="mini-tag tag-ok">whitelisted · ' + esc((entry.tiers || []).join("+")) + "</span>";
+    var btn = document.createElement("button");
+    btn.className = "btn btn-danger";
+    btn.textContent = "Revoke";
+    btn.addEventListener("click", function () {
+      api({ kind: "jbb.ui.revokeSite", host: host }).then(function () {
+        toast("Revoked: " + host);
+      });
+    });
+    row.appendChild(btn);
+    list.appendChild(row);
+  });
   hosts.sort().forEach(function (host) {
     var row = document.createElement("div");
     row.className = "site-row";
@@ -271,12 +292,12 @@ function refresh() {
     if (!s || !s.ok) return;
     renderStatus(s);
     renderModes(s.mode);
-    renderSites(s.sites);
+    renderSites(s.sites, s.whitelist);
     renderSession(s.session);
-    // Grants line: session grant + per-site allows are the active grants.
+    // Grants line: session grant + whitelist entries are the active grants.
     var grantCount = (s.session ? 1 : 0) + Object.keys(s.sites || {}).filter(function (h) {
       return s.sites[h] === "allow";
-    }).length;
+    }).length + Object.keys(s.whitelist || {}).length;
     el("grantsLine").textContent = grantCount === 0
       ? "0 active grants — re-grant to continue"
       : grantCount + " active grant" + (grantCount === 1 ? "" : "s");
