@@ -2,7 +2,9 @@
  * Jarvis Browser Bridge — background service worker
  *
  * Responsibilities:
- *   1. Hold the WebSocket session to the relay (wss).
+ *   1. Own the relay session's LOGIC (the WebSocket itself lives in the
+ *      offscreen document — Chrome suspends this worker and used to take
+ *      the socket with it; transport there, enforcement here).
  *   2. Enforce permission checks LOCALLY before executing any action.
  *   3. Route consent requests to the side panel and await the user's decision.
  *   4. Execute approved actions via the content script; capture screenshots.
@@ -45,9 +47,9 @@ var NOTIF_VERIFY_DELAY_MS = 4000;
 
 // ---------------------------------------------------------------- state
 var state = {
-  ws: null,
-  connecting: false,          // a dial is in flight (see connectRelay guard)
-  connected: false,
+  connected: false,           // relay paired (reported by the offscreen transport)
+  relayDownSince: null,       // when transport was first seen down (watchdog)
+  offscreenSeenAt: 0,         // last sign of life from the offscreen document
   relayUrl: "",
   mode: "ask-some",            // readonly | ask-some | always-ask
   sites: {},
@@ -115,6 +117,7 @@ chrome.alarms.onAlarm.addListener(function (alarm) {
   hydratePendings();
   verifyAllPendingNotifications();
   consentHeartbeatSweep();
+  relayWatchdog();
   // Hard expiry for session grants — no silent extension, ever.
   if (state.session && Date.now() >= state.session.expiresAt) expireSession("expired");
   // Re-check sign-in state: a later sign-in can't slip through unnoticed.
@@ -276,21 +279,24 @@ function rotateConnectorKey(done) {
     patch[K.EPOCH] = newEpoch;
     patch[K.KEY_ACKED] = false;
     chrome.storage.local.set(patch, function () {
-      if (oldKey && state.ws && state.ws.readyState === WebSocket.OPEN) {
-        try {
-          state.ws.send(JSON.stringify({ v: JBB.PROTOCOL_VERSION, type: "key.revoked", key: oldKey }));
-        } catch (e) { /* socket already dying — close below still disconnects */ }
+      if (oldKey) {
+        try { sendToRelay({ v: JBB.PROTOCOL_VERSION, type: "key.revoked", key: oldKey }); }
+        catch (e) { /* transport raced — the disconnect below still ends the session */ }
       }
-      if (state.ws) { try { state.ws.close(); } catch (e) {} state.ws = null; }
-      state.connected = false;
-      audit({ site: "-", action: "connector key", tier: "T0", result: "rotated",
-              detail: "key rotated (epoch " + newEpoch + "); " + grantsCleared +
-                      " grant(s) invalidated; driver session disconnected" });
-      pushToPanel({ kind: "jbb.ui.status", connected: false });
-      pushToPanel({ kind: "jbb.ui.sessionChanged" });
-      refreshBadge();
-      if (state.relayUrl && !state.sessionKilled) connectRelay(state.relayUrl);
-      if (done) done(newKey);
+      // Give the revocation a beat to reach the relay before the transport
+      // drops the socket — the relay must poison the old room, not just
+      // lose it.
+      setTimeout(function () {
+        disconnectRelay("key rotated");
+        audit({ site: "-", action: "connector key", tier: "T0", result: "rotated",
+                detail: "key rotated (epoch " + newEpoch + "); " + grantsCleared +
+                        " grant(s) invalidated; driver session disconnected" });
+        pushToPanel({ kind: "jbb.ui.status", connected: false });
+        pushToPanel({ kind: "jbb.ui.sessionChanged" });
+        refreshBadge();
+        if (state.relayUrl && !state.sessionKilled) connectRelay(state.relayUrl);
+        if (done) done(newKey);
+      }, 350);
     });
   });
 }
@@ -523,7 +529,7 @@ function ensureOffscreenDocument(cb) {
   var create = function () {
     chrome.offscreen.createDocument(
       { url: "offscreen.html", reasons: ["AUDIO_PLAYBACK"],
-        justification: "Play an audible tone when an approval prompt needs attention." },
+        justification: "Play an audible tone when an approval prompt needs attention, and hold the relay WebSocket so it survives service-worker suspension." },
       function () {
         // "Only one offscreen document" just means it's already there.
         if (chrome.runtime.lastError &&
@@ -555,10 +561,14 @@ function ensureOffscreenDocument(cb) {
 // Called when the offscreen page signals its script is running.
 function onOffscreenReady() {
   offscreenReady = true;
+  state.offscreenSeenAt = Date.now();
   if (offscreenWantTone) {
     offscreenWantTone = false;
     sendPlayTone();
   }
+  // A (re)created document also means the relay transport may need its
+  // connection re-posted (it says hello separately too — either path heals).
+  if (state.relayUrl && !state.sessionKilled) postRelayConnect();
 }
 
 function sendPlayTone() {
@@ -904,17 +914,79 @@ function dismissBannerConsent(proposalId) {
   } catch (e) { /* tab gone */ }
 }
 
-// Make sure the relay socket is up (and paired) before sending anything that
-// must reach the driver — e.g. a consent grant after a worker restart.
+// ------------------------------------------------------------ relay transport
+// The relay WebSocket is owned by the offscreen document (see offscreen.js):
+// Chrome suspends this worker and used to take the socket with it. The
+// worker talks transport over runtime messages; enforcement never leaves
+// this file — the offscreen document cannot approve, deny, or act.
+
+function postToOffscreen(msg) {
+  ensureOffscreenDocument(function () {
+    chrome.runtime.sendMessage(msg).catch(function () { /* doc raced away */ });
+  });
+}
+
+// (Re)post the desired connection: reads the CURRENT key from storage, so a
+// rotation or a fresh document always pairs with the live key.
+function postRelayConnect() {
+  if (!state.relayUrl || state.sessionKilled || state.signInBlocked) return;
+  chrome.storage.local.get([K.KEY], function (res) {
+    var key = res[K.KEY];
+    if (!key) {
+      pushToPanel({ kind: "jbb.ui.status", connected: false, error: "no connector key — generate one first" });
+      return;
+    }
+    postToOffscreen({ kind: "jbb.relay.connect", url: state.relayUrl, key: key });
+  });
+}
+
+function onRelayState(connected) {
+  var was = state.connected;
+  state.connected = connected;
+  if (connected) state.relayDownSince = null;
+  else if (state.relayUrl && state.relayDownSince == null) state.relayDownSince = Date.now();
+  if (was !== connected) pushToPanel({ kind: "jbb.ui.status", connected: connected });
+}
+
+// Watchdog (keepalive alarm): if the transport reports down — or goes
+// silent — for more than 30s while a relay is configured, recreate the
+// offscreen document. The new document says hello on load and the
+// connection is re-posted; pendings are unaffected (they persist in
+// storage and in this worker's map, and hydrate after any restart).
+function relayWatchdog() {
+  if (!state.relayUrl || state.sessionKilled) { state.relayDownSince = null; return; }
+  var now = Date.now();
+  var silent = !state.offscreenSeenAt || (now - state.offscreenSeenAt > 45000);
+  if (state.connected && !silent) { state.relayDownSince = null; return; }
+  if (state.relayDownSince == null) { state.relayDownSince = now; return; }
+  if (now - state.relayDownSince > 30000) {
+    state.relayDownSince = now; // don't thrash while it restarts
+    audit({ site: "-", action: "relay transport", tier: "T0", result: "restarted",
+            detail: "offscreen relay transport down >30s — recreating the offscreen document" });
+    recreateOffscreenDocument();
+  }
+}
+
+function recreateOffscreenDocument() {
+  offscreenReady = false;
+  var done = function () { ensureOffscreenDocument(function () {}); };
+  if (chrome.offscreen && chrome.offscreen.closeDocument) {
+    try { chrome.offscreen.closeDocument().then(done, done); return; }
+    catch (e) { /* fall through */ }
+  }
+  done();
+}
+
+// Make sure the relay is up (and paired) before sending anything that must
+// reach the driver — e.g. a consent grant after a worker restart.
 function ensureRelayConnected(cb) {
-  if (state.connected && state.ws && state.ws.readyState === WebSocket.OPEN) { cb(); return; }
+  if (state.connected) { cb(); return; }
   if (!state.relayUrl || state.sessionKilled) { cb(); return; }
   connectRelay(state.relayUrl);
   var waited = 0;
   var iv = setInterval(function () {
     waited += 250;
-    var up = state.connected && state.ws && state.ws.readyState === WebSocket.OPEN;
-    if (up || waited >= 8000) {
+    if (state.connected || waited >= 8000) {
       clearInterval(iv);
       cb();
     }
@@ -983,19 +1055,16 @@ function decideAction(proposal) {
   return { decision: "ask", reason: "site not yet approved" };
 }
 
-// ---------------------------------------------------------------- relay (WebSocket)
+// ---------------------------------------------------------------- relay (transport client)
 //
-// Connection lifecycle is generation-guarded: every (dis)connect bumps
-// connGen, and a socket's handlers ignore events once a newer generation
-// exists. This kills a whole class of races — duplicate dials, stale
-// onclose handlers clobbering the live socket, and reconnect loops where
-// each new connection kills the previous one at the relay.
-var connGen = 0;
+// The socket itself lives in the offscreen document (see the transport
+// helpers above and offscreen.js). This worker only expresses intent —
+// connect with the configured URL, disconnect, send — and consumes the
+// forwarded protocol messages in handleRelayMessage. Generation guards
+// and stale-socket races are gone by construction: there is exactly one
+// socket and it is not ours.
 
 function connectRelay(url) {
-  // Never stack duplicate connections: if a socket exists or one is dialing,
-  // there is nothing to do.
-  if (state.ws || state.connecting) return;
   // HARD BLOCK: signed into Chrome with an unacknowledged account. Sync may
   // be importing passwords and payment data — no relay until the user
   // explicitly acknowledges the account. No warn-and-allow.
@@ -1007,75 +1076,29 @@ function connectRelay(url) {
             result: "denied", detail: "blocked: unacknowledged Chrome sign-in" });
     return;
   }
-  state.connecting = true;
   state.relayUrl = url;
   saveSettings();
-
-  chrome.storage.local.get([K.KEY], function (res) {
-    var key = res[K.KEY];
-    state.connecting = false;
-    if (!key) {
-      pushToPanel({ kind: "jbb.ui.status", connected: false, error: "no connector key — generate one first" });
-      return;
-    }
-    if (state.ws) return; // someone beat us while we were reading the key
-    var gen = ++connGen;
-    var ws;
-    try {
-      ws = new WebSocket(url);
-    } catch (e) {
-      pushToPanel({ kind: "jbb.ui.status", connected: false, error: "bad relay URL" });
-      return;
-    }
-    state.ws = ws;
-    state.connected = false;
-
-    ws.onopen = function () {
-      if (gen !== connGen) { try { ws.close(); } catch (e) {} return; } // stale
-      // Authenticate with the full connector key + role, per protocol v1.
-      // Encrypted by TLS on wss://; loopback-only on ws://127.0.0.1.
-      ws.send(JSON.stringify(JBB.Message.pairRequest("extension", key)));
-    };
-    ws.onmessage = function (ev) {
-      if (gen !== connGen) return; // stale
-      handleRelayMessage(ev.data);
-    };
-    ws.onclose = function () {
-      if (gen !== connGen) return; // stale socket: ignore completely
-      state.connected = false;
-      state.ws = null;
-      pushToPanel({ kind: "jbb.ui.status", connected: false });
-      // Backoff reconnect while a relay URL is configured
-      // and the session wasn't killed.
-      if (state.relayUrl && !state.sessionKilled) {
-        setTimeout(function () {
-          if (state.ws === null && !state.connecting && state.relayUrl && !state.sessionKilled) {
-            connectRelay(state.relayUrl);
-          }
-        }, 5000);
-      }
-    };
-    ws.onerror = function () {
-      if (gen !== connGen) return; // stale
-      pushToPanel({ kind: "jbb.ui.status", connected: false, error: "relay connection failed" });
-    };
-  });
+  postRelayConnect();
 }
 
 function disconnectRelay(reason) {
-  connGen++; // invalidate every existing socket's handlers
-  state.connecting = false;
-  if (state.ws) {
-    try { state.ws.close(); } catch (e) {}
-    state.ws = null;
-  }
   state.connected = false;
+  state.relayDownSince = null;
+  // Don't create an offscreen document just to tell it to disconnect.
+  if (chrome.offscreen && chrome.offscreen.hasDocument) {
+    try {
+      chrome.offscreen.hasDocument(function (has) {
+        if (has) {
+          chrome.runtime.sendMessage({ kind: "jbb.relay.disconnect" })
+            .catch(function () {});
+        }
+      });
+    } catch (e) { /* transport already gone */ }
+  }
 }
 
 function sendToRelay(msg) {
-  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-    state.ws.send(JSON.stringify(msg));
-  }
+  postToOffscreen({ kind: "jbb.relay.send", data: JSON.stringify(msg) });
 }
 
 function handleRelayMessage(raw) {
@@ -1086,8 +1109,18 @@ function handleRelayMessage(raw) {
   switch (msg.type) {
     case "pair.confirm":
       state.connected = true;
+      state.relayDownSince = null;
       pushToPanel({ kind: "jbb.ui.status", connected: true });
       audit({ site: "-", action: "session paired", tier: "T0", result: "allowed", detail: "protocol " + msg.v });
+      break;
+    case "pair.error":
+      // The relay refused pairing (e.g. this key was rotated away). Surface
+      // it — a silent lonely state would look like an outage.
+      state.connected = false;
+      pushToPanel({ kind: "jbb.ui.status", connected: false,
+        error: "relay refused pairing: " + (msg.message || msg.error || "unknown") });
+      audit({ site: "-", action: "session paired", tier: "T0", result: "denied",
+              detail: "pair refused (" + (msg.error || "?") + ")" });
       break;
     case "act.propose":
       if (msg.proposal) {
@@ -1123,7 +1156,7 @@ function handleRelayMessage(raw) {
       audit({ site: "-", action: "session abort", tier: "T0",
               result: "ended", detail: abortReason + " (remote; local kill switch untouched)" });
       pushToPanel({ kind: "jbb.ui.status", connected: false, error: abortReason });
-      if (state.ws) { try { state.ws.close(); } catch (e) {} }
+      disconnectRelay("peer abort");
       break;
     }
     // observe.request is answered on demand; unknown types are ignored.
@@ -1538,7 +1571,21 @@ function mockPropose() {
 chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
   if (!msg || typeof msg.kind !== "string" ||
       (msg.kind.indexOf("jbb.ui.") !== 0 && msg.kind !== "jbb.banner.decision" &&
-       msg.kind.indexOf("jbb.offscreen.") !== 0)) {
+       msg.kind.indexOf("jbb.offscreen.") !== 0 && msg.kind.indexOf("jbb.relay.") !== 0)) {
+    return false;
+  }
+  // Relay transport signals — accepted ONLY from the offscreen document.
+  // Anything else claiming to be transport (a page, the panel, a content
+  // script) is ignored: forged relay messages would be an injection path
+  // straight into handleRelayMessage.
+  if (msg.kind.indexOf("jbb.relay.") === 0) {
+    if (!sender || !sender.url || sender.url.indexOf("offscreen.html") === -1) return false;
+    state.offscreenSeenAt = Date.now();
+    if (msg.kind === "jbb.relay.message") handleRelayMessage(msg.data);
+    else if (msg.kind === "jbb.relay.state") onRelayState(!!msg.connected);
+    else if (msg.kind === "jbb.relay.hello") {
+      if (state.relayUrl && !state.sessionKilled && !state.signInBlocked) postRelayConnect();
+    }
     return false;
   }
   // Offscreen page signals (no response needed).
