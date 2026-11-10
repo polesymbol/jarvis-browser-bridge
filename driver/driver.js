@@ -105,7 +105,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
       'listen flags: --duration <seconds> --out <file.webm> (proposes audio capture — T2 — then writes the streamed Opus/WebM chunks to the file)',
       'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
       'watch flags: --duration <seconds> (stream media.progress events as JSON lines; 0 = until Ctrl-C)',
-      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab|audioCapture --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file> --direction up|down|top|bottom --amount <px>',
+      'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab|audioCapture --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --header "Name: Value" (repeatable, fetch, same-origin only) --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file> --direction up|down|top|bottom --amount <px>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
     ],
   }, 0);
@@ -587,7 +587,19 @@ async function connect(timeoutMs) {
 }
 
 async function main() {
-  const ws = await connect(CMD === 'status' ? 8000 : 15000);
+  // One retry on a refused/dropped first connection: a transient relay
+  // or network hiccup used to fail the whole command (the 2026-11-10
+  // session lost a status check to a single RELAY_UNREACHABLE). If the
+  // retry also fails, the error stands — reported, not papered over.
+  let ws;
+  try {
+    ws = await connect(CMD === 'status' ? 8000 : 15000);
+  } catch (e) {
+    if (!e || e.code !== 'RELAY_UNREACHABLE') throw e;
+    console.error('[relay] first connection attempt failed — retrying once');
+    await new Promise((r) => setTimeout(r, 1000));
+    ws = await connect(CMD === 'status' ? 8000 : 15000);
+  }
   try {
     if (CMD === 'status') {
       const confirm = await pair(ws, 8000);
@@ -604,7 +616,27 @@ async function main() {
       return;
     }
 
-    await pair(ws);
+    const pairConfirm = await pair(ws);
+
+    // Fail fast on a KNOWN-down peer (field fix 2026-11-10): with the
+    // extension absent, every command used to burn its full timeout
+    // (observe: 30s, twice) and report PEER_TIMEOUT for what was known
+    // at pair time. Give the extension a short grace to join — it may
+    // be mid-reconnect — then say PEER_DOWN plainly and exit.
+    if (!pairConfirm.peer) {
+      const graceRaw = process.env.JBB_PEER_WAIT_MS;
+      const graceMs = graceRaw === undefined ? 5000 : Math.max(0, Number(graceRaw) || 0);
+      let joined = false;
+      if (graceMs > 0) {
+        try { await waitFor(ws, ['peer.joined'], graceMs); joined = true; }
+        catch { joined = false; }
+      }
+      if (!joined) {
+        throw new DriverError('PEER_DOWN',
+          'the extension is not connected to the relay — open Chrome with the extension installed, check the side panel says Connected, then retry (failed fast instead of waiting out the full timeout)');
+      }
+      console.error('[relay] peer joined during the grace wait — continuing');
+    }
 
     if (CMD === 'plan') {
       // Propose an ordered plan; the user approves it ONCE in the panel;
@@ -965,6 +997,25 @@ async function main() {
         const ct = opt('--content-type', undefined);
         if (ct !== undefined) proposal.contentType = ct;
         proposal.description = `fetch ${method} ${proposal.url} in this page`;
+        // --header 'Name: Value' (repeatable): the app headers the
+        // page's own XHRs send on top of cookies (CSRF tokens and the
+        // like) — without them, session-gated APIs refuse a fetch that
+        // carries only cookies. The extension honors them SAME-ORIGIN
+        // ONLY and never prints their values.
+        const headerArgs = [];
+        for (let hi = 0; hi < args.length; hi++) {
+          if (args[hi] === '--header' && args[hi + 1]) headerArgs.push(args[hi + 1]);
+        }
+        if (headerArgs.length) {
+          const hdrs = {};
+          for (const hstr of headerArgs) {
+            const ci = hstr.indexOf(':');
+            if (ci <= 0) throw new DriverError('USAGE', `--header must look like 'Name: Value' (got '${hstr}')`);
+            hdrs[hstr.slice(0, ci).trim()] = hstr.slice(ci + 1).trim();
+          }
+          proposal.headers = hdrs;
+          proposal.description += ` with ${headerArgs.length} page-session header(s)`;
+        }
       } else if (type === 'waitFor') {
         const kind = opt('--wait', undefined);
         const KINDS = ['element', 'text', 'navigation', 'networkIdle', 'mediaEnded'];

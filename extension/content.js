@@ -43,8 +43,87 @@
     "[role='link']",
     "[role='checkbox']",
     "[role='textbox']",
+    "[role='tab']",
+    "[role='combobox']",
+    "[role='listbox']",
+    "[role='option']",
+    "[role='menuitem']",
+    "[role='radio']",
+    "[role='switch']",
+    "[role='slider']",
+    "[role='spinbutton']",
+    "[role='searchbox']",
+    "[role='treeitem']",
+    "[aria-haspopup]",
+    "[aria-expanded]",
     "[tabindex]:not([tabindex='-1'])"
   ].join(",");
+
+  /**
+   * Deep query: light DOM plus every OPEN shadow root, in tree order.
+   * Component libraries (Seller Central's dashboards among them) render
+   * their real controls — dropdowns, tabs, filters — inside shadow DOM,
+   * where a plain document.querySelectorAll never sees them; snapshots
+   * used to show only the host page's outer shell (field report
+   * 2026-11-10: every Brand Analytics control invisible). Closed shadow
+   * roots stay unreachable by design — the browser forbids it, and the
+   * snapshot says so via what it cannot list rather than pretending.
+   */
+  function queryDeep(selector) {
+    var out = [];
+    var seen = new Set();
+    var walk = function (scope) {
+      var nodes;
+      try { nodes = scope.querySelectorAll(selector); } catch (e) { nodes = []; }
+      for (var i = 0; i < nodes.length; i++) {
+        if (!seen.has(nodes[i])) { seen.add(nodes[i]); out.push(nodes[i]); }
+      }
+      var all;
+      try { all = scope.querySelectorAll("*"); } catch (e) { all = []; }
+      for (var j = 0; j < all.length; j++) {
+        if (all[j].shadowRoot) walk(all[j].shadowRoot);
+      }
+    };
+    walk(document);
+    return out;
+  }
+
+  function queryInteractives() { return queryDeep(INTERACTIVE_SELECTOR); }
+
+  /**
+   * Pointer pass: clickable div/span widgets that no HTML tag or ARIA
+   * role names. The page's own computed `cursor: pointer` is its
+   * declaration that the element is clickable — that, a visible box, and
+   * a readable label are the entry bar. These candidates only ever FILL
+   * budget the semantic pass left over (they never displace a real
+   * control), and an element whose interactive descendant exists is
+   * skipped — the innermost real control is the meaningful target.
+   */
+  function pointerCandidates(exclude, budget) {
+    var out = [];
+    if (budget <= 0) return out;
+    var all = queryDeep("*");
+    for (var i = 0; i < all.length && out.length < budget; i++) {
+      var el = all[i];
+      if (exclude.has(el)) continue;
+      var tag = (el.tagName || "").toLowerCase();
+      if (tag === "script" || tag === "style" || tag === "link" || tag === "meta" ||
+          tag === "html" || tag === "body" || tag === "head") continue;
+      var r;
+      try { r = el.getBoundingClientRect(); } catch (e) { continue; }
+      if (!r || (r.width === 0 && r.height === 0)) continue;
+      if (!labelFor(el)) continue;
+      var style;
+      try { style = window.getComputedStyle(el); } catch (e) { continue; }
+      if (!style || style.cursor !== "pointer") continue;
+      if (style.visibility === "hidden" || style.display === "none") continue;
+      var inner = null;
+      try { inner = el.querySelector(INTERACTIVE_SELECTOR); } catch (e) { /* exotic node */ }
+      if (inner) continue;
+      out.push(el);
+    }
+    return out;
+  }
 
   // Guard against double-injection (background re-injects before each action).
   // On re-injection, refresh the snapshot entry point the background calls via
@@ -136,9 +215,11 @@
     var tag = el.tagName.toLowerCase();
     if (tag === "a") return "link";
     if (tag === "input") return "input:" + (el.type || "text");
-    if (tag === "button" || el.getAttribute("role") === "button") return "button";
+    var role = el.getAttribute ? el.getAttribute("role") : null;
+    if (tag === "button" || role === "button") return "button";
     if (tag === "select") return "select";
     if (tag === "textarea") return "textarea";
+    if (role) return role;
     return tag;
   }
 
@@ -282,23 +363,39 @@
   function buildSnapshot(opts) {
     opts = opts || {};
     pruneIdRegistry();
-    var els = document.querySelectorAll(INTERACTIVE_SELECTOR);
+    var els = queryInteractives();
     var interactives = [];
-    var n = 0;
-    for (var i = 0; i < els.length && n < MAX_ELEMENTS; i++) {
-      var el = els[i];
-      if (!isVisible(el)) continue;
+    var seen = new Set();
+    var entryFor = function (el, typeOverride) {
       var geo = boxFor(el);
-      interactives.push({
+      return {
         ref: stableIdFor(el),
         label: labelFor(el),
-        type: typeFor(el),
+        type: typeOverride || typeFor(el),
         name: el.getAttribute("name") || null,
         href: hrefFor(el),
         box: geo.box,
         inViewport: geo.inViewport
-      });
+      };
+    };
+    var n = 0;
+    for (var i = 0; i < els.length && n < MAX_ELEMENTS; i++) {
+      var el = els[i];
+      if (!isVisible(el)) continue;
+      seen.add(el);
+      interactives.push(entryFor(el));
       n++;
+    }
+    // Pointer pass: clickable-but-unmarked widgets fill whatever budget
+    // the semantic pass left — never displacing a real control.
+    var ptrTruncated = false;
+    if (n < MAX_ELEMENTS) {
+      var ptr = pointerCandidates(seen, MAX_ELEMENTS - n);
+      ptrTruncated = ptr.length >= MAX_ELEMENTS - n;
+      for (var p = 0; p < ptr.length; p++) {
+        interactives.push(entryFor(ptr[p], "clickable"));
+        n++;
+      }
     }
     var collected = collectVisibleText();
     var fullText = collected.text;
@@ -314,7 +411,7 @@
       title: document.title,
       url: location.href,
       interactives: interactives,
-      truncated: els.length > MAX_ELEMENTS,
+      truncated: els.length > MAX_ELEMENTS || ptrTruncated,
       text: chunk,
       text_chunk: chunk,
       text_offset: offset,
@@ -367,11 +464,35 @@
    * than a refused one. Returns { el, matchQuality: "exact"|"fuzzy" }.
    * (Ref-based acts never come here: their label check stays exact.)
    */
+  // Every element a label may legitimately name: the semantic pass plus
+  // pointer-pass widgets, deduped. Label acts and ref re-resolution both
+  // search this set, so a target the snapshot could show is a target an
+  // act can find.
+  function labelCandidates() {
+    var els = queryInteractives();
+    var seen = new Set(els);
+    var ptr = pointerCandidates(seen, 100);
+    for (var i = 0; i < ptr.length; i++) els.push(ptr[i]);
+    return els;
+  }
+
+  function findExactByLabel(query) {
+    var q = normalizeLabel(query);
+    var els = labelCandidates();
+    var exact = [];
+    for (var i = 0; i < els.length; i++) {
+      var el = els[i];
+      if (!isVisible(el)) continue;
+      if (labelFor(el) === q) exact.push(el);
+    }
+    return exact;
+  }
+
   function findByLabel(query) {
     var q = normalizeLabel(query);
     if (!q) throw new Error("empty label");
     var ql = q.toLowerCase();
-    var els = document.querySelectorAll(INTERACTIVE_SELECTOR);
+    var els = labelCandidates();
     var exact = [], fuzzy = [];
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
@@ -393,8 +514,27 @@
 
   function resolveTarget(ref, expectedLabel) {
     if (ref) {
-      var el = verifyTarget(findByRef(ref), ref, expectedLabel);
-      return { el: el, matchQuality: expectedLabel ? "exact" : undefined };
+      var el = findByRef(ref);
+      if (el) {
+        verifyTarget(el, ref, expectedLabel);
+        return { el: el, matchQuality: expectedLabel ? "exact" : undefined };
+      }
+      // The stamped element is GONE — on a re-rendering SPA (Seller
+      // Central Learn re-renders every few seconds) refs die between
+      // observe and act, and "no element for ref" was the session's top
+      // click failure. If the act carries the label the user approved,
+      // re-resolve it against the LIVE DOM: exactly one exact-label
+      // match, or fail closed. Fuzzy is never accepted here — the user
+      // approved a specific element, and only its exact label, unique,
+      // is a safe stand-in for it.
+      if (expectedLabel) {
+        var exact = findExactByLabel(expectedLabel);
+        if (exact.length === 1) return { el: exact[0], matchQuality: "re-resolved" };
+        throw new Error("no element for ref " + ref + " — the page re-rendered, and its label '" +
+          expectedLabel + "' now matches " + exact.length + " elements (re-resolution needs exactly one)");
+      }
+      throw new Error("no element for ref " + ref +
+        " — if the page re-renders, pass the element's label as --target alongside --ref so the act can re-resolve at execution time");
     }
     if (expectedLabel) return findByLabel(expectedLabel);
     throw new Error("act needs a ref or a label");
@@ -750,6 +890,32 @@
     return step();
   }
 
+  var FORBIDDEN_FETCH_HEADERS = ["cookie", "host", "content-length", "connection",
+    "transfer-encoding", "upgrade", "proxy-authorization", "te", "trailer", "referer", "origin"];
+
+  function validateFetchHeaders(h) {
+    if (typeof h !== "object" || h === null || Array.isArray(h)) {
+      throw new Error("fetch headers must be an object of name: value pairs");
+    }
+    var names = Object.keys(h);
+    if (names.length > 16) throw new Error("too many fetch headers (max 16)");
+    var out = {};
+    names.forEach(function (name) {
+      if (!/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
+        throw new Error("invalid fetch header name: '" + name + "'");
+      }
+      if (FORBIDDEN_FETCH_HEADERS.indexOf(name.toLowerCase()) >= 0) {
+        throw new Error("fetch header '" + name + "' is browser-owned and cannot be set — cookies ride the session automatically on same-origin fetches");
+      }
+      var v = h[name];
+      if (typeof v !== "string" || v.length > 512 || /[\r\n]/.test(v)) {
+        throw new Error("invalid value for fetch header '" + name + "'");
+      }
+      out[name] = v;
+    });
+    return out;
+  }
+
   function doFetch(a) {
     if (!a.url) throw new Error("fetch needs a URL");
     var u;
@@ -760,11 +926,30 @@
     }
     var sameOrigin = u.origin === location.origin;
     var method = String(a.method || "GET").toUpperCase();
+    // Custom headers (field fix 2026-11-10): session-gated app APIs
+    // (Seller University search among them) demand app headers — CSRF
+    // tokens and the like — on top of cookies, so a cookies-only fetch
+    // was refused even same-origin. Headers are SAME-ORIGIN ONLY: in
+    // page context they are exactly what the page's own XHRs may send,
+    // while cross-origin they would leak page internals to another
+    // site, so asking for them there is refused outright. Cookie and
+    // the other browser-owned headers can never be set by hand.
+    var extraHeaders = null;
+    if (a.headers != null) {
+      if (!sameOrigin) {
+        throw new Error("custom headers are only sent on same-origin fetches — this URL is cross-origin");
+      }
+      extraHeaders = validateFetchHeaders(a.headers);
+    }
     var init = { method: method, credentials: sameOrigin ? "include" : "omit" };
+    var reqHeaders = {};
+    if (extraHeaders) for (var hk in extraHeaders) reqHeaders[hk] = extraHeaders[hk];
     if (a.body != null && method !== "GET" && method !== "HEAD") {
       init.body = String(a.body);
-      init.headers = { "Content-Type": a.contentType || "application/json" };
+      var hasCt = Object.keys(reqHeaders).some(function (k) { return k.toLowerCase() === "content-type"; });
+      if (!hasCt) reqHeaders["Content-Type"] = a.contentType || "application/json";
     }
+    if (Object.keys(reqHeaders).length) init.headers = reqHeaders;
     return fetch(u.href, init).then(function (res) {
       var headers = {};
       try {
@@ -781,7 +966,8 @@
           data: { status: res.status, headers: headers, url: res.url || u.href,
                   body: wireTruncated ? r.body.slice(0, FETCH_WIRE_CAP) : r.body,
                   truncated: !!(r.truncated || wireTruncated), size: r.size,
-                  credentials: sameOrigin ? "include" : "omit" }
+                  credentials: sameOrigin ? "include" : "omit",
+                  headersSent: Object.keys(reqHeaders) }
         };
       });
     });
@@ -960,7 +1146,40 @@
     return mediaDelay(50).then(grab);
   }
 
-  function doScroll(direction, amount) {
+  function isScrollableY(el) {
+    if (!el || !el.clientHeight) return false;
+    if ((el.scrollHeight || 0) <= el.clientHeight + 1) return false;
+    var style;
+    try { style = window.getComputedStyle(el); } catch (e) { return false; }
+    if (!style) return false;
+    return ["auto", "scroll", "overlay"].indexOf(style.overflowY) >= 0;
+  }
+
+  function scrollableAncestor(el) {
+    var node = el;
+    while (node && node !== document.documentElement && node !== document.body) {
+      if (isScrollableY(node)) return node;
+      if (node.parentElement) node = node.parentElement;
+      else {
+        // Cross the shadow boundary: a control inside a web component
+        // scrolls the container outside it.
+        var root = node.getRootNode ? node.getRootNode() : null;
+        node = root && root.host ? root.host : null;
+      }
+    }
+    return null;
+  }
+
+  function scrollBox(box, dir, px) {
+    var before = box.scrollTop || 0;
+    if (dir === "up") box.scrollTop = before - px;
+    else if (dir === "down") box.scrollTop = before + px;
+    else if (dir === "top") box.scrollTop = 0;
+    else box.scrollTop = box.scrollHeight;
+    return Math.abs((box.scrollTop || 0) - before);
+  }
+
+  function doScroll(direction, amount, target) {
     // The result must name what actually happened (Prompt 16 §5.5): a
     // missing direction defaults to "down" instead of printing
     // "scrolled undefined", the scroll is applied instantly so the
@@ -968,6 +1187,27 @@
     // says so instead of claiming success.
     var dir = ["up", "down", "top", "bottom"].indexOf(direction) >= 0 ? direction : "down";
     var px = amount || 600;
+    // Targeted scroll (field fix 2026-11-10): app pages — Seller Central
+    // results, dashboards — scroll an INNER container, not the window;
+    // a window-only scroll reported "already at the bottom" while the
+    // results sat unscrolled in their own box. With a target (ref,
+    // label, or selector), scroll the scrollable ancestor of that
+    // element — the container it actually lives in.
+    if (target && (target.ref || target.label || target.selector)) {
+      var el = null;
+      if (target.selector) {
+        el = document.querySelector(target.selector);
+        if (!el) throw new Error("no element for selector '" + target.selector + "'");
+      } else {
+        el = resolveTarget(target.ref, target.label).el;
+      }
+      var box = scrollableAncestor(el);
+      if (!box) throw new Error("no scrollable container around '" + (target.label || target.selector || target.ref) + "'");
+      var movedT = scrollBox(box, dir, px);
+      if (movedT > 0) return "scrolled " + dir + " " + Math.round(movedT) + "px (inner container)";
+      return "scroll " + dir + " requested — the inner container did not move (already at the " +
+        (dir === "up" || dir === "top" ? "top" : "bottom") + ")";
+    }
     var before = window.scrollY || 0;
     if (dir === "up") window.scrollBy({ top: -px, behavior: "auto" });
     else if (dir === "down") window.scrollBy({ top: px, behavior: "auto" });
@@ -975,6 +1215,24 @@
     else window.scrollTo({ top: document.body.scrollHeight, behavior: "auto" });
     var moved = Math.abs((window.scrollY || 0) - before);
     if (moved > 0) return "scrolled " + dir + " " + Math.round(moved) + "px";
+    // The window cannot move — the page's real scroll surface is an
+    // inner container. Find the largest visible one and scroll that
+    // instead of declaring the bottom of a page that never moved.
+    var all = queryDeep("*");
+    var best = null, bestRoom = 0;
+    for (var i = 0; i < all.length; i++) {
+      var cand = all[i];
+      if (!isScrollableY(cand)) continue;
+      var r;
+      try { r = cand.getBoundingClientRect(); } catch (e) { continue; }
+      if (!r || r.width === 0 || r.height === 0) continue;
+      var room = cand.scrollHeight - cand.clientHeight;
+      if (room > bestRoom) { bestRoom = room; best = cand; }
+    }
+    if (best) {
+      var movedC = scrollBox(best, dir, px);
+      if (movedC > 0) return "scrolled " + dir + " " + Math.round(movedC) + "px (inner container)";
+    }
     return "scroll " + dir + " requested — the page did not move (already at the " +
       (dir === "up" || dir === "top" ? "top" : "bottom") + ")";
   }
@@ -1092,7 +1350,7 @@
         else if (a.type === "setValue") out = doSetValue(t.ref, a.value, t.label);
         else if (a.type === "drag") out = doDrag(a.dragFrom || t, a.dragTo);
         else if (a.type === "captions") out = doCaptions(a);
-        else if (a.type === "scroll") out = { detail: doScroll(a.direction, a.amount) };
+        else if (a.type === "scroll") out = { detail: doScroll(a.direction, a.amount, { ref: t.ref, label: t.label, selector: a.selector }) };
         else throw new Error("unknown action type: " + a.type);
         var resp = { ok: true, detail: out.detail };
         if (out.matchQuality) resp.matchQuality = out.matchQuality;

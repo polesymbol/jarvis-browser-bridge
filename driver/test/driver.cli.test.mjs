@@ -551,6 +551,19 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
     "stdout=" + pdr.out + " proposes=" + pd.proposeCount);
   stopExt(pd);
 }
+{
+  // No extension pairs at all: observe must fail fast with PEER_DOWN
+  // (field fix 2026-11-10) instead of burning the full observe timeout
+  // to report PEER_TIMEOUT for a room known empty at pair time.
+  const key = "peerdown-key-0123456789abcde";
+  const started = Date.now();
+  const r = await runDriver(["--relay", lArg, "--key", key, "observe"],
+    { ...FAST, JBB_PEER_WAIT_MS: "300", JBB_OBSERVE_MS: "30000" });
+  const j = parseStdout(r.out);
+  check("observe with no extension paired fails fast as PEER_DOWN, not PEER_TIMEOUT",
+    r.code !== 0 && !!j && j.ok === false && j.error === "PEER_DOWN" && (Date.now() - started) < 10000,
+    "code=" + r.code + " stdout=" + r.out.slice(0, 200) + " elapsed=" + (Date.now() - started));
+}
 L.httpServer.close();
 
 console.log(failures === 0 ? "ALL DRIVER TESTS PASSED" : failures + " DRIVER TEST(S) FAILED");
