@@ -962,14 +962,38 @@ function ensureOffscreenDocument(cb) {
   if (!offscreenAvailable()) return;
   if (offscreenReady) { cb(); return; }
   // Remember the intent: the ready handshake (below) will flush it.
-  var create = function () {
+  //
+  // REASONS ARE THE LIFETIME (v0.3.1): Chrome's offscreen docs are explicit
+  // that AUDIO_PLAYBACK alone "sets the document to close after 30 seconds
+  // without audio playing", while all other reasons set no lifetime limit.
+  // Our tones last under a second, so an audio-only document — the one
+  // holding the relay socket — was reap-eligible almost immediately after
+  // every creation: the multi-month connect flap (peer present, gone
+  // ~30–45s, present again) was that 30s timer, not the relay and not the
+  // socket code. The document also genuinely hosts tab audio capture
+  // (getUserMedia on the user's explicit enable), so it is created with
+  // USER_MEDIA alongside AUDIO_PLAYBACK and carries no Chrome lifetime
+  // limit. If a Chrome build ever rejects the combined set, fall back to
+  // the original audio-only reasons rather than dead-ending the bridge.
+  var create = function (reasons, isFallback) {
     chrome.offscreen.createDocument(
-      { url: "offscreen.html", reasons: ["AUDIO_PLAYBACK"],
-        justification: "Play an audible tone when an approval prompt needs attention, and hold the relay WebSocket so it survives service-worker suspension." },
+      { url: "offscreen.html", reasons: reasons,
+        justification: "Play an audible tone when an approval prompt needs attention, hold the relay WebSocket so it survives service-worker suspension, and host tab audio capture when the user enables it." },
       function () {
-        // "Only one offscreen document" just means it's already there.
-        if (chrome.runtime.lastError &&
-            chrome.runtime.lastError.message.indexOf("Only one") === -1) {
+        if (chrome.runtime.lastError) {
+          // "Only one offscreen document" just means it's already there —
+          // its script is running; treat as ready.
+          if (chrome.runtime.lastError.message.indexOf("Only one") !== -1) {
+            offscreenReady = true;
+            cb();
+            return;
+          }
+          if (!isFallback) {
+            audit({ site: "-", action: "offscreen document", tier: "T0", result: "failed",
+                    detail: "createDocument rejected the full reason set (" + chrome.runtime.lastError.message + ") — retrying with AUDIO_PLAYBACK only; the transport will work, but Chrome may reap the document when no tone is playing." });
+            create(["AUDIO_PLAYBACK"], true);
+            return;
+          }
           audit({ site: "-", action: "consent tone", tier: "T0", result: "failed",
                   detail: "offscreen document failed: " + chrome.runtime.lastError.message });
           return;
@@ -977,21 +1001,15 @@ function ensureOffscreenDocument(cb) {
         // Do NOT mark ready here: the create callback fires before the
         // page's script runs, so an immediate playTone would be lost.
         // Readiness comes from the page's own jbb.offscreen.ready signal.
-        if (chrome.runtime.lastError) {
-          // Document already existed — its script is running; treat as ready.
-          offscreenReady = true;
-          cb();
-        }
-        // else: wait for the ready signal.
       });
   };
   try {
     if (chrome.offscreen.hasDocument) {
       chrome.offscreen.hasDocument(function (has) {
-        if (has) { offscreenReady = true; cb(); } else create();
+        if (has) { offscreenReady = true; cb(); } else create(["AUDIO_PLAYBACK", "USER_MEDIA"], false);
       });
-    } else create();
-  } catch (e) { create(); }
+    } else create(["AUDIO_PLAYBACK", "USER_MEDIA"], false);
+  } catch (e) { create(["AUDIO_PLAYBACK", "USER_MEDIA"], false); }
 }
 
 // Called when the offscreen page signals its script is running.
@@ -1380,8 +1398,12 @@ function postToOffscreen(msg) {
       // relay sends (observe results, consent acks, act results) that loss
       // reads as a dead bridge at the driver, so retry ONCE after a beat.
       // Duplicates are safe: the driver correlates by id and takes the
-      // first matching message.
-      if (msg && msg.kind === "jbb.relay.send") {
+      // first matching message. Connect posts retry too (v0.3.1): a
+      // connect lost into a dying document used to surface as a Connect
+      // button that did nothing until the watchdog happened by, and
+      // relayConnect is idempotent in the document — same url+key dials
+      // only when not already dialing or open.
+      if (msg && (msg.kind === "jbb.relay.send" || msg.kind === "jbb.relay.connect")) {
         setTimeout(function () {
           chrome.runtime.sendMessage(msg).catch(function () { /* doc raced away */ });
         }, 800);
@@ -1432,13 +1454,13 @@ function onRelayState(connected) {
 // in storage and in this worker's map, and hydrate after any restart).
 //
 // Two paths, fastest first:
-//  1. The document itself is GONE. Chrome reaps offscreen documents (an
-//     AUDIO_PLAYBACK document that isn't playing audio has no lifetime
-//     guarantee), and a dead document sends no state reports at all — the
-//     old logic inferred death from 45s of silence + 30s sustained, which
-//     left the bridge dead for 75+ seconds per cycle in the 2026-11-09
-//     live flap (driver probes: peer yes, no, no, no, no, yes over two
-//     minutes). hasDocument is ground truth: recreate immediately.
+//  1. The document itself is GONE. Since v0.3.1 the document carries a
+//     USER_MEDIA reason alongside AUDIO_PLAYBACK, so Chrome sets it no
+//     lifetime limit (an AUDIO_PLAYBACK-only document closes 30s after
+//     audio stops — that timer was the 2026-11-09 live flap); a document
+//     can still die to a crash or memory pressure, and a dead document
+//     sends no state reports at all. hasDocument is ground truth:
+//     recreate immediately.
 //  2. The document lives but reports the transport down (or goes silent)
 //     for >20s: close + recreate, as before but tighter.
 var lastDocRecreateAt = 0;
@@ -2838,7 +2860,12 @@ function killSession(reason) {
   endPlans("session killed");
   sendToRelay(JBB.Message.sessionAbort(reason || "user kill switch"));
   disconnectRelay("killed");
-  state.relayUrl = ""; // require explicit reconnect
+  // The relay URL is NOT blanked (pre-v0.3.1 it was, which made every
+  // post-kill reconnect start with re-pasting the URL — and the panel's
+  // Connect button, which reads state.relayUrl, silently did nothing).
+  // sessionKilled above already gates every reconnect path (connect,
+  // hello, watchdog, alarm); the URL is just a setting, and keeping it
+  // makes Revive reconnect in one action instead of three.
   saveSettings();
   audit({ site: "-", action: "session killed", tier: "T3", result: "executed", detail: reason || "user kill switch" });
   pushToPanel({ kind: "jbb.ui.killed" });
@@ -3238,6 +3265,10 @@ chrome.runtime.onMessage.addListener(function (msg, sender, sendResponse) {
       state.sessionKilled = false;
       audit({ site: "-", action: "session revived by user", tier: "T0", result: "allowed" });
       pushToPanel({ kind: "jbb.ui.revived" });
+      // Revive IS the explicit reconnect intent — don't make the user
+      // press Connect as a second step (v0.3.1). connectRelay carries
+      // the sign-in hard block itself.
+      if (state.relayUrl) connectRelay(state.relayUrl);
       done();
       break;
 

@@ -94,5 +94,17 @@ check("offscreen: no consent machinery (never approves/denies/applies)",
 check("offscreen: chime path intact (tone variants ride the same message)",
   off.includes('msg.kind === "jbb.offscreen.playTone"') && off.includes("playChime(msg.tone)"));
 
+// ---------------------------------------------------------- document lifetime (v0.3.1)
+check("worker: document created with a no-lifetime-limit reason alongside audio (Chrome closes AUDIO_PLAYBACK-only documents 30s after audio stops — that timer was the connect flap)",
+  bg.includes('create(["AUDIO_PLAYBACK", "USER_MEDIA"], false)'));
+check("worker: a rejected reason set falls back to audio-only instead of dead-ending the bridge",
+  bg.includes('create(["AUDIO_PLAYBACK"], true)') && bg.includes("retrying with AUDIO_PLAYBACK only"));
+check("worker: a connect post that races a document recreate is retried once too",
+  bg.includes('msg.kind === "jbb.relay.connect"'));
+check("worker: killing a session no longer blanks the saved relay URL (Connect reads state.relayUrl — blanking made it a dead button)",
+  !bg.includes('state.relayUrl = "";'));
+check("worker: revive reconnects immediately when a relay URL is saved",
+  bg.includes("if (state.relayUrl) connectRelay(state.relayUrl);"));
+
 console.log(failures === 0 ? "ALL TRANSPORT GUARD TESTS PASSED" : failures + " TRANSPORT GUARD CHECK(S) FAILED");
 process.exit(failures === 0 ? 0 : 1);
