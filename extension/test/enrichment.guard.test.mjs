@@ -34,7 +34,8 @@ function check(name, cond) {
 check("content: pagination fields are produced",
   content.includes("text_chunk: chunk") && content.includes("text_total_chars: fullText.length") &&
   content.includes("text_next_offset"));
-check("content: default chunk cap unchanged (15000)", content.includes("var TEXT_CAP = 15000;"));
+check("content: default chunk cap raised to 30000 (Fix 6 — a 26k page reads in one observe)",
+  content.includes("var TEXT_CAP = 30000;"));
 check("content: interactives carry href, box, inViewport",
   content.includes("href: hrefFor(el)") && content.includes("box: geo.box") && content.includes("inViewport: geo.inViewport"));
 check("content: scroll state + contentChanged signature",

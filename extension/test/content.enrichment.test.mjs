@@ -64,6 +64,9 @@ global.window = {
   innerHeight: 800,
   innerWidth: 1200,
   scrollY: 120,
+  // Keep the miss-retry budget short here: the failure-path checks below
+  // would otherwise each burn the production 5s budget.
+  __jbbResolveRetryMs: 500,
 };
 global.document = {
   title: "Long course page",
@@ -92,18 +95,21 @@ new Function("window", "document", "location", "chrome", src)(
 );
 
 function act(action) {
-  let resp = null;
-  listener({ kind: "jbb.content.act", action }, {}, (r) => { resp = r; });
-  return resp;
+  // Clicks verify post-click state asynchronously (Fix 3) and a missed
+  // target retries across re-renders (Fix 1), so responses arrive on a
+  // later tick — await them instead of reading them synchronously.
+  return new Promise((resolve) => {
+    listener({ kind: "jbb.content.act", action }, {}, resolve);
+  });
 }
 
 // ---------------------------------------------------------- pagination (acceptance)
 const s1 = global.window.__jbbBuildSnapshot();
-check("first chunk is capped at 15000 with pagination metadata",
-  s1.text_chunk.length === 15000 && s1.text_offset === 0 &&
-  s1.text_total_chars === 40000 && s1.text_next_offset === 15000 && s1.text === s1.text_chunk);
-const sTail = global.window.__jbbBuildSnapshot({ textOffset: s1.text_next_offset * 2 });
-check("the final chunk carries the completion message the 15k cap used to hide",
+check("first chunk is capped at 30000 with pagination metadata",
+  s1.text_chunk.length === 30000 && s1.text_offset === 0 &&
+  s1.text_total_chars === 40000 && s1.text_next_offset === 30000 && s1.text === s1.text_chunk);
+const sTail = global.window.__jbbBuildSnapshot({ textOffset: s1.text_next_offset });
+check("the final chunk carries the completion message the old 15k cap used to hide",
   sTail.text_offset === 30000 && sTail.text_chunk.includes(TAIL) && sTail.text_next_offset === null);
 
 // ---------------------------------------------------------- element fields
@@ -127,27 +133,27 @@ check("unchanged page reports contentChanged: false again", s3.scroll.contentCha
 body.innerText = bodyText;
 
 // ---------------------------------------------------------- fuzzy label fallback
-let r = act({ type: "click", target: { ref: null, label: "Lesson 2: Getting started" } });
+let r = await act({ type: "click", target: { ref: null, label: "Lesson 2: Getting started" } });
 check("label-only act: exact match, quality reported",
   r && r.ok === true && r.matchQuality === "exact" && lessonBtn.clicked === 1);
-r = act({ type: "click", target: { ref: null, label: "lesson 2" } });
+r = await act({ type: "click", target: { ref: null, label: "lesson 2" } });
 check("label-only act: unique case-insensitive substring is a fuzzy match",
   r && r.ok === true && r.matchQuality === "fuzzy" && lessonBtn.clicked === 2);
-r = act({ type: "click", target: { ref: null, label: "settings" } });
+r = await act({ type: "click", target: { ref: null, label: "settings" } });
 check("ambiguous fuzzy match fails closed (nothing clicked)",
   r && r.ok === false && settingsBtn.clicked === 0 && siteSettingsBtn.clicked === 0);
-r = act({ type: "click", target: { ref: null, label: "No such thing" } });
+r = await act({ type: "click", target: { ref: null, label: "No such thing" } });
 check("unmatched label fails", r && r.ok === false);
 
 // ---------------------------------------------------------- coordinate + selector fallbacks (acceptance)
-r = act({ type: "clickAt", point: { x: 50, y: 60 } });
+r = await act({ type: "clickAt", point: { x: 50, y: 60 } });
 check("clickAt clicks the element at those coordinates",
   r && r.ok === true && settingsBtn.clicked === 1 && /Settings/.test(r.detail));
-r = act({ type: "clickAt", point: { x: 999, y: 999 } });
+r = await act({ type: "clickAt", point: { x: 999, y: 999 } });
 check("clickAt with nothing at the point fails", r && r.ok === false);
-r = act({ type: "clickSelector", selector: "#go" });
+r = await act({ type: "clickSelector", selector: "#go" });
 check("clickSelector clicks the selected element", r && r.ok === true && siteSettingsBtn.clicked === 1);
-r = act({ type: "clickSelector", selector: ".missing" });
+r = await act({ type: "clickSelector", selector: ".missing" });
 check("clickSelector with no match fails", r && r.ok === false);
 
 console.log(failures === 0 ? "ALL ENRICHMENT TESTS PASSED" : failures + " ENRICHMENT CHECK(S) FAILED");

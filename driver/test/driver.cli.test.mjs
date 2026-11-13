@@ -105,14 +105,50 @@ function fakeLifecycleExt(port, key, mode) {
         state.stopProposals = (state.stopProposals || 0) + 1;
         return;
       }
+      if (m.type === "status.request") {
+        if (mode === "statusReport") {
+          send({ type: "status.report",
+            pending: [{ proposalId: "prop-7", ageSec: 45, type: "click", label: "Segment View",
+                        site: "https://sellercentral.amazon.com" }],
+            heldCount: 0, keyEpoch: 3, keyExpiresAt: Date.now() + 3600000,
+            signin: { blocked: true, email: "user@example.com",
+                      action: "open the side panel and acknowledge the Chrome sign-in" },
+            tabUrl: "https://sellercentral.amazon.com/analytics" });
+        }
+        return;
+      }
+      if (m.type === "proposal.cancel") {
+        if (mode === "cancelAck") {
+          send({ type: "proposal.cancelled", proposalId: m.proposalId,
+            detail: "proposal withdrawn before a decision — it will not apply" });
+        }
+        return;
+      }
       if (m.type !== "act.propose" && m.type !== "observe.request") return;
       if (m.type === "observe.request") {
         state.lastObserve = m;
         state.observeCount = (state.observeCount || 0) + 1;
         if (mode === "observeFlap" && state.observeCount === 1) return; // transport died mid-request: no reply ever comes
+        if (mode === "observeEmptyFirst" && state.observeCount === 1) {
+          // First answer is an empty shell — the driver must retry once.
+          send({ type: "observe.result", id: m.id, snapshotVersion: 5,
+            snapshot: { title: "Loading", text: "", text_chunk: "", text_offset: 0,
+                        text_total_chars: 0, text_next_offset: null, interactives: [] } });
+          return;
+        }
+        if (mode === "observeEmptyFirst") {
+          send({ type: "observe.result", id: m.id, snapshotVersion: 5,
+            snapshot: { title: "Long page", text: "full page text — the loaded listing",
+              text_chunk: "full page text — the loaded listing", text_offset: 0,
+              text_total_chars: 41, text_next_offset: null,
+              interactives: [{ ref: "e1", label: "Home", type: "link" }] } });
+          return;
+        }
         send({ type: "observe.result", id: m.id, snapshotVersion: 5,
-          snapshot: { title: "Long page", text_chunk: "tail chunk — COURSE COMPLETED",
-            text_offset: m.textOffset || 0, text_total_chars: 31234, text_next_offset: null } });
+          snapshot: { title: "Long page", text: "tail chunk — COURSE COMPLETED",
+            text_chunk: "tail chunk — COURSE COMPLETED",
+            text_offset: m.textOffset || 0, text_total_chars: 31234, text_next_offset: null,
+            interactives: [{ ref: "e1", label: "Next", type: "link" }] } });
         return;
       }
       state.proposeCount++;
@@ -561,8 +597,48 @@ const actArgs = (key) => ["--relay", lArg, "--key", key, "act", "--type", "click
     { ...FAST, JBB_PEER_WAIT_MS: "300", JBB_OBSERVE_MS: "30000" });
   const j = parseStdout(r.out);
   check("observe with no extension paired fails fast as PEER_DOWN, not PEER_TIMEOUT",
-    r.code !== 0 && !!j && j.ok === false && j.error === "PEER_DOWN" && (Date.now() - started) < 10000,
+    r.code !== 0 && !!j && j.ok === false && j.error === "PEER_DOWN" && (Date.now() - started) < 10000 &&
+    /wrong key/.test(j.message || ""),
     "code=" + r.code + " stdout=" + r.out.slice(0, 200) + " elapsed=" + (Date.now() - started));
+}
+{
+  // Fix 7: an empty first observe is retried once inside the driver.
+  const key = "emptyobs-key-0123456789abcdef";
+  const e = await fakeLifecycleExt(L.port, key, "observeEmptyFirst");
+  const r = await runDriver(["--relay", lArg, "--key", key, "observe"], FAST);
+  const j = parseStdout(r.out);
+  check("observe retrying an empty first snapshot returns the full page",
+    r.code === 0 && !!j && j.snapshot && (j.snapshot.text || "").includes("full page text"),
+    "stdout=" + r.out.slice(0, 300));
+  check("the empty observe was retried (two observe.requests reached the extension)",
+    e.observeCount === 2, "observeCount=" + e.observeCount);
+  stopExt(e);
+}
+{
+  // Fix 12/14/16: status asks the extension and reports pending proposals,
+  // key epoch + expiry, and the sign-in block.
+  const key = "statusrep-key-0123456789abcdef";
+  const e = await fakeLifecycleExt(L.port, key, "statusReport");
+  const r = await runDriver(["--relay", lArg, "--key", key, "status"], FAST);
+  const j = parseStdout(r.out);
+  check("status with a live extension reports pending proposals + key epoch + sign-in block",
+    r.code === 0 && !!j && j.extension && j.extension.pending.length === 1 &&
+    j.extension.pending[0].label === "Segment View" && j.extension.pending[0].ageSec === 45 &&
+    j.extension.keyEpoch === 3 && j.extension.signinBlocked === true &&
+    j.extension.signinEmail === "user@example.com",
+    "stdout=" + r.out.slice(0, 500));
+  stopExt(e);
+}
+{
+  // Fix 12: cancel withdraws a queued proposal.
+  const key = "cancel-key-0123456789abcdef";
+  const e = await fakeLifecycleExt(L.port, key, "cancelAck");
+  const r = await runDriver(["--relay", lArg, "--key", key, "cancel", "--proposal-id", "prop-7"], FAST);
+  const j = parseStdout(r.out);
+  check("cancel exits 0 with the withdrawal detail",
+    r.code === 0 && !!j && j.ok === true && j.command === "cancel" && /will not apply/.test(j.detail || ""),
+    "stdout=" + r.out);
+  stopExt(e);
 }
 L.httpServer.close();
 

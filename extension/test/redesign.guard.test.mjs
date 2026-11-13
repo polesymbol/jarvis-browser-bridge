@@ -72,6 +72,10 @@ check("the same-ID in-place escalation is gone from the sweep",
   !bg.includes("notifyConsent does both, same notification ID in place)"));
 check("the panel learns about escalation (card line)",
   bg.includes("jbb.ui.consentEscalated") && panel.includes("consentEscalated"));
+check("escalation is audited as an 'escalated' feed entry",
+  bg.includes('result: "escalated"') && bg.includes("consent prompt unanswered for 60s"));
+check("plan card is a consent-card — as visible as a single-act approval (Fix 11)",
+  panel.includes('"consent-card plan-card"') && panel.includes("Approve plan"));
 
 check("plans are two-stage: approval stores started:false",
   bg.includes("started: false, startedAt: 0, paused: false"));

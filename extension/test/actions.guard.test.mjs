@@ -43,8 +43,9 @@ check("password fields refuse on press_key, set_value, and type",
   content.includes('throw new Error("refusing to type into a password field")') &&
   content.includes('throw new Error("refusing to press keys on a password field")') &&
   content.includes('throw new Error("refusing to set a value on a password field")'));
-check("set_value detail never echoes the value",
-  content.includes('String(value == null ? "" : value).length + " chars)"'));
+check("set_value detail never echoes the value (length only, plus the verification suffix)",
+  content.includes('var setLen = String(value == null ? "" : value).length;') &&
+  content.includes('"set \'" + setLabel + "\' (" + setLen + " chars)'));
 check("hover waits and reports what appeared",
   content.includes("interactiveLabelsById()") && content.includes("appeared: appeared"));
 check("driver builds proposals for every new type",

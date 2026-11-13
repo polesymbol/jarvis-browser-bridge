@@ -134,6 +134,26 @@
       return base("proposal.queued", { proposalId: proposalId });
     },
 
+    // Extension → driver: the extension's own status report (Fix 12/14/16).
+    // Answers a status.request; fields are null when the extension does
+    // not know them (legacy builds simply never answer — the driver must
+    // tolerate that). pending: [{ proposalId, ageSec, type, label, site }];
+    // keyEpoch: the connector key's epoch (a wrong key pairs into a
+    // different room, so the epoch is the only way to tell "wrong key"
+    // from "extension offline"); keyExpiresAt: ms epoch or null (legacy
+    // keys / Never); signin: { blocked, email, action } for the
+    // fresh-profile sign-in hard block.
+    statusReport: function (fields) {
+      return base("status.report", fields || {});
+    },
+
+    // Extension → driver: a queued proposal was withdrawn before a
+    // decision (driver `cancel`). The waiting driver exits CANCELLED —
+    // the proposal will never apply, unlike NO_ANSWER (still queued).
+    proposalCancelled: function (proposalId, detail) {
+      return base("proposal.cancelled", { proposalId: proposalId, detail: detail || null });
+    },
+
     planReceived: function (planId) { return base("plan.received", { planId: planId }); },
     planApproved: function (planId, fields) { return base("plan.approved", Object.assign({ planId: planId }, fields || {})); },
     planDenied: function (planId, reason) { return base("plan.denied", { planId: planId, reason: reason || "plan denied" }); },

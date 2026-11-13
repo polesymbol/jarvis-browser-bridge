@@ -64,6 +64,7 @@ var KEY_DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
 var state = {
   connected: false,           // relay paired (reported by the offscreen transport)
   snapshotVersion: 0,         // bumps on every observe + every applied act; acts built against an older version are refused STALE_SNAPSHOT
+  lastObserveTab: null,       // { tabId, url, at } of the last observe — the tab-wander detector (Fix 2): a tab that moved on its own is reported, never silently served
   relayDownSince: null,       // when transport was first seen down (watchdog)
   offscreenSeenAt: 0,         // last sign of life from the offscreen document
   relayUrl: "",
@@ -1787,7 +1788,8 @@ function handleRelayMessage(raw) {
       break;
     case "observe.request": {
       var obsId = msg.id;
-      observeActiveTab(false, { textOffset: msg.textOffset }).then(
+      observeActiveTab(false, { textOffset: msg.textOffset,
+        interactiveOffset: msg.interactiveOffset, interactiveLimit: msg.interactiveLimit }).then(
         function (m) {
           m.id = obsId;
           sendToRelay(m);
@@ -1796,6 +1798,25 @@ function handleRelayMessage(raw) {
           sendToRelay({ v: JBB.PROTOCOL_VERSION, type: "observe.result", id: obsId, ok: false, error: String((err && err.message) || err) });
         }
       );
+      break;
+    }
+    case "status.request": {
+      // The driver asks the extension for what only it knows (Fix 12/14/16):
+      // pending proposals with age + target, the key epoch + expiry, and
+      // the fresh-profile sign-in block. Answers are best-effort — a
+      // legacy driver ignores them, a legacy extension never answers.
+      sendToRelay(JBB.Message.statusReport(buildStatusReport()));
+      break;
+    }
+    case "proposal.cancel": {
+      // Withdraw a queued proposal before a decision (driver `cancel`):
+      // it must never apply later, unlike NO_ANSWER (still queued). The
+      // waiting driver gets proposal.cancelled and exits CANCELLED; the
+      // extension itself drops the entry and audits the withdrawal.
+      var cancelled = cancelQueuedProposal(msg.proposalId);
+      sendToRelay(JBB.Message.proposalCancelled(msg.proposalId,
+        cancelled ? "proposal withdrawn before a decision — it will not apply"
+                  : "no queued proposal with that id"));
       break;
     }
     case "session.abort": {
@@ -1821,6 +1842,73 @@ function handleRelayMessage(raw) {
     }
     // observe.request is answered on demand; unknown types are ignored.
   }
+}
+
+// The extension's own status report (Fix 12/14/16): pending proposals
+// with age + target, key epoch + expiry, the sign-in block, and the
+// current tab — the four things the driver's relay-only status could
+// never see.
+function buildStatusReport() {
+  var now = Date.now();
+  var pending = [];
+  state.pending.forEach(function (entry, proposalId) {
+    var p = entry.proposal || {};
+    pending.push({
+      proposalId: proposalId,
+      ageSec: Math.round((now - (entry.createdAt || now)) / 1000),
+      type: p.type || null,
+      label: (p.target && p.target.label) || p.description || null,
+      site: p.site || null
+    });
+  });
+  var keyExpiresAt = null;
+  if (state.keyMeta && state.keyMeta.createdAt && state.keyMeta.ttlMs) {
+    keyExpiresAt = state.keyMeta.createdAt + state.keyMeta.ttlMs;
+  }
+  return {
+    pending: pending,
+    heldCount: state.holdQueue.length + state.planHold.length,
+    keyEpoch: state.keyEpoch,
+    keyExpiresAt: keyExpiresAt,
+    signin: {
+      blocked: !!state.signInBlocked,
+      email: state.chromeSignedInEmail || null,
+      action: state.signInBlocked
+        ? "open the side panel and acknowledge the Chrome sign-in for " + (state.chromeSignedInEmail || "this account") +
+          ", or sign out of Chrome in this profile — the extension refuses all work while it is unacknowledged"
+        : null
+    },
+    tabUrl: state.lastObserveTab ? state.lastObserveTab.url : null
+  };
+}
+
+// Withdraw a queued proposal (Fix 12): remove it from every queue it
+// could sit in so it can never apply later. Returns true when an entry
+// was actually withdrawn.
+function cancelQueuedProposal(proposalId) {
+  if (!proposalId) return false;
+  var found = false;
+  var entry = state.pending.get(proposalId);
+  if (entry) {
+    clearTimeout(entry.timer);
+    state.pending.delete(proposalId);
+    found = true;
+  }
+  [state.holdQueue, state.planHold].forEach(function (q) {
+    var before = q.length;
+    for (var i = q.length - 1; i >= 0; i--) {
+      if (q[i] && q[i].proposal && q[i].proposal.proposalId === proposalId) q.splice(i, 1);
+    }
+    if (q.length !== before) found = true;
+  });
+  if (found) {
+    unpersistPending(proposalId);
+    audit({ site: "-", action: "proposal cancelled", tier: "T0", result: "cancelled",
+            detail: "queued proposal " + proposalId + " withdrawn before a decision — it will not apply",
+            proposalId: proposalId });
+    pushToPanel({ kind: "jbb.ui.consentResolved", proposalId: proposalId, choice: "cancelled" });
+  }
+  return found;
 }
 
 // ---------------------------------------------------------------- proposal -> consent -> execute
@@ -2691,6 +2779,10 @@ function runOnPage(proposal) {
           " but navigate targets " + destHost);
       }
       return chrome.tabs.update(tab.id, { url: proposal.url }).then(function () {
+        // A navigate act moves the tab deliberately — update the wander
+        // expectation so the next act is not refused for the move the
+        // agent itself asked for.
+        state.lastObserveTab = { tabId: tab.id, url: proposal.url, at: Date.now() };
         return { detail: "navigated to " + proposal.url };
       });
     }
@@ -2705,6 +2797,18 @@ function runOnPage(proposal) {
     if (claimedHost && actualHost !== claimedHost) {
       throw new Error("site mismatch: consented for " + claimedHost +
         " but active tab is " + (actualHost || "unknown"));
+    }
+    // Navigation guard (Fix 1d / Fix 2): the tab must not have moved on
+    // its own since the last observe — a click built for page A must
+    // never land on page B (about:blank, /ngs-search, the Assistant
+    // sidebar, an ad host). The extension cannot freeze SPA/router
+    // navigation without breaking pages, so it refuses loudly instead:
+    // re-observe and rebuild the act. A navigate act already updated
+    // the expectation above, so deliberate moves are not refused.
+    if (state.lastObserveTab && state.lastObserveTab.tabId === tab.id &&
+        state.lastObserveTab.url && tab.url && state.lastObserveTab.url !== tab.url) {
+      throw new Error("the tab moved during the wait (was " + state.lastObserveTab.url +
+        ", now " + tab.url + ") — re-observe and retry instead of acting on the wrong page");
     }
     return chrome.scripting.executeScript({
       target: { tabId: tab.id, allFrames: true },
@@ -2812,6 +2916,12 @@ function observeActiveTab(withScreenshot, observeOpts) {
         return chrome.tabs.sendMessage(tab.id, { kind: "jbb.content.observe", textOffset: observeOpts.textOffset })
           .then(function (res) {
             if (!res || !res.ok) throw new Error("observe failed");
+            var prev = state.lastObserveTab;
+            if (prev && prev.tabId === tab.id && prev.url && tab.url && prev.url !== tab.url) {
+              res.snapshot.tabMoved = { from: prev.url, to: tab.url };
+            }
+            state.lastObserveTab = { tabId: tab.id, url: tab.url || "", at: Date.now() };
+            res.snapshot.tabUrl = tab.url || "";
             return finishObserve(tab, res.snapshot, withScreenshot);
           });
       }
@@ -2819,6 +2929,19 @@ function observeActiveTab(withScreenshot, observeOpts) {
       frames.forEach(function (f) { if (f.frameId === 0) top = f; });
       if (!top) top = frames[0];
       var snap = top.snapshot;
+      // Tab-wander detection (Fix 2): the tab leaves pages on its own
+      // (about:blank, /ngs-search, the Seller Assistant sidebar, ad
+      // hosts) — a follow-up observe used to silently return the WRONG
+      // page's content. Compare against the last observe on this tab and
+      // say the move plainly in the snapshot instead. Auto-navigating
+      // back is deliberately NOT done: steering the user's tab without
+      // consent is an action, not a report.
+      var prev = state.lastObserveTab;
+      var tabMoved = (prev && prev.tabId === tab.id && prev.url && tab.url && prev.url !== tab.url)
+        ? { from: prev.url, to: tab.url } : null;
+      state.lastObserveTab = { tabId: tab.id, url: tab.url || "", at: Date.now() };
+      snap.tabUrl = tab.url || "";
+      if (tabMoved) snap.tabMoved = tabMoved;
       var totalText = (snap.text || "").length;
       var others = [];
       frames.forEach(function (f) {
@@ -2834,6 +2957,34 @@ function observeActiveTab(withScreenshot, observeOpts) {
         others.push(s);
       });
       if (others.length) snap.frames = others;
+      // Frame provenance (Fix 2c): the top-level document is the primary
+      // snapshot, but the driver must be able to SEE that — which frame
+      // each text chunk came from, and whether the top frame is an empty
+      // shell while a subframe holds the content (the assistant-sidebar
+      // capture). Each frame snapshot already carries its own url.
+      var sources = [{ frameId: top.frameId, url: top.snapshot.url || "", textChars: (top.snapshot.text || "").length }];
+      others.forEach(function (s) {
+        sources.push({ frameId: s.frameId, url: s.url || "", textChars: (s.text || "").length });
+      });
+      snap.frameSources = sources;
+      var topEmpty = (top.snapshot.text || "").length === 0 &&
+        others.some(function (s) { return (s.text || "").length > 0; });
+      if (topEmpty) snap.topFrameEmpty = true;
+      // Interactive pagination (Fix 5): the 200-entry cap made links
+      // beyond it unreachable by ref (an Amazon search page's later
+      // product links were invisible). Page the TOP frame's list — the
+      // frame lists in snap.frames are unaffected, and the default page
+      // is unchanged, so existing callers see exactly what they saw.
+      var iTotal = (snap.interactives || []).length;
+      var iOff = Math.max(0, observeOpts.interactiveOffset | 0);
+      var iLim = observeOpts.interactiveLimit
+        ? Math.max(1, Math.min(500, observeOpts.interactiveLimit | 0)) : 200;
+      if (iOff > iTotal) iOff = iTotal;
+      var iPage = Math.min(iLim, iTotal - iOff);
+      snap.interactive_total = iTotal;
+      snap.interactive_offset = iOff;
+      snap.interactive_next_offset = iOff + iPage < iTotal ? iOff + iPage : null;
+      snap.interactives = (snap.interactives || []).slice(iOff, iOff + iLim);
       return finishObserve(tab, snap, withScreenshot);
     });
   });

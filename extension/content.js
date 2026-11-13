@@ -26,7 +26,7 @@
   // the rest (observe --text-offset). The background merges frames under a
   // total cap so a text-heavy LMS page stays well below the relay's 1 MB
   // payload ceiling while still carrying the actual lesson content.
-  var TEXT_CAP = 15000;
+  var TEXT_CAP = 30000;
   // Absolute collection ceiling per frame: pagination is how you read a
   // huge page, not unbounded memory. total_chars reports what was
   // collected; collectionTruncated says the page had even more.
@@ -173,7 +173,149 @@
       el.getAttribute("name") ||
       el.getAttribute("title") ||
       tag;
+    // Tabs and widgets whose visible text lives in an open shadow root
+    // have an empty innerText on the host — the snapshot used to label
+    // them by tag ("div"), which made --target re-resolution impossible
+    // for them (Fix 9 — the Repeat Purchase tab switch failed 5/5).
+    // Fall back to the shadow text before the tag name.
+    if (raw === tag && el.shadowRoot) {
+      var st = "";
+      try {
+        for (var j = 0; j < el.shadowRoot.children.length; j++) {
+          st += (el.shadowRoot.children[j].innerText || el.shadowRoot.children[j].textContent || "") + "\n";
+        }
+      } catch (e) { /* shadow access is best-effort */ }
+      if (st.trim()) raw = st;
+    }
     return normalizeLabel(raw).slice(0, 80);
+  }
+
+  /**
+   * A stable CSS selector for an element, computed from its own
+   * identifying attributes — ids and hrefs survive SPA re-renders, a
+   * positional path is the last resort and is only trusted when it
+   * matches exactly one element. Used at snapshot time so a later act
+   * can re-resolve by selector when the stamped element is gone.
+   * Returns null when nothing identifying could be built.
+   */
+  function stableSelectorFor(el) {
+    try {
+      var tag = (el.tagName || "").toLowerCase();
+      if (!tag) return null;
+      var esc = function (s) {
+        return String(s).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      };
+      if (el.id) {
+        var idSel = "#" + (window.CSS && CSS.escape ? CSS.escape(el.id) : el.id);
+        if (document.querySelectorAll(idSel).length === 1) return idSel;
+      }
+      var attrs = [];
+      var al = el.getAttribute && el.getAttribute("aria-label");
+      if (al) attrs.push('[aria-label="' + esc(al) + '"]');
+      var nm = el.getAttribute && el.getAttribute("name");
+      if (nm) attrs.push('[name="' + esc(nm) + '"]');
+      if (tag === "a" && el.getAttribute && el.getAttribute("href")) {
+        attrs.push('[href="' + esc(el.getAttribute("href")) + '"]');
+      }
+      var role = el.getAttribute && el.getAttribute("role");
+      if (role) attrs.push('[role="' + esc(role) + '"]');
+      for (var i = 0; i < attrs.length; i++) {
+        var cand = tag + attrs[i];
+        if (document.querySelectorAll(cand).length === 1) return cand;
+      }
+      var parts = [];
+      var node = el;
+      for (var d = 0; d < 4 && node && node !== document.body && node !== document.documentElement; d++) {
+        var t = (node.tagName || "").toLowerCase();
+        if (!t) break;
+        var sibs = node.parentElement ? node.parentElement.children : [];
+        var idx = 0, same = 0;
+        for (var s = 0; s < sibs.length; s++) {
+          if ((sibs[s].tagName || "").toLowerCase() === t) {
+            same++;
+            if (sibs[s] === node) idx = same;
+          }
+        }
+        if (!idx) break;
+        parts.unshift(t + ":nth-of-type(" + idx + ")");
+        node = node.parentElement;
+      }
+      if (parts.length) {
+        var path = parts.join(" > ");
+        if (document.querySelectorAll(path).length === 1) return path;
+      }
+    } catch (e) { /* selector building is best-effort */ }
+    return null;
+  }
+
+  // Checked / selected / disabled state of an element, as the snapshot
+  // exposes it (Fix 4) and as post-click verification reads it (Fix 3).
+  // Fields are undefined when not applicable — JSON drops them, so
+  // snapshots stay lean and only stateful elements carry state. Before
+  // this, a checkbox carried only the label "on" and the agent could not
+  // tell whether a box was ticked at all.
+  function elementState(el) {
+    var out = {};
+    var tag = (el.tagName || "").toLowerCase();
+    var it = tag === "input" ? String(el.type || "text").toLowerCase() : null;
+    if (it === "checkbox" || it === "radio") out.checked = !!el.checked;
+    else if (el.getAttribute) {
+      var ac = el.getAttribute("aria-checked");
+      if (ac === "true") out.checked = true;
+      else if (ac === "false") out.checked = false;
+    }
+    var as = el.getAttribute ? el.getAttribute("aria-selected") : null;
+    if (as === "true") out.selected = true;
+    else if (as === "false") out.selected = false;
+    else if (tag === "option") out.selected = !!el.selected;
+    else if (el.classList && el.classList.contains && el.classList.contains("selected")) out.selected = true;
+    if (el.disabled === true) out.disabled = true;
+    else if (el.getAttribute && el.getAttribute("aria-disabled") === "true") out.disabled = true;
+    return out;
+  }
+
+  function stateProbe(el) {
+    var st = elementState(el);
+    st.label = labelFor(el);
+    st.url = location.href;
+    return st;
+  }
+
+  // Post-click verification (Fix 3): a click that reports success while
+  // the page silently rejected it is worse than a failure — the agent
+  // moves on believing a change landed. After the click, wait briefly,
+  // re-find the target in the live DOM, and compare its state:
+  // VERIFIED when the state changed or the click navigated the page,
+  // UNCONFIRMED when a stateful element's state did not change, N/A
+  // when the element carries no state to check (a plain link/button).
+  // ok=true still means "the click was delivered"; verification says
+  // whether the page applied it.
+  var VERIFY_WAIT_MS = 350;
+  function stateChangeNote(b, a) {
+    var bits = [];
+    if (b.checked !== a.checked) bits.push("checked " + b.checked + " → " + a.checked);
+    if (b.selected !== a.selected) bits.push("selected " + b.selected + " → " + a.selected);
+    if (b.disabled !== a.disabled) bits.push("disabled " + b.disabled + " → " + a.disabled);
+    return bits.join(", ");
+  }
+  function verifyStateChange(before, getEl) {
+    return delay(VERIFY_WAIT_MS).then(function () {
+      if (location.href !== before.url) {
+        return { verification: "VERIFIED", note: "page navigated", before: before, after: null };
+      }
+      var after = null;
+      try { var el = getEl(); if (el) after = stateProbe(el); } catch (e) { after = null; }
+      if (!after) {
+        return { verification: "UNCONFIRMED", note: "target element is gone and the page did not navigate", before: before, after: null };
+      }
+      var changed = (before.checked !== after.checked) || (before.selected !== after.selected) ||
+                    (before.disabled !== after.disabled);
+      if (changed) return { verification: "VERIFIED", note: stateChangeNote(before, after), before: before, after: after };
+      if (before.checked === undefined && before.selected === undefined) {
+        return { verification: "N/A", note: "element carries no checked/selected state to verify against", before: before, after: after };
+      }
+      return { verification: "UNCONFIRMED", note: "state did not change after the click", before: before, after: after };
+    });
   }
 
   // ------------------------------------------------------------ stable ids
@@ -188,6 +330,11 @@
   // this script are adopted, never reissued.
   var nextIdNum = 0;
   var idRegistry = {}; // id -> element (this frame, this script lifetime)
+  // What each stamped id MEANT when the snapshot was built: the approved
+  // label and a stable selector, so an act whose element died in a
+  // re-render can re-resolve by selector or label at execution time
+  // instead of failing on a dead ref. Pruned with the registry.
+  var idMemory = {}; // id -> { label, selector, type }
 
   function stableIdFor(el) {
     var id = el.getAttribute(ID_ATTR);
@@ -207,7 +354,7 @@
   function pruneIdRegistry() {
     Object.keys(idRegistry).forEach(function (id) {
       var el = idRegistry[id];
-      if (!el || el.isConnected === false) delete idRegistry[id];
+      if (!el || el.isConnected === false) { delete idRegistry[id]; delete idMemory[id]; }
     });
   }
 
@@ -368,14 +515,24 @@
     var seen = new Set();
     var entryFor = function (el, typeOverride) {
       var geo = boxFor(el);
+      var ref = stableIdFor(el);
+      var label = labelFor(el);
+      var type = typeOverride || typeFor(el);
+      // Remember what this id meant, so a later act can re-resolve by
+      // selector or label when the node itself is replaced by a re-render.
+      idMemory[ref] = { label: label, selector: stableSelectorFor(el), type: type };
+      var st = elementState(el);
       return {
-        ref: stableIdFor(el),
-        label: labelFor(el),
-        type: typeOverride || typeFor(el),
+        ref: ref,
+        label: label,
+        type: type,
         name: el.getAttribute("name") || null,
         href: hrefFor(el),
         box: geo.box,
-        inViewport: geo.inViewport
+        inViewport: geo.inViewport,
+        checked: st.checked,
+        selected: st.selected,
+        disabled: st.disabled
       };
     };
     var n = 0;
@@ -540,11 +697,102 @@
     throw new Error("act needs a ref or a label");
   }
 
+  function delay(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // How long resolution is retried across re-renders before an act gives
+  // up: long enough for an SPA redraw or a document re-mount, short
+  // enough that a genuinely dead target fails in seconds, not minutes.
+  // (window.__jbbResolveRetryMs overrides it — tests only.)
+  var RESOLVE_RETRY_MS = (typeof window !== "undefined" && window.__jbbResolveRetryMs) || 5000;
+  var RESOLVE_POLL_MS = 250;
+
+  function isResolutionMiss(err) {
+    var m = String((err && err.message) || err || "");
+    return /no element for ref|no element matches label|element changed since observation|no element for selector/.test(m);
+  }
+
+  // One resolution attempt, in order: the stamped ref, the selector the
+  // snapshot remembered for that ref, an explicit selector the act
+  // carries, then the approved label (exact, unique). A selector hit is
+  // accepted only when its label still matches the approved one — a
+  // selector that now points at a different control is a miss, not a hit.
+  function resolveOnce(ref, label, selector) {
+    if (ref) {
+      var el = findByRef(ref);
+      if (el) {
+        verifyTarget(el, ref, label);
+        return { el: el, matchQuality: label ? "exact" : undefined };
+      }
+      var mem = idMemory[ref];
+      if (mem && mem.selector) {
+        var selEl = null;
+        try { selEl = document.querySelector(mem.selector); } catch (e) { selEl = null; }
+        if (selEl && isVisible(selEl) &&
+            (!label || normalizeLabel(labelFor(selEl)) === normalizeLabel(label))) {
+          return { el: selEl, matchQuality: "re-resolved" };
+        }
+      }
+    }
+    if (selector) {
+      var qEl = null;
+      try { qEl = document.querySelector(selector); } catch (e) { qEl = null; }
+      if (qEl && isVisible(qEl)) return { el: qEl, matchQuality: "re-resolved" };
+    }
+    if (label) {
+      var exact = findExactByLabel(label);
+      if (exact.length === 1) return { el: exact[0], matchQuality: "re-resolved" };
+    }
+    return null;
+  }
+
+  // Retry resolution across re-renders for up to RESOLVE_RETRY_MS. If the
+  // page is blank at execution time (about:blank, or an SPA shell that
+  // has not re-mounted after a navigation during the consent wait), wait
+  // for real content first instead of resolving against an empty shell.
+  function resolveWithRetry(ref, label, selector) {
+    return (async function () {
+      var deadline = Date.now() + RESOLVE_RETRY_MS;
+      var lastErr = null;
+      for (;;) {
+        var bodyText = "";
+        try { bodyText = (document.body && document.body.innerText) || ""; } catch (e) {}
+        if (bodyText.trim().length > 0) {
+          try {
+            var hit = resolveOnce(ref, label, selector);
+            if (hit) return hit;
+          } catch (e) { lastErr = e; }
+        }
+        if (Date.now() >= deadline) break;
+        await delay(RESOLVE_POLL_MS);
+      }
+      if (lastErr) throw lastErr;
+      if (ref) {
+        var mem = idMemory[ref];
+        throw new Error("no element for ref " + ref + " after " + (RESOLVE_RETRY_MS / 1000) +
+          "s of retries across re-renders" +
+          (label ? " — its label '" + label + "' matches 0 elements now" : "") +
+          (mem && mem.selector ? " (remembered selector '" + mem.selector + "' also found nothing)" : "") +
+          " — re-observe and rebuild the act");
+      }
+      if (selector) throw new Error("no element for selector '" + selector + "' after " + (RESOLVE_RETRY_MS / 1000) + "s of retries");
+      throw new Error("no element matches label '" + label + "'");
+    })();
+  }
+
   function doClick(ref, expectedLabel) {
     var r = resolveTarget(ref, expectedLabel);
+    var before = stateProbe(r.el);
+    var label = labelFor(r.el);
     r.el.scrollIntoView({ block: "center", behavior: "instant" });
     r.el.click(); // trusted event, same as a user click
-    return { detail: "clicked '" + labelFor(r.el) + "'", matchQuality: r.matchQuality };
+    return verifyStateChange(before, function () {
+      try { return resolveTarget(ref, expectedLabel).el; } catch (e) { return null; }
+    }).then(function (v) {
+      var detail = "clicked '" + label + "'" +
+        (v.verification !== "N/A" ? " — state " + v.verification + (v.note ? " (" + v.note + ")" : "") : "");
+      return { detail: detail, matchQuality: r.matchQuality,
+               data: { verification: v.verification, stateBefore: v.before, stateAfter: v.after } };
+    });
   }
 
   function doClickAt(point) {
@@ -596,7 +844,14 @@
     setter.call(el, value);
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { detail: "typed into '" + labelFor(el) + "'", matchQuality: r.matchQuality };
+    var typeLabel = labelFor(el);
+    return delay(VERIFY_WAIT_MS).then(function () {
+      var ok = false;
+      try { var el2 = resolveTarget(ref, expectedLabel).el; ok = String(el2.value) === String(value); } catch (e) {}
+      var verification = ok ? "VERIFIED" : "UNCONFIRMED";
+      return { detail: "typed into '" + typeLabel + "' — state " + verification,
+               matchQuality: r.matchQuality, data: { verification: verification } };
+    });
   }
 
   // ------------------------------------------------------------ press_key
@@ -706,8 +961,16 @@
     el.value = chosen.value;
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    return { detail: "selected '" + (chosen.textContent || chosen.text || chosen.value) + "' in '" + labelFor(el) + "'",
-             matchQuality: r.matchQuality };
+    var selLabel = labelFor(el);
+    var chosenValue = chosen.value;
+    var chosenText = chosen.textContent || chosen.text || chosen.value;
+    return delay(VERIFY_WAIT_MS).then(function () {
+      var ok = false;
+      try { var el2 = resolveTarget(ref, expectedLabel).el; ok = String(el2.value) === String(chosenValue); } catch (e) {}
+      var verification = ok ? "VERIFIED" : "UNCONFIRMED";
+      return { detail: "selected '" + chosenText + "' in '" + selLabel + "' — state " + verification,
+               matchQuality: r.matchQuality, data: { verification: verification } };
+    });
   }
 
   // ------------------------------------------------------------ set_value
@@ -730,8 +993,15 @@
     el.dispatchEvent(new Event("change", { bubbles: true }));
     // The detail names the field and the length — never the value itself
     // (details land in the on-machine audit log).
-    return { detail: "set '" + labelFor(el) + "' (" + String(value == null ? "" : value).length + " chars)",
-             matchQuality: r.matchQuality };
+    var setLabel = labelFor(el);
+    var setLen = String(value == null ? "" : value).length;
+    return delay(VERIFY_WAIT_MS).then(function () {
+      var ok = false;
+      try { var el2 = resolveTarget(ref, expectedLabel).el; ok = String(el2.value) === String(value); } catch (e) {}
+      var verification = ok ? "VERIFIED" : "UNCONFIRMED";
+      return { detail: "set '" + setLabel + "' (" + setLen + " chars) — state " + verification,
+               matchQuality: r.matchQuality, data: { verification: verification } };
+    });
   }
 
   // ------------------------------------------------------------ drag
@@ -950,6 +1220,18 @@
       if (!hasCt) reqHeaders["Content-Type"] = a.contentType || "application/json";
     }
     if (Object.keys(reqHeaders).length) init.headers = reqHeaders;
+    // A fetch that never settles (stalled host, dying tab) must fail
+    // with a NAMED error, not hang until the act timeout and surface as
+    // a bare ok:false (Fix 8 — the amazon.com fetch returned exactly
+    // that: no error, no data).
+    var controller = null;
+    try {
+      if (typeof AbortController !== "undefined") {
+        controller = new AbortController();
+        init.signal = controller.signal;
+        setTimeout(function () { try { controller.abort(); } catch (e) {} }, 30000);
+      }
+    } catch (e) { controller = null; }
     return fetch(u.href, init).then(function (res) {
       var headers = {};
       try {
@@ -970,6 +1252,17 @@
                   headersSent: Object.keys(reqHeaders) }
         };
       });
+    }, function (err) {
+      // Name the failure instead of surfacing a bare ok:false: a timeout
+      // is a timeout, a TypeError is a network/CSP refusal, anything else
+      // carries its own message.
+      var name = err && err.name;
+      var reason = name === "AbortError"
+        ? "fetch timed out after 30s (no response from " + u.host + ")"
+        : name === "TypeError"
+        ? "fetch failed: network error, or the page's CSP blocks requests to " + u.host + " (Failed to fetch)"
+        : "fetch failed: " + ((err && err.message) || String(err || "unknown error"));
+      throw new Error(reason);
     });
   }
 
@@ -1336,26 +1629,57 @@
             if (out.data) resp.data = out.data;
             sendResponse(resp);
           }, function (err) {
-            sendResponse({ ok: false, error: String((err && err.message) || err) });
+            // Never surface a bare ok:false: an error with no message is
+            // still a named failure, not an empty one (Fix 8).
+            var em = (err && err.message) || String(err || "");
+            if (!em || em === "[object Object]") em = "act failed without a reported reason — observe before retrying";
+            sendResponse({ ok: false, error: em });
           });
           return true; // keep the response channel open
         }
+        var sendOk = function (o) {
+          var resp = { ok: true, detail: o.detail };
+          if (o.matchQuality) resp.matchQuality = o.matchQuality;
+          if (o.appeared) resp.appeared = o.appeared;
+          if (o.data) resp.data = o.data;
+          sendResponse(resp);
+        };
+        var sendErr = function (e) { sendResponse({ ok: false, error: String((e && e.message) || e) }); };
+        var dispatchSync = function () {
+          if (a.type === "click") return doClick(t.ref, t.label);
+          if (a.type === "type") return doType(t.ref, a.value, t.label);
+          if (a.type === "clickAt") return doClickAt(a.point);
+          if (a.type === "clickSelector") return doClickSelector(a.selector);
+          if (a.type === "key") return doPressKey(a.key, t.ref, t.label);
+          if (a.type === "select") return doSelect(t.ref, t.label, a.optionValue != null ? a.optionValue : a.value, a.optionText);
+          if (a.type === "setValue") return doSetValue(t.ref, a.value, t.label);
+          if (a.type === "drag") return doDrag(a.dragFrom || t, a.dragTo);
+          if (a.type === "captions") return doCaptions(a);
+          if (a.type === "scroll") return { detail: doScroll(a.direction, a.amount, { ref: t.ref, label: t.label, selector: a.selector }) };
+          throw new Error("unknown action type: " + a.type);
+        };
         var out;
-        if (a.type === "click") out = doClick(t.ref, t.label);
-        else if (a.type === "type") out = doType(t.ref, a.value, t.label);
-        else if (a.type === "clickAt") out = doClickAt(a.point);
-        else if (a.type === "clickSelector") out = doClickSelector(a.selector);
-        else if (a.type === "key") out = doPressKey(a.key, t.ref, t.label);
-        else if (a.type === "select") out = doSelect(t.ref, t.label, a.optionValue != null ? a.optionValue : a.value, a.optionText);
-        else if (a.type === "setValue") out = doSetValue(t.ref, a.value, t.label);
-        else if (a.type === "drag") out = doDrag(a.dragFrom || t, a.dragTo);
-        else if (a.type === "captions") out = doCaptions(a);
-        else if (a.type === "scroll") out = { detail: doScroll(a.direction, a.amount, { ref: t.ref, label: t.label, selector: a.selector }) };
-        else throw new Error("unknown action type: " + a.type);
-        var resp = { ok: true, detail: out.detail };
-        if (out.matchQuality) resp.matchQuality = out.matchQuality;
-        if (out.data) resp.data = out.data;
-        sendResponse(resp);
+        try { out = dispatchSync(); }
+        catch (err) {
+          // The page re-rendered (or is still blank) between the snapshot
+          // and execution — the consent wait is long enough for an SPA to
+          // redraw several times. Retry resolution across re-renders
+          // instead of failing on the first miss; the retry re-dispatches
+          // the act once the target is live again.
+          if (isResolutionMiss(err) && (t.ref || t.label || a.selector)) {
+            resolveWithRetry(t.ref, t.label, a.selector).then(function () {
+              try {
+                var out2 = dispatchSync();
+                if (out2 && typeof out2.then === "function") out2.then(sendOk, sendErr);
+                else sendOk(out2);
+              } catch (e2) { sendErr(e2); }
+            }, sendErr);
+            return true; // keep the response channel open
+          }
+          throw err;
+        }
+        if (out && typeof out.then === "function") { out.then(sendOk, sendErr); return true; }
+        sendOk(out);
       } else {
         sendResponse({ ok: false, error: "unknown content message" });
       }

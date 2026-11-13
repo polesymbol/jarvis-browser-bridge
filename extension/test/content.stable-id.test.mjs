@@ -77,9 +77,12 @@ new Function("window", "document", "location", "chrome", src)(
 );
 
 function act(ref, label) {
-  let resp = null;
-  listener({ kind: "jbb.content.act", action: { type: "click", target: { ref, label } } }, {}, (r) => { resp = r; });
-  return resp;
+  // Clicks verify post-click state asynchronously (Fix 3), so the
+  // response arrives on a later tick — await it instead of reading it
+  // synchronously.
+  return new Promise((resolve) => {
+    listener({ kind: "jbb.content.act", action: { type: "click", target: { ref, label } } }, {}, resolve);
+  });
 }
 
 // --- snapshot 1: ids are assigned
@@ -104,18 +107,18 @@ check("the inserted element gets a fresh, unused id",
   !!byLabel2["New banner button"] && !Object.values(byLabel).includes(byLabel2["New banner button"]));
 
 // --- acceptance: click a second element using ids from the FIRST snapshot
-const r1 = act(byLabel["Lesson 2"], "Lesson 2");
+const r1 = await act(byLabel["Lesson 2"], "Lesson 2");
 check("click from snapshot 1 lands on the correct element after expansion/shift",
   r1 && r1.ok === true && lesson2.clicked === 1 && expandBtn.clicked === 0 && inserted.clicked === 0);
 
 // --- invisible-char labels match their visible text, both directions
-const r2 = act(byLabel["Lesson 3"], "Lesson 3");
+const r2 = await act(byLabel["Lesson 3"], "Lesson 3");
 check("snapshot label (ZWSP/NBSP inside) matches plain expected label", r2 && r2.ok === true && lesson3.clicked === 1);
-const r3 = act(byLabel["Quiz Time"], "Quiz\u00A0Time");
+const r3 = await act(byLabel["Quiz Time"], "Quiz\u00A0Time");
 check("expected label carrying NBSP matches the plain element label", r3 && r3.ok === true && quiz.clicked === 1);
 
 // --- wrong label still fails closed (never the wrong element)
-const r4 = act(byLabel["Expand section"], "Delete account");
+const r4 = await act(byLabel["Expand section"], "Delete account");
 check("label mismatch refuses the click", r4 && r4.ok === false && expandBtn.clicked === 0);
 
 // --- the page clones a stamped id onto a different element: not trusted

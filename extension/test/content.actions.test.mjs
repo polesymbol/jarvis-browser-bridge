@@ -185,7 +185,7 @@ react.dispatchEvent(new Ev("input", { bubbles: true }));
 check("control: plain assignment is swallowed by the controlled input (app state unchanged)",
   appState.coupon === "(unset)");
 react._val = ""; react._tracked = "";
-r = act({ type: "setValue", value: "DIWALI10", target: { label: "Coupon code" } });
+r = await actAsync({ type: "setValue", value: "DIWALI10", target: { label: "Coupon code" } });
 check("set_value updates the React app's state via the native setter",
   r.ok && appState.coupon === "DIWALI10");
 check("set_value detail names the field, never the value",
@@ -196,15 +196,15 @@ r = act({ type: "type", value: "x", target: { label: "Password" } });
 check("type into a password field is refused too", !r.ok && /password/.test(r.error));
 
 // ---------------------------------------------------------- select_option
-r = act({ type: "select", optionText: "India", target: { label: "Country" } });
+r = await actAsync({ type: "select", optionText: "India", target: { label: "Country" } });
 check("select by visible text sets the value and fires change",
   r.ok && country.value === "IN" && country.events.some((e) => e.type === "change") && /India/.test(r.detail));
 country.value = "";
-r = act({ type: "select", optionValue: "US", target: { label: "Country" } });
+r = await actAsync({ type: "select", optionValue: "US", target: { label: "Country" } });
 check("select by value works", r.ok && country.value === "US");
 r = act({ type: "select", optionValue: "ZZ", target: { label: "Country" } });
 check("unknown option fails closed", !r.ok && /no option/.test(r.error));
-r = act({ type: "select", optionValue: "IN", target: { label: "Search" } });
+r = await actAsync({ type: "select", optionValue: "IN", target: { label: "Search" } });
 check("select on a non-<select> is refused", !r.ok && /not a <select>/.test(r.error));
 
 // ---------------------------------------------------------- hover

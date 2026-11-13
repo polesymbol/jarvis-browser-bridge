@@ -100,10 +100,11 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
     ok: true,
     usage: [
       'node driver/driver.js --relay <ws-url> --key <connector-key> <command>',
-      'commands: observe | act | abort | status | watch | listen | plan',
+      'commands: observe | act | abort | status | watch | listen | plan | cancel',
       'plan: --file <steps.json> (ordered steps, max 20; user approves once; T3 steps still ask)',
+      'cancel: --proposal-id <id> (withdraw a queued proposal before a decision — it will never apply, unlike NO_ANSWER)',
       'listen flags: --duration <seconds> --out <file.webm> (proposes audio capture — T2 — then writes the streamed Opus/WebM chunks to the file)',
-      'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset)',
+      'observe flags: --text-offset <n> (page through snapshot text: the result carries text_offset/text_total_chars/text_next_offset) --interactive-offset <n> --interactive-limit <n> (page through snapshot interactives: the result carries interactive_offset/interactive_total/interactive_next_offset)',
       'watch flags: --duration <seconds> (stream media.progress events as JSON lines; 0 = until Ctrl-C)',
       'act flags: --type click|type|key|scroll|navigate|clickAt|clickSelector|hover|select|setValue|drag|listTabs|switchTab|closeTab|closeInactiveTabs|openTab|pinTab|fetch|waitFor|media|captions|frameGrab|audioCapture --target <label> --ref <ref> --value <text> --press-key <name> --url <url> --tier T0|T1|T2|T3 --snapshot-version <n> --x <n> --y <n> --selector <css> --option-text <text> --to-target <label> --from-x <n> --from-y <n> --to-x <n> --to-y <n> --tab-id <n> --method <verb> --body <text> --content-type <mime> --header "Name: Value" (repeatable, fetch, same-origin only) --wait element|text|navigation|networkIdle|mediaEnded --wait-text <text> --timeout <ms> --media play|pause|seek --seek-to <s> --from <s> --to <s> --language <code> --track-index <n> --at <s> --out <file> --direction up|down|top|bottom --amount <px>',
       '--key is always the connector key; the keypress name goes in --press-key (e.g. --press-key Enter)',
@@ -113,7 +114,7 @@ if (args.includes('--help') || args.includes('-h') || args[0] === 'help') {
 
 const RELAY = opt('--relay', 'ws://127.0.0.1:8787');
 const KEY = opt('--key', '');
-const CMD = args.find((a) => ['observe', 'act', 'abort', 'status', 'watch', 'listen', 'plan'].includes(a));
+const CMD = args.find((a) => ['observe', 'act', 'abort', 'status', 'watch', 'listen', 'plan', 'cancel'].includes(a));
 
 // In-flight act proposals owned by this process. A one-shot CLI holds none at
 // rest, so `status` reports 0; the counter exists so the field is real, not
@@ -147,7 +148,7 @@ if (KEY.length < 16) {
     CMD === 'status' ? statusSnapshot(false) : undefined);
 }
 if (!CMD) {
-  failNow('USAGE', 'command required: observe | act | abort | status', 2);
+  failNow('USAGE', 'command required: observe | act | abort | status | watch | listen | plan | cancel', 2);
 }
 
 function waitFor(ws, types, timeoutMs) {
@@ -394,6 +395,12 @@ function finishResult(msg) {
       snapshotVersion: typeof msg.snapshotVersion === 'number' ? msg.snapshotVersion : null,
     }, 1);
   }
+  // Never print a bare ok:false (Fix 8): a result that failed without a
+  // reported reason gets one, so the agent can act on it instead of
+  // guessing whether anything happened.
+  if (msg && msg.ok === false && !msg.detail && !msg.error) {
+    msg = { ...msg, error: 'act failed with no reported reason — the result may have been lost in transit; observe before retrying' };
+  }
   console.log(JSON.stringify(msg, null, 2));
 }
 
@@ -447,7 +454,7 @@ async function runAct(ws, proposal, id) {
     for (;;) {
       let got;
       try {
-        got = await pump.next(['proposal.received', 'consent.grant', 'consent.deny', 'act.result', 'peer.joined'], receiptDeadline - Date.now());
+        got = await pump.next(['proposal.received', 'consent.grant', 'consent.deny', 'act.result', 'peer.joined', 'proposal.cancelled'], receiptDeadline - Date.now());
       } catch (e) {
         if (isTimeout(e)) {
           throw new DriverError('PEER_DOWN', pump.peerUnavailable
@@ -461,6 +468,9 @@ async function runAct(ws, proposal, id) {
         sendPropose();
         continue;
       }
+      if (got.type === 'proposal.cancelled') {
+        throw new DriverError('CANCELLED', got.detail || 'the proposal was cancelled — it will not apply');
+      }
       if (got.type === 'proposal.received') break;
       early = got; break; // an older extension that answers without acks
     }
@@ -469,6 +479,9 @@ async function runAct(ws, proposal, id) {
     if (early) {
       if (early.type === 'act.result') { finish(early); return; }
       if (early.type === 'consent.deny') throw denyError(early);
+      if (early.type === 'proposal.cancelled') {
+        throw new DriverError('CANCELLED', early.detail || 'the proposal was cancelled — it will not apply');
+      }
       verdict = early; // consent.grant
     }
 
@@ -478,7 +491,7 @@ async function runAct(ws, proposal, id) {
       for (;;) {
         let got;
         try {
-          got = await pump.next(['consent.shown', 'consent.waiting', 'consent.grant', 'consent.deny', 'act.result', 'proposal.queued'], shownDeadline - Date.now());
+          got = await pump.next(['consent.shown', 'consent.waiting', 'consent.grant', 'consent.deny', 'act.result', 'proposal.queued', 'proposal.cancelled'], shownDeadline - Date.now());
         } catch (e) {
           if (isTimeout(e)) {
             throw new DriverError('PROMPT_NOT_SHOWN', 'the extension received the proposal but the consent prompt never appeared — no panel card or in-page banner became visible');
@@ -492,6 +505,9 @@ async function runAct(ws, proposal, id) {
           console.error('[queued] user has taken over in the panel — this action is held until they hand back');
           shownDeadline = Date.now() + 60000;
           continue;
+        }
+        if (got.type === 'proposal.cancelled') {
+          throw new DriverError('CANCELLED', got.detail || 'the proposal was cancelled — it will not apply');
         }
         if (got.type === 'consent.shown' || got.type === 'consent.waiting') break;
         if (got.type === 'act.result') { finish(got); return; }
@@ -507,7 +523,7 @@ async function runAct(ws, proposal, id) {
       for (;;) {
         let got;
         try {
-          got = await pump.next(['consent.grant', 'consent.deny', 'act.result', 'consent.waiting', 'proposal.queued'], consentDeadline - Date.now());
+          got = await pump.next(['consent.grant', 'consent.deny', 'act.result', 'consent.waiting', 'proposal.queued', 'proposal.cancelled'], consentDeadline - Date.now());
         } catch (e) {
           if (isTimeout(e)) {
             throw new DriverError('NO_ANSWER', 'the consent prompt was shown but not answered in time — the proposal is still queued in the extension panel, not denied or forgotten');
@@ -518,6 +534,9 @@ async function runAct(ws, proposal, id) {
           console.error('[queued] user has taken over in the panel — this action is held until they hand back');
           consentDeadline = Date.now() + 60000;
           continue;
+        }
+        if (got.type === 'proposal.cancelled') {
+          throw new DriverError('CANCELLED', got.detail || 'the proposal was cancelled — it will not apply');
         }
         if (got.type === 'consent.waiting') {
           console.error(`[waiting] consent prompt open, unanswered for ${Math.round((got.waitedMs || 0) / 1000)}s — waiting for the user`);
@@ -608,10 +627,57 @@ async function main() {
       // protocol v1 exposes. Session grants live inside the extension and
       // protocol v1 has no message to query their remaining time, so that
       // field is reported as null (unknown), never invented.
+      // Extension report (Fix 12/14/16): when a peer is present, ask the
+      // extension itself for the pending proposals, key epoch + expiry,
+      // and the sign-in block. A legacy extension never answers — the
+      // query times out quietly and the fields stay null, never invented.
+      let extension = null;
+      if (confirm.peer) {
+        try {
+          const pump = createPump(ws, `status-${Date.now()}`);
+          ws.send(JSON.stringify({ v: 1, type: 'status.request', id: `status-${Date.now()}` }));
+          const rep = await pump.next(['status.report'], 5000);
+          extension = {
+            pending: rep.pending || [],
+            heldCount: typeof rep.heldCount === 'number' ? rep.heldCount : null,
+            keyEpoch: typeof rep.keyEpoch === 'number' ? rep.keyEpoch : null,
+            keyExpiresAt: rep.keyExpiresAt || null,
+            signinBlocked: !!(rep.signin && rep.signin.blocked),
+            signinEmail: (rep.signin && rep.signin.email) || null,
+            signinAction: (rep.signin && rep.signin.action) || null,
+            tabUrl: rep.tabUrl || null,
+          };
+        } catch { extension = null; }
+      }
       console.log(JSON.stringify({
         ok: true,
         command: 'status',
         ...statusSnapshot(!!confirm.peer),
+        extension,
+      }, null, 2));
+      return;
+    }
+
+    if (CMD === 'cancel') {
+      const proposalId = opt('--proposal-id', undefined);
+      if (!proposalId) throw new DriverError('USAGE', 'cancel requires --proposal-id <id> (take it from status.extension.pending)');
+      const confirm = await pair(ws, 8000);
+      if (!confirm.peer) {
+        throw new DriverError('PEER_DOWN', 'the extension is not connected to the relay — open Chrome with the extension installed, check the side panel says Connected, then retry');
+      }
+      const pump = createPump(ws, proposalId);
+      ws.send(JSON.stringify({ v: 1, type: 'proposal.cancel', proposalId }));
+      let ack;
+      try {
+        ack = await pump.next(['proposal.cancelled'], 5000);
+      } catch {
+        throw new DriverError('PEER_TIMEOUT', 'the extension did not answer the cancel request — the proposal may still be queued; check status');
+      }
+      console.log(JSON.stringify({
+        ok: true,
+        command: 'cancel',
+        proposalId,
+        detail: ack.detail || 'proposal withdrawn before a decision — it will not apply',
       }, null, 2));
       return;
     }
@@ -633,7 +699,7 @@ async function main() {
       }
       if (!joined) {
         throw new DriverError('PEER_DOWN',
-          'the extension is not connected to the relay — open Chrome with the extension installed, check the side panel says Connected, then retry (failed fast instead of waiting out the full timeout)');
+          'no peer in this room — the extension is not connected to the relay, or the key is wrong/stale (a wrong key pairs into a different, empty room). Open Chrome with the extension installed and check the side panel says Connected; if it already says Connected, the key is wrong — Rotate a fresh key in Setup and pair again with it (failed fast instead of waiting out the full timeout)');
       }
       console.error('[relay] peer joined during the grace wait — continuing');
     }
@@ -815,6 +881,25 @@ async function main() {
         }
         req.textOffset = off;
       }
+      // Interactive pagination (Fix 5): --interactive-offset / --limit
+      // page the snapshot's interactives (the result carries
+      // interactive_offset/interactive_total/interactive_next_offset).
+      const iOffRaw = opt('--interactive-offset', undefined);
+      if (iOffRaw !== undefined) {
+        const io = Number(iOffRaw);
+        if (!Number.isFinite(io) || io < 0) {
+          throw new DriverError('USAGE', '--interactive-offset must be a non-negative number (take interactive_next_offset from the previous observe)');
+        }
+        req.interactiveOffset = io;
+      }
+      const iLimRaw = opt('--interactive-limit', undefined);
+      if (iLimRaw !== undefined) {
+        const il = Number(iLimRaw);
+        if (!Number.isFinite(il) || il < 1) {
+          throw new DriverError('USAGE', '--interactive-limit must be a positive number (max 500)');
+        }
+        req.interactiveLimit = il;
+      }
       const observeMs = Number(process.env.JBB_OBSERVE_MS) || 30000;
       let res;
       try {
@@ -830,6 +915,33 @@ async function main() {
         await new Promise((r) => setTimeout(r, 3000));
         req.id = `obs-${Date.now()}`;
         res = await sendResilient(ws, req, ['observe.result'], observeMs);
+      }
+      // Empty observe (Fix 7): a loaded page sometimes answers with an
+      // empty snapshot (url: None, text_len: 0, or a tiny shell) and a
+      // retry moments later returns the full page. Never hand the agent
+      // an empty first answer — retry once, then return whatever came
+      // back (a genuinely empty page must still be reportable, so the
+      // retry's own failure keeps the first result).
+      const snapEmpty = (r) => {
+        const s = r && r.snapshot;
+        if (!s) return true;
+        const frameText = (s.frames || []).reduce((n, f) => n + ((f.text || "").length), 0);
+        return ((s.text || "").length + frameText) < 100 && ((s.interactives || []).length === 0);
+      };
+      if (snapEmpty(res)) {
+        console.error('[observe] empty snapshot — retrying once (loaded pages sometimes answer empty first)');
+        await new Promise((r) => setTimeout(r, 2000));
+        req.id = `obs-${Date.now()}`;
+        try { res = await sendResilient(ws, req, ['observe.result'], observeMs); }
+        catch (e) { /* keep the first (empty) result rather than failing on the retry */ }
+      }
+      // Tab-wander report (Fix 2): the snapshot carries tabMoved when
+      // the tab left the page on its own since the last observe — say it
+      // loudly on stderr, because the JSON below is the NEW page's
+      // content and acting on it as if it were the intended page is how
+      // clicks landed on about:blank and the Assistant sidebar.
+      if (res && res.snapshot && res.snapshot.tabMoved) {
+        console.error(`[wander] the tab moved on its own — was ${res.snapshot.tabMoved.from}, now ${res.snapshot.tabMoved.to}. This snapshot is the NEW page; re-observe the intended page before acting.`);
       }
       console.log(JSON.stringify(res, null, 2));
     } else if (CMD === 'act') {
